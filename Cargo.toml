@@ -1,0 +1,22 @@
+[package]
+name = "xtp-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+maxminddb = "0.24"
+clap = { version = "4", features = ["derive"] }
+serde = "1.0.228"
+toml = "1.1.2"
+
+[profile.release]
+opt-level = "z"      # 比 "s" 更激进的体积优化
+lto = true           # 全链接期优化
+codegen-units = 1    # 单编译单元，让 LTO 效果最大化
+strip = true         # 自动 strip
+panic = "abort"      # 去掉 panic unwind 逻辑
