@@ -9,10 +9,11 @@ socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-maxminddb = "0.24"
+maxminddb = { version = "0.28.1", features = ["simdutf8"] }
 clap = { version = "4", features = ["derive"] }
 serde = "1.0.228"
 toml = "1.1.2"
+tokio-util = "0.7.18"
 
 [profile.release]
 opt-level = "z"      # 比 "s" 更激进的体积优化

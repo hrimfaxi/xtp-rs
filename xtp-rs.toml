@@ -1,0 +1,6 @@
+listen_addr = "0.0.0.0"
+listen_port = 10810
+socks5_addr = "127.0.0.1:10808"
+direct_fwmark = 2
+mmdb_path = "Country-only-cn-private.mmdb"
+log_level = "info,xtp_rs=debug"
