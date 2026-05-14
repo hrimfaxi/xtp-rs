@@ -1,3 +1,4 @@
+use aligned_vec::{AVec, RuntimeAlign};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use maxminddb::Reader;
@@ -13,13 +14,17 @@ use std::io::IoSliceMut;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::Interest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const UDP_RECV_BUF_SIZE: usize = 65_536;
+const UDP_BUF_ALIGN: usize = 4096;
 
 #[derive(Parser)]
 #[command(name = "xtp-rs", about = "XTP-RS - Transparent TCP/UDP proxy splitter")]
@@ -29,19 +34,29 @@ struct Cli {
     config: String,
 }
 
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum PortForwardProto {
+    Tcp,
+    Udp,
+    Both,
+}
+
+#[derive(Deserialize, Clone)]
+struct PortForward {
+    name: Option<String>,
+    bind: String,
+    remote: String,
+    proto: PortForwardProto,
+}
+
 #[derive(Deserialize, Clone)]
 struct Config {
-    #[serde(default = "default_listen_addr")]
-    listen_addr: String,
+    #[serde(default = "default_listen")]
+    listen: String,
 
-    #[serde(default = "default_listen_port")]
-    listen_port: u16,
-
-    #[serde(default = "default_udp_enabled")]
-    udp_enabled: bool,
-
-    #[serde(default = "default_udp_listen_port")]
-    udp_listen_port: u16,
+    #[serde(default = "default_udp")]
+    udp: bool,
 
     #[serde(default = "default_socks5_addr")]
     socks5_addr: String,
@@ -62,22 +77,17 @@ struct Config {
     udp_session_timeout_secs: u64,
 
     log_level: Option<String>,
+
+    #[serde(default)]
+    port_forward: Vec<PortForward>,
 }
 
-fn default_listen_addr() -> String {
-    "::".to_string()
+fn default_listen() -> String {
+    "[::]:10810".to_string()
 }
 
-fn default_listen_port() -> u16 {
-    10810
-}
-
-fn default_udp_enabled() -> bool {
+fn default_udp() -> bool {
     true
-}
-
-fn default_udp_listen_port() -> u16 {
-    10810
 }
 
 fn default_socks5_addr() -> String {
@@ -124,12 +134,76 @@ impl AppState {
             .map(|code| code == "CN")
             .unwrap_or(false)
     }
+
+    fn socks5_credentials(&self) -> Option<(&str, &str)> {
+        match (&self.config.socks5_user, &self.config.socks5_password) {
+            (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UdpSessionKind {
+    Tproxy,
+    PortForward { listen_addr: SocketAddr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct UdpSessionKey {
+    kind: UdpSessionKind,
     client_addr: SocketAddr,
-    orig_dst: SocketAddr,
+    target_addr: SocketAddr,
+}
+
+#[derive(Clone)]
+enum UdpReplyPath {
+    Tproxy,
+    PortForward { listen_sock: Arc<UdpSocket> },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UdpRoutingMode {
+    Auto,
+    ForceSocks5,
+}
+
+#[derive(Clone)]
+struct UdpSessionSpec {
+    key: UdpSessionKey,
+    routing: UdpRoutingMode,
+    reply_path: UdpReplyPath,
+}
+
+impl UdpSessionSpec {
+    fn for_tproxy(client_addr: SocketAddr, orig_dst: SocketAddr) -> Self {
+        Self {
+            key: UdpSessionKey {
+                kind: UdpSessionKind::Tproxy,
+                client_addr,
+                target_addr: orig_dst,
+            },
+            routing: UdpRoutingMode::Auto,
+            reply_path: UdpReplyPath::Tproxy,
+        }
+    }
+
+    fn for_port_forward(
+        listen_addr: SocketAddr,
+        client_addr: SocketAddr,
+        remote: SocketAddr,
+        listen_sock: Arc<UdpSocket>,
+    ) -> Self {
+        Self {
+            key: UdpSessionKey {
+                kind: UdpSessionKind::PortForward { listen_addr },
+                client_addr,
+                target_addr: remote,
+            },
+            routing: UdpRoutingMode::ForceSocks5,
+            reply_path: UdpReplyPath::PortForward { listen_sock },
+        }
+    }
 }
 
 enum UdpSessionEntry {
@@ -155,8 +229,10 @@ impl UdpRuntime {
     async fn get_or_create_udp_session(
         self: &Arc<Self>,
         state: Arc<AppState>,
-        key: UdpSessionKey,
+        spec: UdpSessionSpec,
     ) -> Result<Arc<UdpSession>> {
+        let key = spec.key;
+
         let creating_notify = loop {
             let mut sessions = self.sessions.lock().await;
 
@@ -169,8 +245,8 @@ impl UdpRuntime {
                     drop(sessions);
 
                     debug!(
-                        "UDP session is being created, waiting: client={}, orig_dst={}",
-                        key.client_addr, key.orig_dst
+                        "UDP session is being created, waiting: kind={:?}, client={}, target={}",
+                        key.kind, key.client_addr, key.target_addr
                     );
 
                     notify.notified().await;
@@ -184,7 +260,7 @@ impl UdpRuntime {
             }
         };
 
-        let created = create_udp_session(state.clone(), key).await;
+        let created = create_udp_session(state.clone(), spec.clone()).await;
 
         let mut sessions = self.sessions.lock().await;
 
@@ -194,8 +270,8 @@ impl UdpRuntime {
                 creating_notify.notify_waiters();
 
                 info!(
-                    "created UDP session: client={}, orig_dst={}",
-                    key.client_addr, key.orig_dst
+                    "created UDP session: kind={:?}, client={}, target={}",
+                    key.kind, key.client_addr, key.target_addr
                 );
 
                 Ok(session)
@@ -209,8 +285,8 @@ impl UdpRuntime {
     }
 
     async fn cleanup_expired_sessions(&self) {
-        let now = Instant::now();
-        let timeout = self.timeout;
+        let now = now_secs();
+        let timeout_secs = self.timeout.as_secs();
 
         let snapshot: Vec<(UdpSessionKey, Arc<UdpSession>)> = {
             let sessions = self.sessions.lock().await;
@@ -227,9 +303,9 @@ impl UdpRuntime {
         let mut expired = Vec::new();
 
         for (key, session) in snapshot {
-            let last_seen = *session.last_seen.lock().await;
+            let last_seen = session.last_seen_secs.load(Ordering::Relaxed);
 
-            if now.duration_since(last_seen) >= timeout {
+            if now.saturating_sub(last_seen) >= timeout_secs {
                 expired.push((key, session));
             }
         }
@@ -251,8 +327,8 @@ impl UdpRuntime {
                 session.cancel.cancel();
 
                 debug!(
-                    "UDP session expired and cancelled: client={}, orig_dst={}",
-                    key.client_addr, key.orig_dst
+                    "UDP session expired and cancelled: kind={:?}, client={}, target={}",
+                    key.kind, key.client_addr, key.target_addr
                 );
             }
         }
@@ -267,11 +343,11 @@ struct FakeUdpKey {
 
 struct FakeUdpEntry {
     socket: Arc<UdpSocket>,
-    last_used: Instant,
+    last_used_secs: AtomicU64,
 }
 
 struct FakeUdpManager {
-    sockets: Mutex<HashMap<FakeUdpKey, FakeUdpEntry>>,
+    sockets: Mutex<HashMap<FakeUdpKey, Arc<FakeUdpEntry>>>,
 }
 
 impl FakeUdpManager {
@@ -283,24 +359,31 @@ impl FakeUdpManager {
 
     async fn get_or_create(&self, src_addr: SocketAddr, fwmark: u32) -> Result<Arc<UdpSocket>> {
         let key = FakeUdpKey { src_addr, fwmark };
-        let now = Instant::now();
+        let now = now_secs();
 
-        let mut sockets = self.sockets.lock().await;
+        {
+            let sockets = self.sockets.lock().await;
 
-        if let Some(entry) = sockets.get_mut(&key) {
-            entry.last_used = now;
-            return Ok(entry.socket.clone());
+            if let Some(entry) = sockets.get(&key) {
+                entry.last_used_secs.store(now, Ordering::Relaxed);
+                return Ok(entry.socket.clone());
+            }
         }
 
         let socket = Arc::new(create_fake_udp_socket(src_addr, fwmark)?);
+        let entry = Arc::new(FakeUdpEntry {
+            socket: socket.clone(),
+            last_used_secs: AtomicU64::new(now),
+        });
 
-        sockets.insert(
-            key,
-            FakeUdpEntry {
-                socket: socket.clone(),
-                last_used: now,
-            },
-        );
+        let mut sockets = self.sockets.lock().await;
+
+        if let Some(existing) = sockets.get(&key) {
+            existing.last_used_secs.store(now, Ordering::Relaxed);
+            return Ok(existing.socket.clone());
+        }
+
+        sockets.insert(key, entry);
 
         debug!(
             "created fake UDP socket: spoofed_src={}, fwmark={}",
@@ -333,11 +416,14 @@ impl FakeUdpManager {
     }
 
     async fn cleanup_expired(&self, timeout: Duration) {
-        let now = Instant::now();
+        let now = now_secs();
+        let timeout_secs = timeout.as_secs();
+
         let mut sockets = self.sockets.lock().await;
 
         sockets.retain(|key, entry| {
-            let alive = now.duration_since(entry.last_used) < timeout;
+            let last = entry.last_used_secs.load(Ordering::Relaxed);
+            let alive = now.saturating_sub(last) < timeout_secs;
 
             if !alive {
                 debug!(
@@ -351,10 +437,17 @@ impl FakeUdpManager {
     }
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
 struct UdpSession {
-    key: UdpSessionKey,
+    spec: UdpSessionSpec,
     outbound: UdpOutbound,
-    last_seen: Mutex<Instant>,
+    last_seen_secs: AtomicU64,
     cancel: CancellationToken,
 }
 
@@ -364,17 +457,24 @@ enum UdpOutbound {
 }
 
 impl UdpSession {
-    async fn touch(&self) {
-        *self.last_seen.lock().await = Instant::now();
+    fn key(&self) -> UdpSessionKey {
+        self.spec.key
+    }
+
+    fn touch(&self) {
+        self.last_seen_secs.store(now_secs(), Ordering::Relaxed);
     }
 
     async fn send_payload(&self, payload: &[u8]) -> Result<usize> {
+        let key = self.key();
+
         match &self.outbound {
             UdpOutbound::Direct { socket } => {
                 debug!(
-                    "UDP direct send: client={}, orig_dst={}, payload_len={}",
-                    self.key.client_addr,
-                    self.key.orig_dst,
+                    "UDP direct send: kind={:?}, client={}, target={}, payload_len={}",
+                    key.kind,
+                    key.client_addr,
+                    key.target_addr,
                     payload.len()
                 );
 
@@ -382,9 +482,10 @@ impl UdpSession {
                     Ok(sent) => Ok(sent),
                     Err(e) if is_io_emsgsize(&e) => {
                         warn!(
-                            "UDP datagram dropped due to EMSGSIZE: direction=client_to_direct, client={}, orig_dst={}, payload_len={}, error={}",
-                            self.key.client_addr,
-                            self.key.orig_dst,
+                            "UDP datagram dropped due to EMSGSIZE: direction=client_to_direct, kind={:?}, client={}, target={}, payload_len={}, error={}",
+                            key.kind,
+                            key.client_addr,
+                            key.target_addr,
                             payload.len(),
                             e
                         );
@@ -396,12 +497,13 @@ impl UdpSession {
                 }
             }
             UdpOutbound::Socks5 { assoc } => {
-                let pkt = build_socks5_udp_packet(self.key.orig_dst, payload);
+                let pkt = build_socks5_udp_packet(key.target_addr, payload);
 
                 debug!(
-                    "UDP SOCKS5 send: client={}, orig_dst={}, payload_len={}, pkt_len={}, relay={}",
-                    self.key.client_addr,
-                    self.key.orig_dst,
+                    "UDP SOCKS5 send: kind={:?}, client={}, target={}, payload_len={}, pkt_len={}, relay={}",
+                    key.kind,
+                    key.client_addr,
+                    key.target_addr,
                     payload.len(),
                     pkt.len(),
                     assoc.relay_addr
@@ -411,9 +513,10 @@ impl UdpSession {
                     Ok(sent) => Ok(sent),
                     Err(e) if is_io_emsgsize(&e) => {
                         warn!(
-                            "UDP datagram dropped due to EMSGSIZE: direction=client_to_socks5, client={}, orig_dst={}, payload_len={}, socks_pkt_len={}, relay={}, error={}",
-                            self.key.client_addr,
-                            self.key.orig_dst,
+                            "UDP datagram dropped due to EMSGSIZE: direction=client_to_socks5, kind={:?}, client={}, target={}, payload_len={}, socks_pkt_len={}, relay={}, error={}",
+                            key.kind,
+                            key.client_addr,
+                            key.target_addr,
                             payload.len(),
                             pkt.len(),
                             assoc.relay_addr,
@@ -424,6 +527,103 @@ impl UdpSession {
                         Ok(0)
                     }
                     Err(e) => Err(e).context("SOCKS5 UDP send failed"),
+                }
+            }
+        }
+    }
+
+    async fn send_reply(
+        &self,
+        state: &AppState,
+        direction: &'static str,
+        remote_src: SocketAddr,
+        payload: &[u8],
+        relay_addr: Option<SocketAddr>,
+    ) {
+        let key = self.key();
+
+        match &self.spec.reply_path {
+            UdpReplyPath::Tproxy => {
+                match state
+                    .udp_runtime
+                    .fake_udp
+                    .send_to(remote_src, key.client_addr, payload, state.config.fwmark)
+                    .await
+                {
+                    Ok(sent) => {
+                        debug!(
+                            "UDP response sent: direction={}, kind={:?}, spoofed_src={}, client={}, payload_len={}, sent={}",
+                            direction,
+                            key.kind,
+                            remote_src,
+                            key.client_addr,
+                            payload.len(),
+                            sent
+                        );
+                    }
+                    Err(e) if is_anyhow_emsgsize(&e) => {
+                        warn!(
+                            "UDP datagram dropped due to EMSGSIZE: direction={}, kind={:?}, spoofed_src={}, client={}, payload_len={}, relay={:?}, error={:#}",
+                            direction,
+                            key.kind,
+                            remote_src,
+                            key.client_addr,
+                            payload.len(),
+                            relay_addr,
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "failed to send UDP response: direction={}, kind={:?}, spoofed_src={}, client={}, payload_len={}, relay={:?}, error={:#}",
+                            direction,
+                            key.kind,
+                            remote_src,
+                            key.client_addr,
+                            payload.len(),
+                            relay_addr,
+                            e
+                        );
+                    }
+                }
+            }
+            UdpReplyPath::PortForward { listen_sock } => {
+                match listen_sock.send_to(payload, key.client_addr).await {
+                    Ok(sent) => {
+                        debug!(
+                            "UDP response sent: direction={}, kind={:?}, remote_src={}, client={}, payload_len={}, sent={}",
+                            direction,
+                            key.kind,
+                            remote_src,
+                            key.client_addr,
+                            payload.len(),
+                            sent
+                        );
+                    }
+                    Err(e) if is_io_emsgsize(&e) => {
+                        warn!(
+                            "UDP datagram dropped due to EMSGSIZE: direction={}, kind={:?}, remote_src={}, client={}, payload_len={}, relay={:?}, error={}",
+                            direction,
+                            key.kind,
+                            remote_src,
+                            key.client_addr,
+                            payload.len(),
+                            relay_addr,
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "failed to send UDP response: direction={}, kind={:?}, remote_src={}, client={}, payload_len={}, relay={:?}, error={:#}",
+                            direction,
+                            key.kind,
+                            remote_src,
+                            key.client_addr,
+                            payload.len(),
+                            relay_addr,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -577,6 +777,21 @@ struct Socks5UdpAssoc {
     udp_socket: Arc<UdpSocket>,
 }
 
+fn parse_listen_addr(listen: &str) -> Result<(IpAddr, u16)> {
+    let addr: SocketAddr = listen
+        .parse()
+        .map_err(|e| anyhow!("invalid listen address '{listen}': {e}"))?;
+    Ok((addr.ip(), addr.port()))
+}
+
+fn set_socket_reuse(socket: &Socket) -> Result<()> {
+    socket
+        .set_reuse_address(true)
+        .context("SO_REUSEADDR failed")?;
+    socket.set_reuse_port(true).context("SO_REUSEPORT failed")?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -608,37 +823,37 @@ async fn main() -> Result<()> {
         config.udp_session_timeout_secs,
     )));
 
+    let (listen_ip, listen_port) =
+        parse_listen_addr(&config.listen).context("invalid listen address")?;
+
     let state = Arc::new(AppState {
         mmdb: Arc::new(mmdb),
         config,
         udp_runtime,
     });
 
-    let (tcp_v4, tcp_v6) =
-        create_tproxy_tcp_listeners(&state.config.listen_addr, state.config.listen_port)?;
+    let (tcp_v4, tcp_v6) = create_tproxy_tcp_listeners(listen_ip, listen_port)?;
 
     if let Some(l) = tcp_v4 {
-        info!("TPROXY TCP (IPv4) on 0.0.0.0:{}", state.config.listen_port);
-        let state = state.clone();
-        tokio::spawn(async move { tcp_accept_loop(l, state).await });
-    }
-    if let Some(l) = tcp_v6 {
-        info!("TPROXY TCP (IPv6) on [::]:{}", state.config.listen_port);
+        info!("TPROXY TCP (IPv4) on 0.0.0.0:{}", listen_port);
         let state = state.clone();
         tokio::spawn(async move { tcp_accept_loop(l, state).await });
     }
 
-    let (udp_v4, udp_v6) = if state.config.udp_enabled {
-        create_tproxy_udp_sockets(&state.config.listen_addr, state.config.udp_listen_port)?
+    if let Some(l) = tcp_v6 {
+        info!("TPROXY TCP (IPv6) on [::]:{}", listen_port);
+        let state = state.clone();
+        tokio::spawn(async move { tcp_accept_loop(l, state).await });
+    }
+
+    let (udp_v4, udp_v6) = if state.config.udp {
+        create_tproxy_udp_sockets(listen_ip, listen_port)?
     } else {
         (None, None)
     };
 
     if let Some(sock) = udp_v4 {
-        info!(
-            "TPROXY UDP (IPv4) on 0.0.0.0:{}",
-            state.config.udp_listen_port
-        );
+        info!("TPROXY UDP (IPv4) on 0.0.0.0:{}", listen_port);
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = run_udp_loop(state, sock).await {
@@ -648,13 +863,58 @@ async fn main() -> Result<()> {
     }
 
     if let Some(sock) = udp_v6 {
-        info!("TPROXY UDP (IPv6) on [::]:{}", state.config.udp_listen_port);
+        info!("TPROXY UDP (IPv6) on [::]:{}", listen_port);
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = run_udp_loop(state, sock).await {
                 error!("IPv6 UDP loop exited with error: {:#}", e);
             }
         });
+    }
+
+    for pf in &state.config.port_forward {
+        let bind_addr: SocketAddr = pf
+            .bind
+            .parse()
+            .with_context(|| format!("invalid port-forward bind '{}'", pf.bind))?;
+        let remote_addr: SocketAddr = pf
+            .remote
+            .parse()
+            .with_context(|| format!("invalid port-forward remote '{}'", pf.remote))?;
+        let state = state.clone();
+        let name = pf.name.clone().unwrap_or_default();
+
+        match pf.proto {
+            PortForwardProto::Tcp => {
+                tokio::spawn(async move {
+                    if let Err(e) = run_tcp_port_forward(bind_addr, remote_addr, state).await {
+                        error!("port-forward TCP {name} error: {:#}", e);
+                    }
+                });
+            }
+            PortForwardProto::Udp => {
+                tokio::spawn(async move {
+                    if let Err(e) = run_udp_port_forward(bind_addr, remote_addr, state).await {
+                        error!("port-forward UDP {name} error: {:#}", e);
+                    }
+                });
+            }
+            PortForwardProto::Both => {
+                let name_tcp = name.clone();
+                let name_udp = name.clone();
+                let tcp_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_tcp_port_forward(bind_addr, remote_addr, tcp_state).await {
+                        error!("port-forward TCP(both) {name_tcp} error: {:#}", e);
+                    }
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = run_udp_port_forward(bind_addr, remote_addr, state).await {
+                        error!("port-forward UDP(both) {name_udp} error: {:#}", e);
+                    }
+                });
+            }
+        }
     }
 
     {
@@ -681,21 +941,17 @@ async fn handle_tcp_connection(
         debug!("direct connect to {}", orig_dst);
         direct_connect(orig_dst, state.config.fwmark).await?
     } else {
-        let socks5_creds = match (&state.config.socks5_user, &state.config.socks5_password) {
-            (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
-            _ => None,
-        };
         debug!("proxy connect to {}", orig_dst);
         socks5_connect(
             orig_dst,
             &state.config.socks5_addr,
             state.config.fwmark,
-            socks5_creds,
+            state.socks5_credentials(),
         )
         .await?
     };
 
-    let (a, b) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    let (a, b) = tokio_splice::zero_copy_bidirectional(&mut client, &mut upstream).await?;
 
     debug!(
         "tcp finished, client->upstream={} bytes, upstream->client={} bytes",
@@ -736,66 +992,42 @@ async fn direct_connect(orig_dst: SocketAddr, fwmark: u32) -> Result<TcpStream> 
     Ok(stream)
 }
 
-fn enable_orig_dst<F: std::os::fd::AsFd>(fd: &F, ipv6: bool) -> std::io::Result<()> {
-    if ipv6 {
-        setsockopt(fd, sockopt::Ipv6OrigDstAddr, &true)
-            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-    } else {
-        setsockopt(fd, sockopt::Ipv4OrigDstAddr, &true)
-            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-    }
-    Ok(())
+fn enable_orig_dst_v4<F: std::os::fd::AsFd>(fd: &F) -> io::Result<()> {
+    setsockopt(fd, sockopt::Ipv4OrigDstAddr, &true).map_err(errno_to_io)
+}
+
+fn enable_orig_dst_v6<F: std::os::fd::AsFd>(fd: &F) -> io::Result<()> {
+    setsockopt(fd, sockopt::Ipv6OrigDstAddr, &true).map_err(errno_to_io)
 }
 
 fn tproxy_tcp_listener_for_ip(ip: IpAddr, port: u16) -> Result<TcpListener> {
     let sa = SocketAddr::new(ip, port);
-    let domain = if sa.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .context("failed to create TCP socket")?;
-
-    if sa.is_ipv4() {
-        socket.set_ip_transparent_v4(true)?;
-        enable_orig_dst(&socket, false).context("failed to set IP_RECVORIGDSTADDR")?;
-    } else {
-        socket.set_ip_transparent_v6(true)?;
-        socket.set_only_v6(true)?; // 只处理 IPv6，避免混淆
-        enable_orig_dst(&socket, true).context("failed to set IPV6_RECVORIGDSTADDR")?;
-    }
-
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&sa.into())?;
-    socket.listen(1024)?;
-
-    TcpListener::from_std(socket.into()).context("failed to convert to tokio TCP listener")
+    SocketFactory::new().bind_tcp_listener(
+        sa,
+        true,
+        true,
+        if sa.is_ipv6() { Some(true) } else { None },
+        1024,
+    )
 }
 
 fn create_tproxy_tcp_listeners(
-    addr: &str,
+    ip: IpAddr,
     port: u16,
 ) -> Result<(Option<TcpListener>, Option<TcpListener>)> {
-    let ip: IpAddr = addr
-        .parse()
-        .map_err(|e| anyhow!("invalid listen address '{addr}': {e}"))?;
     match ip {
         IpAddr::V4(_) => {
             let v4 = tproxy_tcp_listener_for_ip(ip, port)?;
             Ok((Some(v4), None))
         }
-        IpAddr::V6(ipv6) => {
-            if ipv6.is_unspecified() {
-                let v4 = tproxy_tcp_listener_for_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)?;
-                let v6 = tproxy_tcp_listener_for_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)?;
-                Ok((Some(v4), Some(v6)))
-            } else {
-                let v6 = tproxy_tcp_listener_for_ip(ip, port)?;
-                Ok((None, Some(v6)))
-            }
+        IpAddr::V6(v6) if v6.is_unspecified() => {
+            let v4 = tproxy_tcp_listener_for_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)?;
+            let v6 = tproxy_tcp_listener_for_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)?;
+            Ok((Some(v4), Some(v6)))
+        }
+        IpAddr::V6(_) => {
+            let v6 = tproxy_tcp_listener_for_ip(ip, port)?;
+            Ok((None, Some(v6)))
         }
     }
 }
@@ -830,54 +1062,26 @@ async fn tcp_accept_loop(listener: TcpListener, state: Arc<AppState>) {
 
 fn tproxy_udp_socket_for_ip(ip: IpAddr, port: u16) -> Result<UdpSocket> {
     let sa = SocketAddr::new(ip, port);
-    let domain = if sa.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .context("failed to create UDP socket")?;
-
-    if sa.is_ipv4() {
-        socket.set_ip_transparent_v4(true)?;
-        enable_orig_dst(&socket, false).context("failed to set IP_RECVORIGDSTADDR")?;
-    } else {
-        socket.set_ip_transparent_v6(true)?;
-        socket.set_only_v6(true)?;
-        enable_orig_dst(&socket, true).context("failed to set IPV6_RECVORIGDSTADDR")?;
-    }
-
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&sa.into())?;
-
-    let std_sock: std::net::UdpSocket = socket.into();
-    UdpSocket::from_std(std_sock).context("failed to convert to tokio UDP socket")
+    SocketFactory::new().bind_tproxy_udp_socket(sa, if sa.is_ipv6() { Some(true) } else { None })
 }
 
 fn create_tproxy_udp_sockets(
-    addr: &str,
+    ip: IpAddr,
     port: u16,
 ) -> Result<(Option<UdpSocket>, Option<UdpSocket>)> {
-    let ip: IpAddr = addr
-        .parse()
-        .map_err(|e| anyhow!("invalid listen address '{addr}': {e}"))?;
     match ip {
         IpAddr::V4(_) => {
             let v4 = tproxy_udp_socket_for_ip(ip, port)?;
             Ok((Some(v4), None))
         }
-        IpAddr::V6(ipv6) => {
-            if ipv6.is_unspecified() {
-                let v4 = tproxy_udp_socket_for_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)?;
-                let v6 = tproxy_udp_socket_for_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)?;
-                Ok((Some(v4), Some(v6)))
-            } else {
-                let v6 = tproxy_udp_socket_for_ip(ip, port)?;
-                Ok((None, Some(v6)))
-            }
+        IpAddr::V6(v6) if v6.is_unspecified() => {
+            let v4 = tproxy_udp_socket_for_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)?;
+            let v6 = tproxy_udp_socket_for_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)?;
+            Ok((Some(v4), Some(v6)))
+        }
+        IpAddr::V6(_) => {
+            let v6 = tproxy_udp_socket_for_ip(ip, port)?;
+            Ok((None, Some(v6)))
         }
     }
 }
@@ -1209,123 +1413,103 @@ async fn socks5_udp_associate_for_client(
     })
 }
 
-fn create_direct_udp_socket(orig_dst: SocketAddr, fwmark: u32) -> Result<Arc<UdpSocket>> {
-    let domain = if orig_dst.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .context("failed to create direct UDP socket")?;
-
-    socket.set_mark(fwmark)?;
-    socket.set_nonblocking(true)?;
-
-    if orig_dst.is_ipv4() {
-        socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into())?;
-    } else {
-        socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into())?;
-    }
-
-    socket
-        .connect(&orig_dst.into())
-        .with_context(|| format!("failed to connect direct UDP socket to {orig_dst}"))?;
-
-    let std_udp: std::net::UdpSocket = socket.into();
-
-    Ok(Arc::new(UdpSocket::from_std(std_udp)?))
+fn create_direct_udp_socket(target_addr: SocketAddr, fwmark: u32) -> Result<Arc<UdpSocket>> {
+    SocketFactory::new().connect_direct_udp(target_addr, fwmark)
 }
 
 fn create_fake_udp_socket(src_addr: SocketAddr, fwmark: u32) -> Result<UdpSocket> {
-    let domain = if src_addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .context("failed to create fake UDP socket")?;
-
-    if src_addr.is_ipv4() {
-        socket
-            .set_ip_transparent_v4(true)
-            .context("failed to set IP_TRANSPARENT for fake UDP socket")?;
-    } else {
-        socket
-            .set_ip_transparent_v6(true)
-            .context("failed to set IPV6_TRANSPARENT for fake UDP socket")?;
-        socket
-            .set_only_v6(false)
-            .context("failed to disable IPV6_V6ONLY for fake UDP socket")?;
-    }
-
-    socket.set_mark(fwmark)?;
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.set_nonblocking(true)?;
-
     // 核心：bind 到要伪装成的源地址。
     // 例如返回 DNS 响应时，这里可能是 8.8.8.8:53。
-    socket
-        .bind(&src_addr.into())
-        .with_context(|| format!("failed to bind fake UDP socket to {src_addr}"))?;
-
-    let std_udp: std::net::UdpSocket = socket.into();
+    let std_udp = SocketFactory::new().bind_udp_std(
+        src_addr,
+        true,
+        true,
+        if src_addr.is_ipv6() {
+            Some(false)
+        } else {
+            None
+        },
+        Some(fwmark),
+    )?;
 
     UdpSocket::from_std(std_udp).context("failed to convert fake UDP socket to tokio")
 }
 
-async fn create_udp_session(state: Arc<AppState>, key: UdpSessionKey) -> Result<Arc<UdpSession>> {
-    let direct = state.should_direct(key.orig_dst.ip());
+async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Result<Arc<UdpSession>> {
+    let key = spec.key;
 
-    let outbound = if direct {
-        debug!(
-            "creating direct UDP session: client={}, orig_dst={}",
-            key.client_addr, key.orig_dst
-        );
+    let outbound = match spec.routing {
+        UdpRoutingMode::Auto => {
+            if state.should_direct(key.target_addr.ip()) {
+                debug!(
+                    "creating direct UDP session: kind={:?}, client={}, target={}",
+                    key.kind, key.client_addr, key.target_addr
+                );
 
-        let socket = create_direct_udp_socket(key.orig_dst, state.config.fwmark)?;
+                let socket = create_direct_udp_socket(key.target_addr, state.config.fwmark)?;
 
-        debug!(
-            "direct UDP socket created: local={}, peer={}",
-            socket.local_addr()?,
-            socket.peer_addr()?
-        );
+                debug!(
+                    "direct UDP socket created: local={}, peer={}",
+                    socket.local_addr()?,
+                    socket.peer_addr()?
+                );
 
-        UdpOutbound::Direct { socket }
-    } else {
-        let socks5_creds = match (&state.config.socks5_user, &state.config.socks5_password) {
-            (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
-            _ => None,
-        };
-        debug!(
-            "creating SOCKS5 UDP session: client={}, orig_dst={}",
-            key.client_addr, key.orig_dst
-        );
+                UdpOutbound::Direct { socket }
+            } else {
+                debug!(
+                    "creating SOCKS5 UDP session: kind={:?}, client={}, target={}",
+                    key.kind, key.client_addr, key.target_addr
+                );
 
-        let assoc = socks5_udp_associate_for_client(
-            &state.config.socks5_addr,
-            state.config.fwmark,
-            socks5_creds,
-        )
-        .await?;
+                let assoc = socks5_udp_associate_for_client(
+                    &state.config.socks5_addr,
+                    state.config.fwmark,
+                    state.socks5_credentials(),
+                )
+                .await?;
 
-        debug!(
-            "SOCKS5 UDP session created: client={}, orig_dst={}, relay={}, local={}",
-            key.client_addr,
-            key.orig_dst,
-            assoc.relay_addr,
-            assoc.udp_socket.local_addr()?
-        );
+                debug!(
+                    "SOCKS5 UDP session created: kind={:?}, client={}, target={}, relay={}, local={}",
+                    key.kind,
+                    key.client_addr,
+                    key.target_addr,
+                    assoc.relay_addr,
+                    assoc.udp_socket.local_addr()?
+                );
 
-        UdpOutbound::Socks5 { assoc }
+                UdpOutbound::Socks5 { assoc }
+            }
+        }
+        UdpRoutingMode::ForceSocks5 => {
+            debug!(
+                "creating forced SOCKS5 UDP session: kind={:?}, client={}, target={}",
+                key.kind, key.client_addr, key.target_addr
+            );
+
+            let assoc = socks5_udp_associate_for_client(
+                &state.config.socks5_addr,
+                state.config.fwmark,
+                state.socks5_credentials(),
+            )
+            .await?;
+
+            debug!(
+                "forced SOCKS5 UDP session created: kind={:?}, client={}, target={}, relay={}, local={}",
+                key.kind,
+                key.client_addr,
+                key.target_addr,
+                assoc.relay_addr,
+                assoc.udp_socket.local_addr()?
+            );
+
+            UdpOutbound::Socks5 { assoc }
+        }
     };
 
     let session = Arc::new(UdpSession {
-        key,
+        spec,
         outbound,
-        last_seen: Mutex::new(Instant::now()),
+        last_seen_secs: AtomicU64::new(now_secs()),
         cancel: CancellationToken::new(),
     });
 
@@ -1352,7 +1536,7 @@ async fn create_udp_session(state: Arc<AppState>, key: UdpSessionKey) -> Result<
 
 async fn run_udp_loop(state: Arc<AppState>, tproxy_udp: UdpSocket) -> Result<()> {
     let tproxy_udp = TProxyUdpSocket::new(tproxy_udp);
-    let mut buf = vec![0u8; 65535];
+    let mut buf = new_aligned_udp_buf();
 
     loop {
         let packet = match tproxy_udp.recv_packet(&mut buf).await {
@@ -1369,40 +1553,42 @@ async fn run_udp_loop(state: Arc<AppState>, tproxy_udp: UdpSocket) -> Result<()>
 
         let payload = &buf[..packet.len];
 
-        let key = UdpSessionKey {
-            client_addr: packet.client_addr,
-            orig_dst: packet.orig_dst,
-        };
+        let spec = UdpSessionSpec::for_tproxy(packet.client_addr, packet.orig_dst);
 
         let session = match state
             .udp_runtime
-            .get_or_create_udp_session(state.clone(), key)
+            .get_or_create_udp_session(state.clone(), spec)
             .await
         {
             Ok(session) => session,
             Err(e) => {
                 warn!(
-                    "failed to get/create UDP session: client={}, orig_dst={}, error={:#}",
-                    packet.client_addr, packet.orig_dst, e
+                    "failed to get/create UDP session: kind={:?}, client={}, target={}, error={:#}",
+                    UdpSessionKind::Tproxy,
+                    packet.client_addr,
+                    packet.orig_dst,
+                    e
                 );
                 continue;
             }
         };
 
-        session.touch().await;
+        session.touch();
 
         match session.send_payload(payload).await {
             Ok(sent) => {
                 if sent == 0 {
                     debug!(
-                        "UDP packet dropped before forwarding: client={}, orig_dst={}, payload_len={}, sent=0",
+                        "UDP packet dropped before forwarding: kind={:?}, client={}, target={}, payload_len={}, sent=0",
+                        UdpSessionKind::Tproxy,
                         packet.client_addr,
                         packet.orig_dst,
                         payload.len()
                     );
                 } else {
                     debug!(
-                        "UDP packet forwarded: client={}, orig_dst={}, payload_len={}, sent={}",
+                        "UDP packet forwarded: kind={:?}, client={}, target={}, payload_len={}, sent={}",
+                        UdpSessionKind::Tproxy,
                         packet.client_addr,
                         packet.orig_dst,
                         payload.len(),
@@ -1412,8 +1598,11 @@ async fn run_udp_loop(state: Arc<AppState>, tproxy_udp: UdpSocket) -> Result<()>
             }
             Err(e) => {
                 warn!(
-                    "failed to forward UDP packet: client={}, orig_dst={}, error={:#}",
-                    packet.client_addr, packet.orig_dst, e
+                    "failed to forward UDP packet: kind={:?}, client={}, target={}, error={:#}",
+                    UdpSessionKind::Tproxy,
+                    packet.client_addr,
+                    packet.orig_dst,
+                    e
                 );
             }
         }
@@ -1425,11 +1614,11 @@ async fn run_udp_session_recv_loop(
     state: Arc<AppState>,
     ready_tx: oneshot::Sender<()>,
 ) -> Result<()> {
-    let key = session.key;
+    let key = session.key();
 
     debug!(
-        "UDP session recv loop starting: client={}, orig_dst={}",
-        key.client_addr, key.orig_dst
+        "UDP session recv loop starting: kind={:?}, client={}, target={}",
+        key.kind, key.client_addr, key.target_addr
     );
 
     match &session.outbound {
@@ -1455,13 +1644,14 @@ async fn run_direct_udp_recv_loop(
     socket: Arc<UdpSocket>,
     ready_tx: oneshot::Sender<()>,
 ) -> Result<()> {
-    let key = session.key;
-    let mut buf = vec![0u8; 65535];
+    let key = session.key();
+    let mut buf = new_aligned_udp_buf();
 
     debug!(
-        "direct UDP recv loop started: client={}, orig_dst={}, local={}, peer={}",
+        "direct UDP recv loop started: kind={:?}, client={}, target={}, local={}, peer={}",
+        key.kind,
         key.client_addr,
-        key.orig_dst,
+        key.target_addr,
         socket.local_addr()?,
         socket.peer_addr()?
     );
@@ -1472,9 +1662,10 @@ async fn run_direct_udp_recv_loop(
         tokio::select! {
             _ = session.cancel.cancelled() => {
                 debug!(
-                    "direct UDP recv loop cancelled: client={}, orig_dst={}",
+                    "direct UDP recv loop cancelled: kind={:?}, client={}, target={}",
+                    key.kind,
                     key.client_addr,
-                    key.orig_dst
+                    key.target_addr
                 );
                 return Ok(());
             }
@@ -1490,26 +1681,27 @@ async fn run_direct_udp_recv_loop(
                     None => continue,
                 };
 
-                session.touch().await;
+                session.touch();
 
                 let payload = &buf[..n];
 
                 debug!(
-                    "direct UDP response: orig_dst={}, client={}, payload_len={}",
-                    key.orig_dst,
+                    "direct UDP response: kind={:?}, target={}, client={}, payload_len={}",
+                    key.kind,
+                    key.target_addr,
                     key.client_addr,
                     payload.len()
                 );
 
-                send_fake_udp_response(
-                    &state,
-                    "direct_to_client",
-                    key.orig_dst,
-                    key.client_addr,
-                    payload,
-                    None,
-                )
-                .await;
+                session
+                    .send_reply(
+                        &state,
+                        "direct_to_client",
+                        key.target_addr,
+                        payload,
+                        None,
+                    )
+                    .await;
             }
         }
     }
@@ -1522,13 +1714,14 @@ async fn run_socks5_udp_recv_loop(
     relay_addr: SocketAddr,
     ready_tx: oneshot::Sender<()>,
 ) -> Result<()> {
-    let key = session.key;
-    let mut buf = vec![0u8; 65535];
+    let key = session.key();
+    let mut buf = new_aligned_udp_buf();
 
     debug!(
-        "SOCKS5 UDP recv loop started: client={}, orig_dst={}, relay={}, local={}",
+        "SOCKS5 UDP recv loop started: kind={:?}, client={}, target={}, relay={}, local={}",
+        key.kind,
         key.client_addr,
-        key.orig_dst,
+        key.target_addr,
         relay_addr,
         relay_sock.local_addr()?
     );
@@ -1539,9 +1732,10 @@ async fn run_socks5_udp_recv_loop(
         tokio::select! {
             _ = session.cancel.cancelled() => {
                 debug!(
-                    "SOCKS5 UDP recv loop cancelled: client={}, orig_dst={}",
+                    "SOCKS5 UDP recv loop cancelled: kind={:?}, client={}, target={}",
+                    key.kind,
                     key.client_addr,
-                    key.orig_dst
+                    key.target_addr
                 );
                 return Ok(());
             }
@@ -1557,15 +1751,16 @@ async fn run_socks5_udp_recv_loop(
                     None => continue,
                 };
 
-                session.touch().await;
+                session.touch();
 
                 let (remote_src, payload) = match parse_socks5_udp_packet(&buf[..n]) {
                     Ok(v) => v,
                     Err(e) => {
                         warn!(
-                            "invalid SOCKS5 UDP packet: client={}, orig_dst={}, relay={}, packet_len={}, error={:#}",
+                            "invalid SOCKS5 UDP packet: kind={:?}, client={}, target={}, relay={}, packet_len={}, error={:#}",
+                            key.kind,
                             key.client_addr,
-                            key.orig_dst,
+                            key.target_addr,
                             relay_addr,
                             n,
                             e
@@ -1575,21 +1770,22 @@ async fn run_socks5_udp_recv_loop(
                 };
 
                 debug!(
-                    "SOCKS5 UDP response: remote_src={}, client={}, payload_len={}",
+                    "SOCKS5 UDP response: kind={:?}, remote_src={}, client={}, payload_len={}",
+                    key.kind,
                     remote_src,
                     key.client_addr,
                     payload.len()
                 );
 
-                send_fake_udp_response(
-                    &state,
-                    "socks5_to_client",
-                    remote_src,
-                    key.client_addr,
-                    payload,
-                    Some(relay_addr),
-                )
-                .await;
+                session
+                    .send_reply(
+                        &state,
+                        "socks5_to_client",
+                        remote_src,
+                        payload,
+                        Some(relay_addr),
+                    )
+                    .await;
             }
         }
     }
@@ -1608,6 +1804,101 @@ async fn run_udp_gc_loop(state: Arc<AppState>) {
             .fake_udp
             .cleanup_expired(state.udp_runtime.timeout)
             .await;
+    }
+}
+
+async fn run_tcp_port_forward(
+    listen_addr: SocketAddr,
+    remote: SocketAddr,
+    state: Arc<AppState>,
+) -> Result<()> {
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("bind port-forward TCP {listen_addr} failed"))?;
+
+    info!(
+        "port-forward TCP: listening on {}, forwarding to {} via SOCKS5",
+        listen_addr, remote
+    );
+
+    loop {
+        let (mut client, peer_addr) = listener.accept().await?;
+        let state = state.clone();
+
+        tokio::spawn(async move {
+            info!("port-forward TCP: {} -> {} via SOCKS5", peer_addr, remote);
+
+            let mut upstream = match socks5_connect(
+                remote,
+                &state.config.socks5_addr,
+                state.config.fwmark,
+                state.socks5_credentials(),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("port-forward TCP SOCKS5 connect to {remote}: {:#}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = tokio_splice::zero_copy_bidirectional(&mut client, &mut upstream).await
+            {
+                error!("port-forward TCP relay error: {:#}", e);
+            }
+        });
+    }
+}
+
+async fn run_udp_port_forward(
+    listen_addr: SocketAddr,
+    remote: SocketAddr,
+    state: Arc<AppState>,
+) -> Result<()> {
+    let listen_sock = SocketFactory::new().bind_port_forward_udp_listener(listen_addr)?;
+
+    info!(
+        "port-forward UDP: listening on {}, forwarding to {} via SOCKS5",
+        listen_addr, remote
+    );
+
+    let mut buf = new_aligned_udp_buf();
+
+    loop {
+        let (n, client_addr) = listen_sock.recv_from(&mut buf).await?;
+        if n == 0 {
+            continue;
+        }
+
+        let payload = &buf[..n];
+
+        let spec =
+            UdpSessionSpec::for_port_forward(listen_addr, client_addr, remote, listen_sock.clone());
+
+        let session = match state
+            .udp_runtime
+            .get_or_create_udp_session(state.clone(), spec)
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => {
+                warn!(
+                    "failed to get/create UDP port-forward session: client={}, remote={}, error={:#}",
+                    client_addr, remote, e
+                );
+                continue;
+            }
+        };
+
+        session.touch();
+
+        if let Err(e) = session.send_payload(payload).await {
+            warn!(
+                "port-forward UDP send error: client={}, remote={}, error={:#}",
+                client_addr, remote, e
+            );
+        }
     }
 }
 
@@ -1741,8 +2032,8 @@ fn connected_udp_recv_result(
         Ok(n) => Ok(Some(n)),
         Err(e) if is_io_emsgsize(&e) => {
             warn!(
-                "UDP recv got EMSGSIZE, ignored: direction={}, client={}, orig_dst={}, relay={:?}, error={}",
-                direction, key.client_addr, key.orig_dst, relay_addr, e
+                "UDP recv got EMSGSIZE, ignored: direction={}, kind={:?}, client={}, target={}, relay={:?}, error={}",
+                direction, key.kind, key.client_addr, key.target_addr, relay_addr, e
             );
 
             Ok(None)
@@ -1751,51 +2042,149 @@ fn connected_udp_recv_result(
     }
 }
 
-async fn send_fake_udp_response(
-    state: &AppState,
-    direction: &'static str,
-    spoofed_src: SocketAddr,
-    client_addr: SocketAddr,
-    payload: &[u8],
-    relay_addr: Option<SocketAddr>,
-) {
-    match state
-        .udp_runtime
-        .fake_udp
-        .send_to(spoofed_src, client_addr, payload, state.config.fwmark)
-        .await
-    {
-        Ok(sent) => {
-            debug!(
-                "UDP response sent: direction={}, spoofed_src={}, client={}, payload_len={}, sent={}",
-                direction,
-                spoofed_src,
-                client_addr,
-                payload.len(),
-                sent
-            );
+fn new_aligned_udp_buf() -> AVec<u8, RuntimeAlign> {
+    let mut buf = AVec::<u8, RuntimeAlign>::with_capacity(UDP_BUF_ALIGN.into(), UDP_RECV_BUF_SIZE);
+    buf.resize(UDP_RECV_BUF_SIZE, 0);
+    buf
+}
+
+fn unspecified_addr_for(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
+
+struct SocketFactory;
+
+impl SocketFactory {
+    fn new() -> Self {
+        Self
+    }
+
+    fn domain_for(addr: SocketAddr) -> Domain {
+        if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
         }
-        Err(e) if is_anyhow_emsgsize(&e) => {
-            warn!(
-                "UDP datagram dropped due to EMSGSIZE: direction={}, spoofed_src={}, client={}, payload_len={}, relay={:?}, error={:#}",
-                direction,
-                spoofed_src,
-                client_addr,
-                payload.len(),
-                relay_addr,
-                e
-            );
+    }
+
+    fn udp_socket(&self, addr: SocketAddr) -> Result<Socket> {
+        Socket::new(Self::domain_for(addr), Type::DGRAM, Some(Protocol::UDP))
+            .context("failed to create UDP socket")
+    }
+
+    fn tcp_socket(&self, addr: SocketAddr) -> Result<Socket> {
+        Socket::new(Self::domain_for(addr), Type::STREAM, Some(Protocol::TCP))
+            .context("failed to create TCP socket")
+    }
+
+    fn enable_orig_dst(&self, socket: &Socket, addr: SocketAddr) -> Result<()> {
+        if addr.is_ipv4() {
+            enable_orig_dst_v4(socket).context("failed to set IP_RECVORIGDSTADDR")?;
+        } else {
+            enable_orig_dst_v6(socket).context("failed to set IPV6_RECVORIGDSTADDR")?;
         }
-        Err(e) => {
-            warn!(
-                "failed to send UDP response: direction={}, spoofed_src={}, client={}, payload_len={}, relay={:?}, error={:#}",
-                direction,
-                spoofed_src,
-                client_addr,
-                payload.len(),
-                relay_addr,
-                e
-            );
+
+        Ok(())
+    }
+
+    fn apply_socket_options(
+        &self,
+        socket: &Socket,
+        addr: SocketAddr,
+        reuse_addr: bool,
+        transparent: bool,
+        only_v6: Option<bool>,
+        mark: Option<u32>,
+    ) -> Result<()> {
+        if transparent {
+            if addr.is_ipv4() {
+                socket.set_ip_transparent_v4(true)?;
+            } else {
+                socket.set_ip_transparent_v6(true)?;
+            }
         }
+
+        if let Some(v) = only_v6 {
+            if addr.is_ipv6() {
+                socket.set_only_v6(v)?;
+            }
+        }
+
+        if reuse_addr {
+            set_socket_reuse(socket)?;
+        }
+
+        if let Some(fwmark) = mark {
+            socket.set_mark(fwmark)?;
+        }
+
+        Ok(())
+    }
+
+    fn bind_udp_std(
+        &self,
+        addr: SocketAddr,
+        reuse_addr: bool,
+        transparent: bool,
+        only_v6: Option<bool>,
+        mark: Option<u32>,
+    ) -> Result<std::net::UdpSocket> {
+        let socket = self.udp_socket(addr)?;
+        self.apply_socket_options(&socket, addr, reuse_addr, transparent, only_v6, mark)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        Ok(socket.into())
+    }
+
+    fn bind_tcp_listener(
+        &self,
+        addr: SocketAddr,
+        reuse_addr: bool,
+        transparent: bool,
+        only_v6: Option<bool>,
+        backlog: i32,
+    ) -> Result<TcpListener> {
+        let socket = self.tcp_socket(addr)?;
+        self.apply_socket_options(&socket, addr, reuse_addr, transparent, only_v6, None)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(backlog)?;
+        TcpListener::from_std(socket.into()).context("failed to convert to tokio TCP listener")
+    }
+
+    fn bind_tproxy_udp_socket(&self, addr: SocketAddr, only_v6: Option<bool>) -> Result<UdpSocket> {
+        let socket = self.udp_socket(addr)?;
+        self.apply_socket_options(&socket, addr, true, true, only_v6, None)?;
+        self.enable_orig_dst(&socket, addr)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        UdpSocket::from_std(socket.into()).context("failed to convert to tokio UDP socket")
+    }
+
+    fn connect_direct_udp(&self, target_addr: SocketAddr, fwmark: u32) -> Result<Arc<UdpSocket>> {
+        let bind_addr = unspecified_addr_for(target_addr);
+        let socket = self.udp_socket(bind_addr)?;
+        self.apply_socket_options(&socket, bind_addr, false, false, None, Some(fwmark))?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&bind_addr.into())?;
+        socket
+            .connect(&target_addr.into())
+            .with_context(|| format!("failed to connect direct UDP socket to {target_addr}"))?;
+
+        let std_udp: std::net::UdpSocket = socket.into();
+        Ok(Arc::new(UdpSocket::from_std(std_udp)?))
+    }
+
+    fn bind_port_forward_udp_listener(&self, addr: SocketAddr) -> Result<Arc<UdpSocket>> {
+        let socket = self.udp_socket(addr)?;
+        self.apply_socket_options(&socket, addr, true, false, None, None)?;
+        socket.set_nonblocking(true)?;
+        socket
+            .bind(&addr.into())
+            .with_context(|| format!("bind port-forward UDP to {addr}"))?;
+        Ok(Arc::new(UdpSocket::from_std(socket.into())?))
     }
 }

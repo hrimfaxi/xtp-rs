@@ -1,7 +1,5 @@
-listen_addr = "::"
-listen_port = 10810
-udp_enabled = true
-udp_listen_port = 10810
+listen = "[::]:10810"
+udp = true
 socks5_addr = "127.0.0.1:10808"
 #socks5_user = "user"
 #socks5_password = "password"
