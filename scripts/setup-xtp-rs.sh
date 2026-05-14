@@ -141,8 +141,8 @@ table inet xtp-rs {
 		meta mark 2 return
 		meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
 		meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
-		meta l4proto { udp, } th dport { 53, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
-		meta l4proto { udp, } th dport { 53, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
+		meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
+		meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
 	}
 
 	chain output {
@@ -157,7 +157,7 @@ table inet xtp-rs {
 		ip6 daddr fd00::/8 udp dport != 53 return
 		meta mark 2 counter return
 		meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 accept
-		meta l4proto { udp, } th dport { 53, } meta mark set 1 accept
+		meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 accept
 	}
 
 	# divert表用于避免已有连接的包二次通过TPROXY，理论上有一定的性能提升

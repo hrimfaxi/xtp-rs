@@ -15,6 +15,7 @@ serde = "1.0.228"
 toml = "1.1.2"
 tokio-util = "0.7.18"
 anyhow = "1.0.102"
+nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
 
 [profile.release]
 opt-level = "z"      # 比 "s" 更激进的体积优化
