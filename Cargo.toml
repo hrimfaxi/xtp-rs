@@ -18,6 +18,8 @@ anyhow = "1.0.102"
 nix = { version = "0.31.3", features = ["net", "socket", "uio"] }
 tokio-splice = "0.2.1"
 aligned-vec = "0.6.4"
+ipnet = "2.12.0"
+iptrie = "0.11.1"
 
 [profile.release]
 opt-level = "z"      # 比 "s" 更激进的体积优化

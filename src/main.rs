@@ -1,6 +1,8 @@
 use aligned_vec::{AVec, RuntimeAlign};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use ipnet::IpNet;
+use iptrie::{IpPrefix, Ipv4Prefix, Ipv4RTrieSet, Ipv6Prefix, Ipv6RTrieSet};
 use maxminddb::Reader;
 use maxminddb::geoip2::Country;
 use nix::errno::Errno;
@@ -27,7 +29,10 @@ const UDP_RECV_BUF_SIZE: usize = 65_536;
 const UDP_BUF_ALIGN: usize = 4096;
 
 #[derive(Parser)]
-#[command(name = "xtp-rs", about = "XTP-RS - Transparent TCP/UDP proxy splitter")]
+#[command(
+    name = "xtp-rs",
+    about = "tproxy / port forward -> SOCKS5, with IP country-based direct switch"
+)]
 struct Cli {
     /// 配置文件路径
     #[arg(short = 'c', long, default_value = "xtp-rs.toml")]
@@ -47,7 +52,7 @@ struct PortForward {
     name: Option<String>,
     bind: String,
     remote: String,
-    proto: PortForwardProto,
+    network: PortForwardProto,
 }
 
 #[derive(Deserialize, Clone)]
@@ -70,13 +75,30 @@ struct Config {
     #[serde(default = "default_fwmark")]
     fwmark: u32,
 
-    #[serde(default = "default_mmdb_path")]
-    mmdb_path: String,
+    mmdb_path: Option<String>,
 
     #[serde(default = "default_udp_session_timeout_secs")]
     udp_session_timeout_secs: u64,
 
+    #[serde(default = "default_splice")]
+    splice: bool,
+
     log_level: Option<String>,
+
+    #[serde(default = "default_direct_countries")]
+    direct_countries: Vec<String>,
+
+    #[serde(default)]
+    force_direct_ips: Vec<String>,
+
+    #[serde(default)]
+    force_socks5_ips: Vec<String>,
+
+    #[serde(default)]
+    force_direct_ips_file: Option<String>,
+
+    #[serde(default)]
+    force_socks5_ips_file: Option<String>,
 
     #[serde(default)]
     port_forward: Vec<PortForward>,
@@ -90,6 +112,10 @@ fn default_udp() -> bool {
     true
 }
 
+fn default_direct_countries() -> Vec<String> {
+    vec!["CN".to_string()]
+}
+
 fn default_socks5_addr() -> String {
     "127.0.0.1:20808".to_string()
 }
@@ -98,32 +124,67 @@ fn default_fwmark() -> u32 {
     2
 }
 
-fn default_mmdb_path() -> String {
-    "Country-only-cn-private.mmdb".to_string()
-}
-
 fn default_udp_session_timeout_secs() -> u64 {
     60
 }
 
+fn default_splice() -> bool {
+    true
+}
+
 struct AppState {
-    mmdb: Arc<Reader<Vec<u8>>>,
+    mmdb: Option<Arc<Reader<Vec<u8>>>>,
     config: Config,
     udp_runtime: Arc<UdpRuntime>,
+    force_direct_v4: Ipv4RTrieSet,
+    force_direct_v6: Ipv6RTrieSet,
+    force_socks5_v4: Ipv4RTrieSet,
+    force_socks5_v6: Ipv6RTrieSet,
+}
+
+fn ipv4_trie_contains(trie: &Ipv4RTrieSet, ip: &Ipv4Addr) -> bool {
+    trie.lookup(ip).len() != 0
+}
+
+fn ipv6_trie_contains(trie: &Ipv6RTrieSet, ip: &Ipv6Addr) -> bool {
+    trie.lookup(ip).len() != 0
 }
 
 impl AppState {
     fn should_direct(&self, ip: IpAddr) -> bool {
-        is_must_direct_local_ip(ip) || self.is_china_ip(ip)
+        match ip {
+            IpAddr::V4(ipv4) => {
+                // 先检查 SOCKS5 强制名单（优先级最高）
+                if ipv4_trie_contains(&self.force_socks5_v4, &ipv4) {
+                    return false;
+                }
+                if ipv4_trie_contains(&self.force_direct_v4, &ipv4) {
+                    return true;
+                }
+            }
+            IpAddr::V6(ipv6) => {
+                if ipv6_trie_contains(&self.force_socks5_v6, &ipv6) {
+                    return false;
+                }
+                if ipv6_trie_contains(&self.force_direct_v6, &ipv6) {
+                    return true;
+                }
+            }
+        }
+        is_must_direct_local_ip(ip) || self.is_direct_country_ip(ip)
     }
 
-    fn is_china_ip(&self, ip: IpAddr) -> bool {
-        let result = match self.mmdb.lookup(ip) {
+    fn is_direct_country_ip(&self, ip: IpAddr) -> bool {
+        let mmdb = match self.mmdb.as_ref() {
+            Some(reader) => reader,
+            None => return false,
+        };
+        let lookup_result = match mmdb.lookup(ip) {
             Ok(r) => r,
             Err(_) => return false,
         };
 
-        let country = match result.decode::<Country>() {
+        let country = match lookup_result.decode::<Country>() {
             Ok(Some(c)) => c,
             _ => return false,
         };
@@ -131,7 +192,7 @@ impl AppState {
         country
             .country
             .iso_code
-            .map(|code| code == "CN")
+            .map(|code| self.config.direct_countries.iter().any(|c| c == code))
             .unwrap_or(false)
     }
 
@@ -792,6 +853,56 @@ fn set_socket_reuse(socket: &Socket) -> Result<()> {
     Ok(())
 }
 
+fn parse_ip_net_list(list: &[String]) -> Result<Vec<IpNet>> {
+    list.iter()
+        .map(|raw| {
+            let s = raw.trim();
+
+            if s.is_empty() {
+                bail!("empty IP/CIDR entry");
+            }
+
+            if let Ok(net) = s.parse::<IpNet>() {
+                return Ok(net);
+            }
+
+            let ip: IpAddr = s
+                .parse()
+                .with_context(|| format!("invalid IP/CIDR '{}'", raw))?;
+
+            let prefix_len = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+
+            IpNet::new(ip, prefix_len)
+                .with_context(|| format!("failed to build host network from '{}'", raw))
+        })
+        .collect()
+}
+
+fn build_ip_tries(nets: &[IpNet]) -> Result<(Ipv4RTrieSet, Ipv6RTrieSet)> {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+
+    for net in nets {
+        match net {
+            IpNet::V4(v4net) => {
+                let prefix = Ipv4Prefix::new(v4net.network(), v4net.prefix_len())
+                    .context("failed to convert IPv4 network to prefix")?;
+                v4.push(prefix);
+            }
+            IpNet::V6(v6net) => {
+                let prefix = Ipv6Prefix::new(v6net.network(), v6net.prefix_len())
+                    .context("failed to convert IPv6 network to prefix")?;
+                v6.push(prefix);
+            }
+        }
+    }
+
+    Ok((Ipv4RTrieSet::from_iter(v4), Ipv6RTrieSet::from_iter(v6)))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -812,12 +923,20 @@ async fn main() -> Result<()> {
 
     debug!("xtp-rs started");
 
-    let mmdb_data = tokio::fs::read(&config.mmdb_path)
-        .await
-        .with_context(|| format!("failed to read MMDB file {}", config.mmdb_path))?;
-    let mmdb = Reader::from_source(mmdb_data).context("invalid MMDB data")?;
-
-    info!("MMDB loaded from {}", config.mmdb_path);
+    let mmdb = match config.mmdb_path.as_deref() {
+        Some("") | None => {
+            info!("MMDB is disabled");
+            None
+        }
+        Some(path) => {
+            let data = tokio::fs::read(path)
+                .await
+                .with_context(|| format!("failed to read MMDB file {}", path))?;
+            let reader = Reader::from_source(data).context("invalid MMDB data")?;
+            info!("MMDB loaded from {}", path);
+            Some(Arc::new(reader))
+        }
+    };
 
     let udp_runtime = Arc::new(UdpRuntime::new(Duration::from_secs(
         config.udp_session_timeout_secs,
@@ -826,10 +945,52 @@ async fn main() -> Result<()> {
     let (listen_ip, listen_port) =
         parse_listen_addr(&config.listen).context("invalid listen address")?;
 
+    let mut direct_list = config.force_direct_ips.clone();
+    if let Some(ref path) = config.force_direct_ips_file {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read force_direct_ips_file '{}'", path))?;
+        direct_list.extend(
+            content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string()),
+        );
+    }
+
+    let mut socks5_list = config.force_socks5_ips.clone();
+    if let Some(ref path) = config.force_socks5_ips_file {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read force_socks5_ips_file '{}'", path))?;
+        socks5_list.extend(
+            content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string()),
+        );
+    }
+
+    let direct_nets =
+        parse_ip_net_list(&direct_list).context("failed to parse force_direct_ips")?;
+    info!("force_direct_ips: {} entries loaded", direct_nets.len());
+    let socks5_nets =
+        parse_ip_net_list(&socks5_list).context("failed to parse force_socks5_ips")?;
+    info!("force_socks5_ips: {} entries loaded", socks5_nets.len());
+
+    let (force_direct_v4, force_direct_v6) =
+        build_ip_tries(&direct_nets).context("failed to build force_direct tries")?;
+    let (force_socks5_v4, force_socks5_v6) =
+        build_ip_tries(&socks5_nets).context("failed to build force_socks5 tries")?;
+
     let state = Arc::new(AppState {
-        mmdb: Arc::new(mmdb),
+        mmdb: mmdb.clone(),
         config,
         udp_runtime,
+        force_direct_v4,
+        force_direct_v6,
+        force_socks5_v4,
+        force_socks5_v6,
     });
 
     let (tcp_v4, tcp_v6) = create_tproxy_tcp_listeners(listen_ip, listen_port)?;
@@ -884,7 +1045,7 @@ async fn main() -> Result<()> {
         let state = state.clone();
         let name = pf.name.clone().unwrap_or_default();
 
-        match pf.proto {
+        match pf.network {
             PortForwardProto::Tcp => {
                 tokio::spawn(async move {
                     if let Err(e) = run_tcp_port_forward(bind_addr, remote_addr, state).await {
@@ -951,7 +1112,8 @@ async fn handle_tcp_connection(
         .await?
     };
 
-    let (a, b) = tokio_splice::zero_copy_bidirectional(&mut client, &mut upstream).await?;
+    let (a, b) =
+        splice_or_copy_bidirectional(state.config.splice, &mut client, &mut upstream).await?;
 
     debug!(
         "tcp finished, client->upstream={} bytes, upstream->client={} bytes",
@@ -1843,7 +2005,8 @@ async fn run_tcp_port_forward(
                 }
             };
 
-            if let Err(e) = tokio_splice::zero_copy_bidirectional(&mut client, &mut upstream).await
+            if let Err(e) =
+                splice_or_copy_bidirectional(state.config.splice, &mut client, &mut upstream).await
             {
                 error!("port-forward TCP relay error: {:#}", e);
             }
@@ -2001,7 +2164,7 @@ fn is_anyhow_emsgsize(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
-            .map(|ioe| is_io_emsgsize(ioe))
+            .map(is_io_emsgsize)
             .unwrap_or(false)
     })
 }
@@ -2043,9 +2206,25 @@ fn connected_udp_recv_result(
 }
 
 fn new_aligned_udp_buf() -> AVec<u8, RuntimeAlign> {
-    let mut buf = AVec::<u8, RuntimeAlign>::with_capacity(UDP_BUF_ALIGN.into(), UDP_RECV_BUF_SIZE);
+    let mut buf = AVec::<u8, RuntimeAlign>::with_capacity(UDP_BUF_ALIGN, UDP_RECV_BUF_SIZE);
     buf.resize(UDP_RECV_BUF_SIZE, 0);
     buf
+}
+
+async fn splice_or_copy_bidirectional(
+    splice: bool,
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+) -> Result<(u64, u64)> {
+    if splice {
+        tokio_splice::zero_copy_bidirectional(client, upstream)
+            .await
+            .map_err(|e| anyhow!("splice error: {}", e))
+    } else {
+        tokio::io::copy_bidirectional(client, upstream)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 fn unspecified_addr_for(addr: SocketAddr) -> SocketAddr {
@@ -2107,10 +2286,10 @@ impl SocketFactory {
             }
         }
 
-        if let Some(v) = only_v6 {
-            if addr.is_ipv6() {
-                socket.set_only_v6(v)?;
-            }
+        if let Some(v) = only_v6
+            && addr.is_ipv6()
+        {
+            socket.set_only_v6(v)?;
         }
 
         if reuse_addr {

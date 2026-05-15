@@ -5,4 +5,20 @@ socks5_addr = "127.0.0.1:10808"
 #socks5_password = "password"
 direct_fwmark = 2
 mmdb_path = "Country-only-cn-private.mmdb"
+splice = true
 log_level = "info,xtp_rs=debug"
+direct_countries = [ "CN" ]
+
+# 强制直连的 IP 或 CIDR 网段（例如内网、特定服务）
+force_direct_ips = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "1.1.1.1/32"]
+
+# force_direct_ips_file = "direct.txt"
+
+# 强制走 SOCKS5 代理的 IP 或 CIDR
+force_socks5_ips = ["8.8.8.8/32", "8.8.4.4", "2001:4860:4860::/48"]
+
+[[port_forward]]
+name = "test"
+bind = "127.0.0.1:5354"
+remote = "8.8.8.8:53"
+network = "both"
