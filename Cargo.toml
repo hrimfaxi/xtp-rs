@@ -20,6 +20,10 @@ tokio-splice = "0.2.1"
 aligned-vec = "0.6.4"
 ipnet = "2.12.0"
 iptrie = "0.11.1"
+sha2 = "0.11.0"
+hkdf = "0.13.0"
+aes = "0.9.0"
+aes-gcm = "0.10.3"
 
 [profile.release]
 opt-level = "z"      # 比 "s" 更激进的体积优化

@@ -3,11 +3,74 @@ udp = true
 socks5_addr = "127.0.0.1:10808"
 #socks5_user = "user"
 #socks5_password = "password"
-direct_fwmark = 2
+fwmark = 2 # 表示直出，不要再经过tproxy
 mmdb_path = "Country-only-cn-private.mmdb"
 splice = true
 log_level = "info,xtp_rs=debug"
 direct_countries = [ "CN" ]
+
+# 是否对非直连 TCP 连接进行 TLS ClientHello SNI sniff。
+# 仅在该连接最终准备走 SOCKS5 时使用；直连流量不会做这一步。
+sniff_tls_sni = true
+
+# 是否对非直连 TCP 连接进行 HTTP/1.x Host 头 sniff。
+# 当 TLS SNI sniff 失败或不匹配时，可继续尝试 HTTP Host sniff。
+sniff_http_host = true
+
+# TCP 首包探测的全局最大 peek 缓冲区大小。
+# 它是所有 sniff 行为的硬上限：TLS/HTTP 各自的 max_len 都不会超过它。
+# 该值越大，越容易覆盖被分片的 ClientHello / HTTP 头；但也会增加 peek 内存和等待成本。
+tcp_peek_buffer_size = 32768
+
+# -------------------------------
+# TLS SNI sniff
+# -------------------------------
+
+# TLS SNI sniff 的首次 peek 长度。
+# 如果首包不足以解析完整 ClientHello，会按重试策略继续扩大 peek。
+tls_sniff_peek_len = 512
+
+# TLS SNI sniff 允许的最大探测长度。
+# 实际生效值为 min(tls_sniff_max_len, tcp_peek_buffer_size)。
+# 如果 ClientHello 超过该限制，则放弃 TLS sniff。
+tls_sniff_max_len = 32768
+
+# TLS SNI sniff 在“前缀不足”时最多重试的次数。
+# 每次重试通常会扩大 peek 长度，并等待更多数据到达。
+tls_sniff_max_retries = 2
+
+# TLS SNI sniff 每次等待更多 peek 数据增长的最长时间，单位毫秒。
+# 若在这段时间内没有读到更多首包数据，则停止 TLS sniff。
+8192tls_sniff_wait_more_ms = 100
+
+# 单次 TLS SNI sniff 的总超时时间，单位毫秒。
+# 超时后直接放弃 TLS sniff，转入后续逻辑。
+tls_sniff_timeout_ms = 1000
+
+# -------------------------------
+# HTTP Host sniff
+# -------------------------------
+
+# HTTP Host sniff 的首次 peek 长度。
+# 用于尝试解析 HTTP/1.0 / HTTP/1.1 请求头。
+http_sniff_peek_len = 512
+
+# HTTP Host sniff 允许的最大探测长度。
+# 实际生效值为 min(http_sniff_max_len, tcp_peek_buffer_size)。
+# 如果请求头始终未结束且已达到该限制，则放弃 HTTP sniff。
+http_sniff_max_len = 16384
+
+# HTTP Host sniff 在“前缀不足”时最多重试的次数。
+# 适用于请求头被拆包、第一次 peek 没拿完整的情况。
+http_sniff_max_retries = 2
+
+# HTTP Host sniff 每次等待更多 peek 数据增长的最长时间，单位毫秒。
+# 若在这段时间内没有更多请求头数据到达，则停止 HTTP sniff。
+http_sniff_wait_more_ms = 100
+
+# 单次 HTTP Host sniff 的总超时时间，单位毫秒。
+# 超时后直接放弃 HTTP sniff，转入后续逻辑。
+http_sniff_timeout_ms = 1000
 
 # 强制直连的 IP 或 CIDR 网段（例如内网、特定服务）
 force_direct_ips = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "1.1.1.1/32"]
