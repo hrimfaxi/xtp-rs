@@ -1,0 +1,467 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::{debug, warn};
+
+use crate::sniff::udp::{
+    UdpSniffOutcome, UdpSnifferSessionEngine, udp_sniff_error_reason, udp_sniff_protocol_name,
+};
+use crate::state::AppState;
+use crate::udp::session::{UdpRoutingMode, UdpSession, UdpSessionKey, UdpSessionSpec};
+
+pub(crate) struct PendingReplayBuffer {
+    datagrams: Vec<Vec<u8>>,
+    cached_bytes: usize,
+}
+
+impl PendingReplayBuffer {
+    pub(crate) fn new(first_payload: &[u8]) -> Self {
+        Self {
+            datagrams: vec![first_payload.to_vec()],
+            cached_bytes: first_payload.len(),
+        }
+    }
+
+    pub(crate) fn push_datagram(&mut self, payload: &[u8]) -> bool {
+        let next_bytes = self.cached_bytes.saturating_add(payload.len());
+
+        if self.datagrams.len() >= UDP_SNIFF_MAX_CACHED_DATAGRAMS {
+            return false;
+        }
+
+        if next_bytes > UDP_SNIFF_MAX_CACHED_BYTES {
+            return false;
+        }
+
+        self.datagrams.push(payload.to_vec());
+        self.cached_bytes = next_bytes;
+
+        true
+    }
+
+    pub(crate) fn datagram_count(&self) -> usize {
+        self.datagrams.len()
+    }
+
+    pub(crate) fn cached_bytes(&self) -> usize {
+        self.cached_bytes
+    }
+
+    pub(crate) fn into_datagrams(self) -> Vec<Vec<u8>> {
+        self.datagrams
+    }
+}
+
+pub(crate) struct PendingUdpSniff {
+    pub(crate) started_secs: u64,
+    pub(crate) spec: UdpSessionSpec,
+    pub(crate) sniffer: Box<dyn UdpSnifferSessionEngine>,
+    pub(crate) replay: PendingReplayBuffer,
+}
+
+impl PendingUdpSniff {
+    pub(crate) fn new(
+        spec: UdpSessionSpec,
+        sniffer: Box<dyn UdpSnifferSessionEngine>,
+        first_payload: &[u8],
+    ) -> Self {
+        use crate::util::now_secs;
+        Self {
+            started_secs: now_secs(),
+            spec,
+            sniffer,
+            replay: PendingReplayBuffer::new(first_payload),
+        }
+    }
+
+    pub(crate) fn push_datagram(&mut self, payload: &[u8]) -> bool {
+        self.replay.push_datagram(payload)
+    }
+
+    pub(crate) fn expired(&self) -> bool {
+        use crate::util::now_secs;
+        now_secs().saturating_sub(self.started_secs) >= UDP_SNIFF_TIMEOUT_SECS
+    }
+
+    pub(crate) fn datagram_count(&self) -> usize {
+        self.replay.datagram_count()
+    }
+
+    pub(crate) fn cached_bytes(&self) -> usize {
+        self.replay.cached_bytes()
+    }
+}
+
+pub(crate) const UDP_SNIFF_TIMEOUT_SECS: u64 = 5;
+pub(crate) const UDP_SNIFF_MAX_CACHED_DATAGRAMS: usize = 8;
+pub(crate) const UDP_SNIFF_MAX_CACHED_BYTES: usize = 64 * 1024;
+pub(crate) const UDP_SNIFF_MAX_PENDING_SESSIONS: usize = 4096;
+pub(crate) const UDP_SNIFF_REAP_INTERVAL_SECS: u64 = 1;
+
+pub(crate) async fn forward_udp_payload(
+    state: Arc<AppState>,
+    spec: UdpSessionSpec,
+    payload: &[u8],
+) {
+    let key = spec.key;
+
+    let session = match state
+        .udp_runtime
+        .get_or_create_udp_session(state.clone(), spec)
+        .await
+    {
+        Ok(session) => session,
+        Err(e) => {
+            warn!(
+                "failed to get/create UDP session: kind={:?}, client={}, target={}, error={:#}",
+                key.kind, key.client_addr, key.target_addr, e
+            );
+            return;
+        }
+    };
+
+    session.touch();
+
+    match session.send_payload(payload).await {
+        Ok(sent) => {
+            debug!(
+                "UDP packet forwarded: kind={:?}, client={}, target={}, payload_len={}, sent={}",
+                key.kind,
+                key.client_addr,
+                key.target_addr,
+                payload.len(),
+                sent
+            );
+        }
+        Err(e) => {
+            warn!(
+                "failed to forward UDP packet: kind={:?}, client={}, target={}, error={:#}",
+                key.kind, key.client_addr, key.target_addr, e
+            );
+        }
+    }
+}
+
+pub(crate) async fn forward_udp_payload_to_session(session: Arc<UdpSession>, payload: &[u8]) {
+    let key = session.key();
+
+    session.touch();
+
+    match session.send_payload(payload).await {
+        Ok(sent) => {
+            debug!(
+                "UDP packet forwarded (session): kind={:?}, client={}, target={}, payload_len={}, sent={}",
+                key.kind,
+                key.client_addr,
+                key.target_addr,
+                payload.len(),
+                sent
+            );
+        }
+        Err(e) => {
+            warn!(
+                "failed to forward UDP packet (session): kind={:?}, client={}, target={}, error={:#}",
+                key.kind, key.client_addr, key.target_addr, e
+            );
+        }
+    }
+}
+
+pub(crate) async fn flush_pending_udp_sniff(state: Arc<AppState>, pending: PendingUdpSniff) {
+    let datagrams = pending.replay.into_datagrams();
+    let spec = pending.spec;
+    for payload in datagrams {
+        forward_udp_payload(state.clone(), spec.clone(), &payload).await;
+    }
+}
+
+pub(crate) async fn handle_udp_client_payload(
+    state: Arc<AppState>,
+    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
+    spec: UdpSessionSpec,
+    payload: &[u8],
+) {
+    let key = spec.key;
+
+    if let Some(session) = state.udp_runtime.get_ready_udp_session(key).await {
+        pending_sniff.remove(&key);
+
+        debug!(
+            "UDP existing session hit, skip sniff: kind={:?}, client={}, target={}, payload_len={}",
+            key.kind,
+            key.client_addr,
+            key.target_addr,
+            payload.len()
+        );
+
+        forward_udp_payload_to_session(session, payload).await;
+        return;
+    }
+
+    if handle_pending_udp_sniff(state.clone(), pending_sniff, spec.clone(), payload).await {
+        return;
+    }
+
+    if handle_new_udp_sniff(state.clone(), pending_sniff, spec.clone(), payload).await {
+        return;
+    }
+
+    forward_udp_payload(state, spec, payload).await;
+}
+
+pub(crate) async fn handle_pending_udp_sniff(
+    state: Arc<AppState>,
+    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
+    spec: UdpSessionSpec,
+    payload: &[u8],
+) -> bool {
+    let key = spec.key;
+
+    let Some(mut pending) = pending_sniff.remove(&key) else {
+        return false;
+    };
+
+    if pending.expired() {
+        debug!(
+            "UDP sniff pending expired: kind={:?}, client={}, target={}",
+            key.kind, key.client_addr, key.target_addr
+        );
+
+        flush_pending_udp_sniff(state.clone(), pending).await;
+        forward_udp_payload(state, spec, payload).await;
+        return true;
+    }
+
+    if !pending.push_datagram(payload) {
+        debug!(
+            "UDP sniff pending too large: kind={:?}, client={}, target={}",
+            key.kind, key.client_addr, key.target_addr
+        );
+
+        flush_pending_udp_sniff(state.clone(), pending).await;
+        forward_udp_payload(state, spec, payload).await;
+        return true;
+    }
+
+    match pending.sniffer.feed(payload) {
+        UdpSniffOutcome::Matched { protocol, host } => {
+            debug!(
+                "UDP sniff success after reassembly: protocol={}, kind={:?}, client={}, target={}, host={}",
+                udp_sniff_protocol_name(protocol),
+                key.kind,
+                key.client_addr,
+                key.target_addr,
+                host
+            );
+
+            pending.spec.sniffed_host = Some(host);
+            flush_pending_udp_sniff(state, pending).await;
+        }
+        UdpSniffOutcome::NeedMore { protocol } => {
+            debug!(
+                "UDP sniff still need more: protocol={}, kind={:?}, client={}, target={}, payload_len={}",
+                udp_sniff_protocol_name(protocol),
+                key.kind,
+                key.client_addr,
+                key.target_addr,
+                payload.len()
+            );
+
+            pending_sniff.insert(key, pending);
+            enforce_pending_udp_sniff_capacity(pending_sniff);
+        }
+        UdpSniffOutcome::NotMatched => {
+            debug!(
+                "UDP sniff pending not matched: kind={:?}, client={}, target={}",
+                key.kind, key.client_addr, key.target_addr
+            );
+
+            flush_pending_udp_sniff(state, pending).await;
+        }
+        UdpSniffOutcome::Failed { protocol, error } => {
+            debug!(
+                "UDP sniff pending failed: protocol={}, reason={}, kind={:?}, client={}, target={}",
+                udp_sniff_protocol_name(protocol),
+                udp_sniff_error_reason(error),
+                key.kind,
+                key.client_addr,
+                key.target_addr
+            );
+
+            flush_pending_udp_sniff(state, pending).await;
+        }
+    }
+
+    true
+}
+
+pub(crate) async fn handle_new_udp_sniff(
+    state: Arc<AppState>,
+    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
+    spec: UdpSessionSpec,
+    payload: &[u8],
+) -> bool {
+    let key = spec.key;
+
+    if state.udp_sniffers.is_empty() {
+        return false;
+    }
+
+    let target_ip_direct = matches!(spec.routing, UdpRoutingMode::Auto)
+        && state.should_direct(spec.key.target_addr.ip());
+
+    if target_ip_direct {
+        return false;
+    }
+
+    for sniffer in &state.udp_sniffers {
+        let mut sniff_session = sniffer.new_session();
+
+        match sniff_session.feed(payload) {
+            UdpSniffOutcome::Matched { protocol, host } => {
+                let mut spec = spec;
+
+                debug!(
+                    "UDP sniff success: sniffer={}, protocol={}, kind={:?}, client={}, target={}, host={}",
+                    sniffer.name(),
+                    udp_sniff_protocol_name(protocol),
+                    key.kind,
+                    key.client_addr,
+                    key.target_addr,
+                    host
+                );
+
+                spec.sniffed_host = Some(host);
+                forward_udp_payload(state, spec, payload).await;
+                return true;
+            }
+            UdpSniffOutcome::NeedMore { protocol } => {
+                debug!(
+                    "UDP sniff need more, pending created: sniffer={}, protocol={}, kind={:?}, client={}, target={}, payload_len={}",
+                    sniffer.name(),
+                    udp_sniff_protocol_name(protocol),
+                    key.kind,
+                    key.client_addr,
+                    key.target_addr,
+                    payload.len()
+                );
+
+                let pending = PendingUdpSniff::new(spec, sniff_session, payload);
+                pending_sniff.insert(key, pending);
+                enforce_pending_udp_sniff_capacity(pending_sniff);
+                return true;
+            }
+            UdpSniffOutcome::NotMatched => {
+                debug!(
+                    "UDP sniff not matched: sniffer={}, kind={:?}, client={}, target={}",
+                    sniffer.name(),
+                    key.kind,
+                    key.client_addr,
+                    key.target_addr
+                );
+                continue;
+            }
+            UdpSniffOutcome::Failed { protocol, error } => {
+                debug!(
+                    "UDP sniff failed: sniffer={}, protocol={}, reason={}, kind={:?}, client={}, target={}",
+                    sniffer.name(),
+                    udp_sniff_protocol_name(protocol),
+                    udp_sniff_error_reason(error),
+                    key.kind,
+                    key.client_addr,
+                    key.target_addr
+                );
+                continue;
+            }
+        }
+    }
+
+    false
+}
+
+pub(crate) async fn reap_pending_udp_sniff(
+    state: Arc<AppState>,
+    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
+) {
+    use crate::util::now_secs;
+    let now = now_secs();
+
+    let expired_keys: Vec<UdpSessionKey> = pending_sniff
+        .iter()
+        .filter_map(|(key, pending)| {
+            if now.saturating_sub(pending.started_secs) >= UDP_SNIFF_TIMEOUT_SECS {
+                Some(*key)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for key in expired_keys {
+        if let Some(pending) = pending_sniff.remove(&key) {
+            debug!(
+                "UDP sniff pending expired by reap: kind={:?}, client={}, target={}, cached_datagrams={}, cached_bytes={}",
+                key.kind,
+                key.client_addr,
+                key.target_addr,
+                pending.datagram_count(),
+                pending.cached_bytes()
+            );
+
+            flush_pending_udp_sniff(state.clone(), pending).await;
+        }
+    }
+
+    while pending_sniff.len() > UDP_SNIFF_MAX_PENDING_SESSIONS {
+        let oldest_key = pending_sniff
+            .iter()
+            .min_by_key(|(_, pending)| pending.started_secs)
+            .map(|(key, _)| *key);
+
+        let Some(oldest_key) = oldest_key else {
+            break;
+        };
+
+        if let Some(pending) = pending_sniff.remove(&oldest_key) {
+            warn!(
+                "UDP sniff pending overflow, dropping oldest: kind={:?}, client={}, target={}, cached_datagrams={}, cached_bytes={}, pending_len={}",
+                oldest_key.kind,
+                oldest_key.client_addr,
+                oldest_key.target_addr,
+                pending.datagram_count(),
+                pending.cached_bytes(),
+                pending_sniff.len()
+            );
+
+            drop(pending);
+        }
+    }
+}
+
+pub(crate) fn enforce_pending_udp_sniff_capacity(
+    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
+) {
+    while pending_sniff.len() > UDP_SNIFF_MAX_PENDING_SESSIONS {
+        let oldest_key = pending_sniff
+            .iter()
+            .min_by_key(|(_, pending)| pending.started_secs)
+            .map(|(key, _)| *key);
+
+        let Some(oldest_key) = oldest_key else {
+            break;
+        };
+
+        if let Some(pending) = pending_sniff.remove(&oldest_key) {
+            warn!(
+                "UDP sniff pending overflow, dropping oldest immediately: kind={:?}, client={}, target={}, cached_datagrams={}, cached_bytes={}, pending_len={}",
+                oldest_key.kind,
+                oldest_key.client_addr,
+                oldest_key.target_addr,
+                pending.datagram_count(),
+                pending.cached_bytes(),
+                pending_sniff.len()
+            );
+
+            drop(pending);
+        }
+    }
+}
