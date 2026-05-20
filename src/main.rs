@@ -9,21 +9,31 @@ mod upstream;
 mod util;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use clap::Parser;
-use maxminddb::Reader;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
-use crate::cli::{Cli, Config, PortForwardProto, parse_listen_addr};
-use crate::sniff::{build_sniffers, build_udp_sniffers};
-use crate::socket_factory::{create_tproxy_tcp_listeners, create_tproxy_udp_sockets};
+use crate::cli::{Cli, Config};
 use crate::state::AppState;
-use crate::tcp::{run_tcp_port_forward, tcp_accept_loop};
-use crate::udp::{UdpRuntime, run_udp_gc_loop, run_udp_loop, run_udp_port_forward};
 use crate::upstream::run_upstream_stats_listener;
-use crate::util::{build_ip_tries, parse_ip_net_list, warn_if_splice_with_forwarding};
+use crate::util::TaskGuard;
+
+/// 全局保存，reload 时用来改日志级别
+static LOG_RELOAD_HANDLE: std::sync::OnceLock<reload::Handle<EnvFilter, Registry>> =
+    std::sync::OnceLock::new();
+
+fn build_env_filter(config: &Config) -> Result<EnvFilter> {
+    if let Some(ref level) = config.log_level {
+        EnvFilter::try_new(level).with_context(|| format!("invalid log_level '{}'", level))
+    } else {
+        Ok(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,211 +42,137 @@ async fn main() -> Result<()> {
     let config_str = tokio::fs::read_to_string(&cli.config)
         .await
         .with_context(|| format!("failed to read config file {}", cli.config))?;
-
     let config: Config = toml::from_str(&config_str).context("invalid config")?;
 
-    let env_filter = if let Some(ref level) = config.log_level {
-        tracing_subscriber::EnvFilter::new(level)
-    } else {
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
-    };
+    let env_filter = build_env_filter(&config)?;
+    let (reload_layer, reload_handle) = reload::Layer::new(env_filter);
 
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    tracing_subscriber::registry()
+        .with(reload_layer) // 先包 reload
+        .with(tracing_subscriber::fmt::layer().without_time()) // 再包 fmt
+        // 强行把全局最大级别推到 TRACE，确保任何日志都能走到 Layer 内部
+        .with(tracing_subscriber::filter::LevelFilter::TRACE)
+        .init();
+
+    let _ = LOG_RELOAD_HANDLE.set(reload_handle);
 
     debug!("xtp-rs started");
 
-    warn_if_splice_with_forwarding(config.splice);
-
-    let mmdb = match config.mmdb_path.as_deref() {
-        Some("") | None => {
-            info!("MMDB is disabled");
-            None
-        }
-        Some(path) => {
-            let data = tokio::fs::read(path)
-                .await
-                .with_context(|| format!("failed to read MMDB file {}", path))?;
-            let reader = Reader::from_source(data).context("invalid MMDB data")?;
-            info!("MMDB loaded from {}", path);
-            Some(Arc::new(reader))
-        }
-    };
-
-    let udp_runtime = Arc::new(UdpRuntime::new(Duration::from_secs(
-        config.udp_session_timeout_secs,
-    )));
-
-    let (listen_ip, listen_port) =
-        parse_listen_addr(&config.listen).context("invalid listen address")?;
-
-    let mut direct_list = config.force_direct_ips.clone();
-    if let Some(ref path) = config.force_direct_ips_file {
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("failed to read force_direct_ips_file '{}'", path))?;
-        direct_list.extend(
-            content
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.trim().to_string()),
-        );
-    }
-
-    let mut socks5_list = config.force_socks5_ips.clone();
-    if let Some(ref path) = config.force_socks5_ips_file {
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("failed to read force_socks5_ips_file '{}'", path))?;
-        socks5_list.extend(
-            content
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.trim().to_string()),
-        );
-    }
-
-    let direct_nets =
-        parse_ip_net_list(&direct_list).context("failed to parse force_direct_ips")?;
-    info!("force_direct_ips: {} entries loaded", direct_nets.len());
-    let socks5_nets =
-        parse_ip_net_list(&socks5_list).context("failed to parse force_socks5_ips")?;
-    info!("force_socks5_ips: {} entries loaded", socks5_nets.len());
-
-    let (force_direct_v4, force_direct_v6) =
-        build_ip_tries(&direct_nets).context("failed to build force_direct tries")?;
-    let (force_socks5_v4, force_socks5_v6) =
-        build_ip_tries(&socks5_nets).context("failed to build force_socks5 tries")?;
-
-    let sniffers = build_sniffers(&config);
-    let udp_sniffers = build_udp_sniffers(&config);
-
-    let upstreams = config.build_upstream_set()?;
-
-    let state = Arc::new(AppState {
-        mmdb: mmdb.clone(),
-        config,
-        udp_runtime,
-        force_direct_v4,
-        force_direct_v6,
-        force_socks5_v4,
-        force_socks5_v6,
-        sniffers,
-        udp_sniffers,
-        upstreams,
-    });
-
-    let (tcp_v4, tcp_v6) = create_tproxy_tcp_listeners(listen_ip, listen_port)?;
-
-    if let Some(l) = tcp_v4 {
-        info!("TPROXY TCP (IPv4) on 0.0.0.0:{}", listen_port);
-        let state = state.clone();
-        tokio::spawn(async move { tcp_accept_loop(l, state).await });
-    }
-
-    if let Some(l) = tcp_v6 {
-        info!("TPROXY TCP (IPv6) on [::]:{}", listen_port);
-        let state = state.clone();
-        tokio::spawn(async move { tcp_accept_loop(l, state).await });
-    }
-
-    let (udp_v4, udp_v6) = if state.config.udp {
-        create_tproxy_udp_sockets(listen_ip, listen_port)?
-    } else {
-        (None, None)
-    };
-
-    if let Some(sock) = udp_v4 {
-        info!("TPROXY UDP (IPv4) on 0.0.0.0:{}", listen_port);
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_loop(state, sock).await {
-                error!("IPv4 UDP loop exited with error: {:#}", e);
-            }
-        });
-    }
-
-    if let Some(sock) = udp_v6 {
-        info!("TPROXY UDP (IPv6) on [::]:{}", listen_port);
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_loop(state, sock).await {
-                error!("IPv6 UDP loop exited with error: {:#}", e);
-            }
-        });
-    }
-
-    for pf in &state.config.port_forward {
-        let bind_addr: SocketAddr = pf
-            .bind
-            .parse()
-            .with_context(|| format!("invalid port-forward bind '{}'", pf.bind))?;
-        let remote_addr: SocketAddr = pf
-            .remote
-            .parse()
-            .with_context(|| format!("invalid port-forward remote '{}'", pf.remote))?;
-        let state = state.clone();
-        let name = pf.name.clone().unwrap_or_default();
-
-        match pf.network {
-            PortForwardProto::Tcp => {
-                tokio::spawn(async move {
-                    if let Err(e) = run_tcp_port_forward(bind_addr, remote_addr, state).await {
-                        error!("port-forward TCP {name} error: {:#}", e);
-                    }
-                });
-            }
-            PortForwardProto::Udp => {
-                tokio::spawn(async move {
-                    if let Err(e) = run_udp_port_forward(bind_addr, remote_addr, state).await {
-                        error!("port-forward UDP {name} error: {:#}", e);
-                    }
-                });
-            }
-            PortForwardProto::Both => {
-                let name_tcp = name.clone();
-                let name_udp = name.clone();
-                let tcp_state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = run_tcp_port_forward(bind_addr, remote_addr, tcp_state).await {
-                        error!("port-forward TCP(both) {name_tcp} error: {:#}", e);
-                    }
-                });
-                tokio::spawn(async move {
-                    if let Err(e) = run_udp_port_forward(bind_addr, remote_addr, state).await {
-                        error!("port-forward UDP(both) {name_udp} error: {:#}", e);
-                    }
-                });
-            }
-        }
-    }
-
-    if !state.config.disable_upstream_score {
-        for up in state.upstreams.iter() {
-            let up = Arc::clone(up);
-            tokio::spawn(async move {
-                up.spawn_score_task();
-            });
-        }
-        let state_clone = Arc::clone(&state);
-        tokio::spawn(async move {
-            run_upstream_stats_listener(state_clone).await;
-        });
-    }
-
-    // 启动主动健康检查（interval=0 时禁用）
-    if state.config.health_check_interval_secs > 0 {
-        crate::upstream::spawn_health_check_task(Arc::clone(&state));
-    }
+    let app_state = AppState::build(config, cli.config.clone()).await?;
+    let state = Arc::new(ArcSwap::from(Arc::new(app_state)));
 
     {
-        let state = state.clone();
-        tokio::spawn(async move {
-            run_udp_gc_loop(state).await;
-        });
+        let initial = state.load_full();
+        initial.spawn_all_tasks().await?;
     }
+
+    // stats listener 全局单例，用独立 TaskGuard 管理
+    let state_for_stats = Arc::clone(&state);
+    let stats_guard = TaskGuard::new();
+    stats_guard.spawn(|cancel| async move {
+        run_upstream_stats_listener(state_for_stats, cancel).await;
+    });
+
+    // SIGHUP 热重载
+    let sighup_guard = TaskGuard::new();
+    let state_for_sighup = Arc::clone(&state);
+    sighup_guard.spawn(move |cancel| async move {
+        let mut sighup =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    info!("SIGHUP handler shutting down");
+                    break;
+                }
+                r = sighup.recv() => {
+                    if r.is_none() {
+                        info!("SIGHUP stream closed");
+                        break;
+                    }
+
+                    info!("SIGHUP received, reloading config...");
+                    if let Err(e) = reload_config(Arc::clone(&state_for_sighup)).await {
+                        error!("reload failed: {:#}", e);
+                    }
+                }
+            }
+        }
+    });
 
     tokio::signal::ctrl_c().await?;
     info!("shutting down");
 
+    // 先停全局 stats listener（它有 socket 文件要清理）
+    if !stats_guard.shutdown(Duration::from_secs(1)).await {
+        warn!("stats listener shutdown timed out");
+    }
+
+    // 停 SIGHUP handler
+    if !sighup_guard.shutdown(Duration::from_secs(10)).await {
+        warn!("sighup handler shutdown timed out");
+    }
+
+    let current = state.load_full();
+    if !current.shutdown_for_exit(Duration::from_secs(2)).await {
+        warn!("shutdown timed out, some tasks aborted");
+    }
+
+    Ok(())
+}
+
+async fn reload_config(state: Arc<ArcSwap<AppState>>) -> Result<()> {
+    let old_snapshot = state.load_full();
+    let path = old_snapshot.config_path.clone();
+
+    // 不要持有 old_snapshot 做太多事，这里只是拿 config path。
+    drop(old_snapshot);
+
+    // 1. 先读取并构建新配置。失败时旧 generation 完全不动。
+    let config_str = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("failed to read config file {}", path))?;
+
+    let config: Config = toml::from_str(&config_str).context("invalid config")?;
+    // 提前校验 log filter，失败时旧 generation 不动
+    let new_filter = build_env_filter(&config)?;
+    let new_arc = Arc::new(AppState::build(config, path.clone()).await?);
+
+    // 2. 尝试启动新 generation。失败时 rollback，新 generation 自己清理，旧服务不动。
+    //
+    // 注意：所有 listener 都需要 SO_REUSEADDR + SO_REUSEPORT，
+    // 否则这里先启新 generation 时会因为旧 generation 还占着端口而 EADDRINUSE。
+    if let Err(e) = new_arc.spawn_all_tasks().await {
+        error!("new generation spawn failed, rolling back: {:#}", e);
+        new_arc.shutdown_for_exit(Duration::from_secs(1)).await;
+        return Err(e);
+    }
+
+    // 3. 新 generation 启动成功后，原子切换全局 state。
+    //
+    // state.swap() 会返回被替换掉的旧 generation。
+    // 这一步之后，stats listener 等全局任务会读到 new_arc。
+    let old_arc = state.swap(new_arc.clone());
+
+    // 4. 热更新 tracing filter。
+    //
+    // 提前构建好的 filter，swap 成功后直接应用
+    if let Some(handle) = LOG_RELOAD_HANDLE.get() {
+        if let Err(e) = handle.reload(new_filter) {
+            error!("failed to reload tracing filter: {}", e);
+        } else {
+            info!("tracing filter reloaded");
+        }
+    }
+
+    // 5. 停旧 generation。
+    //
+    // 这里只停一次。
+    if !old_arc.shutdown_for_reload(Duration::from_secs(2)).await {
+        warn!("old generation shutdown timed out, some tasks aborted");
+    }
+
+    info!("config reloaded from {}", path);
     Ok(())
 }

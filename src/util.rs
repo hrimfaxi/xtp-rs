@@ -8,6 +8,10 @@ use socket2::Socket;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsFd;
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 pub const UDP_RECV_BUF_SIZE: usize = 65_536;
@@ -262,4 +266,80 @@ pub fn get_tcp_info_ext_raw(fd: std::os::fd::RawFd) -> Option<TcpInfoExt> {
     }
 
     Some(info)
+}
+
+pub struct TaskGuard {
+    cancel: CancellationToken,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl TaskGuard {
+    pub fn new() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn child_token(&self) -> CancellationToken {
+        self.cancel.child_token()
+    }
+
+    /// 同步 spawn，guard 不跨 await，完全安全
+    pub fn spawn<F>(&self, build: impl FnOnce(CancellationToken) -> F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let token = self.child_token();
+        let mut handles = self.handles.lock().expect("bad taskguard lock");
+        // 自动清理已结束任务，避免动态 spawn 场景下无限增长
+        handles.retain(|h| !h.is_finished());
+        handles.push(tokio::spawn(build(token)));
+    }
+
+    /// 1) 发 cancel；2) 把 handles 拿出来；3) 带超时等它们结束。返回是否在超时前全部完成
+    pub async fn shutdown(&self, timeout: Duration) -> bool {
+        self.cancel.cancel();
+
+        let handles: Vec<_> = {
+            let mut h = self.handles.lock().expect("bad taskguard lock");
+            h.drain(..).collect()
+        };
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut ok = true;
+
+        for mut handle in handles {
+            let now = tokio::time::Instant::now();
+
+            if now >= deadline {
+                handle.abort();
+                let _ = handle.await;
+                ok = false;
+                continue;
+            }
+
+            match tokio::time::timeout_at(deadline, &mut handle).await {
+                Ok(Ok(())) => {
+                    // 正常退出
+                }
+                Ok(Err(e)) => {
+                    warn!("task exited with JoinError: {}", e);
+                }
+                Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    ok = false;
+                }
+            }
+        }
+
+        ok
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }

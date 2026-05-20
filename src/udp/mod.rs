@@ -6,9 +6,11 @@ mod tproxy;
 use anyhow::{Context, Result, anyhow};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 pub(crate) use pending::UDP_SNIFF_REAP_INTERVAL_SECS;
@@ -17,7 +19,7 @@ pub(crate) use session::{
     UdpSessionSpec,
 };
 
-use crate::socket_factory::{SocketFactory, create_direct_udp_socket};
+use crate::socket_factory::create_direct_udp_socket;
 use crate::socks5::socks5_udp_associate_for_client;
 use crate::state::AppState;
 use crate::udp::fake::FakeUdpManager;
@@ -29,6 +31,7 @@ pub struct UdpRuntime {
     sessions: Mutex<std::collections::HashMap<UdpSessionKey, UdpSessionEntry>>,
     fake_udp: FakeUdpManager,
     timeout: Duration,
+    closed: AtomicBool,
 }
 
 impl UdpRuntime {
@@ -37,6 +40,7 @@ impl UdpRuntime {
             sessions: Mutex::new(std::collections::HashMap::new()),
             fake_udp: FakeUdpManager::new(),
             timeout,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -45,10 +49,16 @@ impl UdpRuntime {
         state: Arc<AppState>,
         spec: UdpSessionSpec,
     ) -> Result<Arc<UdpSession>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(anyhow!("UDP runtime is shutting down"));
+        }
         let key = spec.key;
 
         let creating_notify = loop {
             let mut sessions = self.sessions.lock().await;
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(anyhow!("UDP runtime is shutting down"));
+            }
 
             match sessions.get(&key) {
                 Some(UdpSessionEntry::Ready(session)) => {
@@ -77,6 +87,29 @@ impl UdpRuntime {
         let created = create_udp_session(state.clone(), spec.clone()).await;
 
         let mut sessions = self.sessions.lock().await;
+
+        if self.closed.load(Ordering::SeqCst) {
+            sessions.remove(&key);
+            creating_notify.notify_waiters();
+
+            let session_to_abort = match created {
+                Ok(session) => {
+                    session.cancel.cancel();
+                    Some(session)
+                }
+                Err(_) => None,
+            };
+
+            drop(sessions); // 先放锁
+
+            if let Some(session) = session_to_abort
+                && let Some(h) = session.recv_task.lock().await.take()
+            {
+                h.abort();
+            }
+
+            return Err(anyhow!("UDP runtime is shutting down"));
+        }
 
         match created {
             Ok(session) => {
@@ -130,22 +163,35 @@ impl UdpRuntime {
             return;
         }
 
+        let mut expired_sessions = Vec::new();
         let mut sessions = self.sessions.lock().await;
 
         for (key, session) in expired {
             let should_remove = match sessions.get(&key) {
-                Some(UdpSessionEntry::Ready(current)) => Arc::ptr_eq(current, &session),
+                Some(UdpSessionEntry::Ready(current)) if Arc::ptr_eq(current, &session) => {
+                    let last_seen = current.last_seen_secs.load(Ordering::Relaxed);
+                    now.saturating_sub(last_seen) >= timeout_secs
+                }
                 _ => false,
             };
 
             if should_remove {
                 sessions.remove(&key);
                 session.cancel.cancel();
+                expired_sessions.push(session);
 
                 debug!(
                     "UDP session expired and cancelled: kind={:?}, client={}, target={}",
                     key.kind, key.client_addr, key.target_addr
                 );
+            }
+        }
+
+        drop(sessions);
+
+        for session in expired_sessions {
+            if let Some(h) = session.recv_task.lock().await.take() {
+                h.abort();
             }
         }
     }
@@ -160,6 +206,54 @@ impl UdpRuntime {
             Some(UdpSessionEntry::Ready(session)) => Some(session.clone()),
             _ => None,
         }
+    }
+
+    pub async fn shutdown(&self, timeout: Duration) -> bool {
+        self.closed.store(true, Ordering::SeqCst);
+        let mut sessions = self.sessions.lock().await;
+        let mut ready_sessions = Vec::new();
+        for (_, entry) in sessions.iter() {
+            match entry {
+                UdpSessionEntry::Ready(session) => {
+                    session.cancel.cancel();
+                    ready_sessions.push(Arc::clone(session));
+                }
+                UdpSessionEntry::Creating(notify) => notify.notify_waiters(),
+            }
+        }
+        sessions.clear();
+        drop(sessions);
+
+        // sessions 锁已释放，再拿每个 session 的 recv_task 锁
+        let mut handles = Vec::new();
+        for session in ready_sessions {
+            if let Some(h) = session.recv_task.lock().await.take() {
+                handles.push(h);
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut ok = true;
+        for mut h in handles {
+            match tokio::time::timeout_at(deadline, &mut h).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("UDP session recv task exited with JoinError: {}", e);
+                }
+                Err(_) => {
+                    warn!(
+                        "UDP session recv task did not exit within {:?}, aborting",
+                        timeout
+                    );
+                    h.abort();
+                    let _ = h.await;
+                    ok = false;
+                }
+            }
+        }
+
+        self.fake_udp.close().await;
+        ok
     }
 }
 
@@ -183,7 +277,7 @@ impl UdpSession {
                     .await
                 {
                     Ok(sent) => {
-                        debug!(
+                        trace!(
                             "UDP response sent: direction={}, kind={:?}, spoofed_src={}, client={}, payload_len={}, sent={}",
                             direction,
                             key.kind,
@@ -222,7 +316,7 @@ impl UdpSession {
             UdpReplyPath::PortForward { listen_sock } => {
                 match listen_sock.send_to(payload, key.client_addr).await {
                     Ok(sent) => {
-                        debug!(
+                        trace!(
                             "UDP response sent: direction={}, kind={:?}, remote_src={}, client={}, payload_len={}, sent={}",
                             direction,
                             key.kind,
@@ -313,11 +407,12 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
         outbound,
         last_seen_secs: std::sync::atomic::AtomicU64::new(now_secs()),
         cancel: tokio_util::sync::CancellationToken::new(),
+        recv_task: Mutex::new(None),
     });
 
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    {
+    let recv_handle = {
         let session = session.clone();
         let state = state.clone();
 
@@ -325,7 +420,12 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
             if let Err(e) = run_udp_session_recv_loop(session, state, ready_tx).await {
                 warn!("UDP session recv loop exited with error: {:#}", e);
             }
-        });
+        })
+    };
+
+    {
+        let mut guard = session.recv_task.lock().await;
+        *guard = Some(recv_handle);
     }
 
     ready_rx
@@ -377,6 +477,7 @@ async fn run_direct_udp_recv_loop(
 
     loop {
         tokio::select! {
+            biased;
             _ = session.cancel.cancelled() => {
                 debug!(
                     "direct UDP recv loop cancelled: kind={:?}, client={}, target={}",
@@ -386,7 +487,6 @@ async fn run_direct_udp_recv_loop(
                 );
                 return Ok(());
             }
-
             r = socket.recv(&mut buf) => {
                 let n = match connected_udp_recv_result(
                     r,
@@ -431,6 +531,7 @@ async fn run_socks5_udp_recv_loop(
 
     loop {
         tokio::select! {
+            biased;
             _ = session.cancel.cancelled() => {
                 debug!(
                     "SOCKS5 UDP recv loop cancelled: kind={:?}, client={}, target={}",
@@ -512,14 +613,20 @@ async fn run_socks5_udp_recv_loop(
     }
 }
 
-pub async fn run_udp_gc_loop(state: Arc<AppState>) {
+pub async fn run_udp_gc_loop(state: Arc<AppState>, cancel: CancellationToken) {
     let interval = Duration::from_secs(10);
 
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("UDP GC loop shutting down");
+                break;
+            }
+            _ = tokio::time::sleep(interval) => {},
+        }
 
         state.udp_runtime.cleanup_expired_sessions().await;
-
         state
             .udp_runtime
             .fake_udp
@@ -528,7 +635,11 @@ pub async fn run_udp_gc_loop(state: Arc<AppState>) {
     }
 }
 
-pub async fn run_udp_loop(state: Arc<AppState>, tproxy_udp: UdpSocket) -> Result<()> {
+pub async fn run_udp_loop(
+    state: Arc<AppState>,
+    tproxy_udp: UdpSocket,
+    cancel: CancellationToken,
+) -> Result<()> {
     let tproxy_udp = TProxyUdpSocket::new(tproxy_udp);
     let mut buf = new_aligned_udp_buf();
 
@@ -537,11 +648,20 @@ pub async fn run_udp_loop(state: Arc<AppState>, tproxy_udp: UdpSocket) -> Result
     let mut last_pending_reap_secs = now_secs();
 
     loop {
-        let packet = match tproxy_udp.recv_packet(&mut buf).await {
-            Ok(packet) => packet,
-            Err(e) => {
-                warn!("failed to receive TPROXY UDP packet: {:#}", e);
-                continue;
+        let packet = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("UDP tproxy loop shutting down");
+                break;
+            }
+            res = tproxy_udp.recv_packet(&mut buf) => {
+                match res {
+                    Ok(packet) => packet,
+                    Err(e) => {
+                        warn!("failed to receive TPROXY UDP packet: {:#}", e);
+                        continue;
+                    }
+                }
             }
         };
 
@@ -559,17 +679,26 @@ pub async fn run_udp_loop(state: Arc<AppState>, tproxy_udp: UdpSocket) -> Result
 
         let spec = UdpSessionSpec::for_tproxy(packet.client_addr, packet.orig_dst);
 
-        handle_udp_client_payload(state.clone(), &mut pending_sniff, spec, payload).await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("UDP tproxy loop shutting down during packet handling");
+                break;
+            }
+            _ = handle_udp_client_payload(state.clone(), &mut pending_sniff, spec, payload) => {}
+        }
     }
+
+    Ok(())
 }
 
 pub async fn run_udp_port_forward(
+    listen_sock: Arc<UdpSocket>,
     listen_addr: SocketAddr,
     remote: SocketAddr,
     state: Arc<AppState>,
+    cancel: CancellationToken,
 ) -> Result<()> {
-    let listen_sock = SocketFactory::new().bind_port_forward_udp_listener(listen_addr)?;
-
     info!(
         "port-forward UDP: listening on {}, forwarding to {} via SOCKS5",
         listen_addr, remote
@@ -581,9 +710,19 @@ pub async fn run_udp_port_forward(
     let mut last_pending_reap_secs = now_secs();
 
     loop {
-        let (n, client_addr) = listen_sock.recv_from(&mut buf).await?;
+        let (n, client_addr) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("port-forward UDP {} -> {} shutting down", listen_addr, remote);
+                break;
+            }
+            res = listen_sock.recv_from(&mut buf) => {
+                res?
+            }
+        };
 
         let now = now_secs();
+
         if now.saturating_sub(last_pending_reap_secs) >= UDP_SNIFF_REAP_INTERVAL_SECS {
             last_pending_reap_secs = now;
             reap_pending_udp_sniff(state.clone(), &mut pending_sniff).await;
@@ -598,8 +737,21 @@ pub async fn run_udp_port_forward(
         let spec =
             UdpSessionSpec::for_port_forward(listen_addr, client_addr, remote, listen_sock.clone());
 
-        handle_udp_client_payload(state.clone(), &mut pending_sniff, spec, payload).await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!(
+                    "port-forward UDP {} -> {} shutting down during packet handling",
+                    listen_addr,
+                    remote
+                );
+                break;
+            }
+            _ = handle_udp_client_payload(state.clone(), &mut pending_sniff, spec, payload) => {}
+        }
     }
+
+    Ok(())
 }
 
 fn connected_udp_recv_result(

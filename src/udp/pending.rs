@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::sniff::udp::{
     UdpSniffOutcome, UdpSnifferSessionEngine, udp_sniff_error_reason, udp_sniff_protocol_name,
@@ -123,7 +123,7 @@ pub(crate) async fn forward_udp_payload(
 
     match session.send_payload(payload).await {
         Ok(sent) => {
-            debug!(
+            trace!(
                 "UDP packet forwarded: kind={:?}, client={}, target={}, payload_len={}, sent={}",
                 key.kind,
                 key.client_addr,
@@ -148,7 +148,7 @@ pub(crate) async fn forward_udp_payload_to_session(session: Arc<UdpSession>, pay
 
     match session.send_payload(payload).await {
         Ok(sent) => {
-            debug!(
+            trace!(
                 "UDP packet forwarded (session): kind={:?}, client={}, target={}, payload_len={}, sent={}",
                 key.kind,
                 key.client_addr,
@@ -185,7 +185,7 @@ pub(crate) async fn handle_udp_client_payload(
     if let Some(session) = state.udp_runtime.get_ready_udp_session(key).await {
         pending_sniff.remove(&key);
 
-        debug!(
+        trace!(
             "UDP existing session hit, skip sniff: kind={:?}, client={}, target={}, payload_len={}",
             key.kind,
             key.client_addr,

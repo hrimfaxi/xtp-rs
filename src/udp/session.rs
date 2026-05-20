@@ -3,8 +3,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::socks5::{Socks5UdpAssoc, Socks5UdpTarget, build_socks5_udp_packet};
 use crate::util::{is_io_emsgsize, now_secs};
@@ -85,6 +87,14 @@ pub(crate) struct UdpSession {
     pub(crate) outbound: UdpOutbound,
     pub(crate) last_seen_secs: AtomicU64,
     pub(crate) cancel: CancellationToken,
+
+    // NOTE: 自引用环风险。
+    // recv_task 持有本 session 的 recv loop JoinHandle，
+    // 而 recv loop task 内部又持有 Arc<UdpSession>。
+    // 正常路径下 task 收到 cancel 后迅速退出，future drop 打破环。
+    // 若 task 异常卡住（如 I/O 死锁），session 可能无法释放。
+    // 当前可接受；未来若出现泄漏，应将 handle 移到 UdpRuntime 统一管理。
+    pub(crate) recv_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 pub(crate) enum UdpOutbound {
@@ -106,7 +116,7 @@ impl UdpSession {
 
         match &self.outbound {
             UdpOutbound::Direct { socket } => {
-                debug!(
+                trace!(
                     "UDP direct send: kind={:?}, client={}, target={}, payload_len={}",
                     key.kind,
                     key.client_addr,
@@ -156,7 +166,7 @@ impl UdpSession {
                     }
                 };
 
-                debug!(
+                trace!(
                     "UDP SOCKS5 send: kind={:?}, client={}, original_target={}, socks_target={}, payload_len={}, pkt_len={}, relay={}",
                     key.kind,
                     key.client_addr,

@@ -16,7 +16,7 @@ pub struct Cli {
     pub config: String,
 }
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum PortForwardProto {
     /// 转发 TCP
@@ -27,7 +27,7 @@ pub enum PortForwardProto {
     Both,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PortForward {
     /// 规则名称，仅用于日志输出。
     pub name: Option<String>,
@@ -53,7 +53,7 @@ pub struct UpstreamConfig {
     pub addr: SocketAddr,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_listen")]
     /// 监听地址。

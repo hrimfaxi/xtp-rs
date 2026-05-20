@@ -237,10 +237,14 @@ fn quic_remove_header_protection_and_decrypt(
     packet_end: usize,
     keys: &QuicInitialKeys,
 ) -> Result<Vec<u8>, UdpSniffError> {
-    if pn_offset + 4 + 16 > packet.len() {
+    if packet_end > packet.len() || packet_end <= pn_offset {
         return Err(UdpSniffError::InsufficientPrefix);
     }
-    if packet_end > packet.len() || packet_end <= pn_offset {
+    let sample_end = pn_offset
+        .checked_add(4)
+        .and_then(|v| v.checked_add(16))
+        .ok_or(UdpSniffError::TooLarge)?;
+    if sample_end > packet_end {
         return Err(UdpSniffError::InsufficientPrefix);
     }
     let sample = &packet[pn_offset + 4..pn_offset + 4 + 16];

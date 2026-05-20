@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -7,6 +8,7 @@ use std::sync::{Mutex, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixDatagram;
 use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::socks5::{Socks5Target, socks5_connect};
@@ -59,66 +61,66 @@ impl Upstream {
         token
     }
 
-    pub fn spawn_score_task(self: Arc<Self>) {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let (recv, sent, alive) = {
-                    let mut reg = self.registry.lock().expect("bad registry lock");
-                    reg.retain(|(w, _)| w.strong_count() > 0);
-                    let mut r = 0u64;
-                    let mut s = 0u64;
-                    let mut n = 0usize;
-                    for (_, fd) in reg.iter() {
-                        if let Some(info) = get_tcp_info_ext_raw(*fd) {
-                            r += info.tcpi_bytes_received;
-                            s += info.tcpi_bytes_acked;
-                            n += 1;
-                        }
-                    }
-                    (r, s, n)
-                };
-
-                if alive == 0 {
-                    continue;
-                }
-
-                let now = now_secs();
-                let prev_recv = self.last_total_recv.swap(recv, Ordering::Relaxed);
-                let prev_sent = self.last_total_sent.swap(sent, Ordering::Relaxed);
-                let prev_secs = self.last_check_secs.swap(now, Ordering::Relaxed);
-
-                if !self.tcp_info_initialized.swap(true, Ordering::Relaxed) {
-                    continue;
-                }
-
-                let delta_recv = recv.saturating_sub(prev_recv);
-                let delta_sent = sent.saturating_sub(prev_sent);
-                let delta_bytes = delta_recv + delta_sent;
-                let delta_secs = now.saturating_sub(prev_secs).max(1);
-
-                if let Some(raw) =
-                    calc_throughput_score(delta_bytes, Duration::from_secs(delta_secs))
-                {
-                    let old = self.tcp_score.load(Ordering::Relaxed);
-                    // 50/50，历史与新数据同等权重
-                    let blended = (old * 5 + raw * 5) / 10;
-                    let speed_mibps = delta_bytes as f64 / 1024.0 / 1024.0 / delta_secs as f64;
-
-                    self.tcp_score.store(blended, Ordering::Relaxed);
-                    debug!(
-                        "upstream aggregate score: id={}, alive={}, delta_mb={:.2}, speed={:.2}MiB/s, score={}",
-                        self.id,
-                        alive,
-                        delta_bytes as f64 / 1024.0 / 1024.0,
-                        speed_mibps,
-                        blended,
-                    );
-                }
+    pub async fn run_score_task(self: Arc<Self>, cancel: CancellationToken) {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {},
             }
-        });
+            let (recv, sent, alive) = {
+                let mut reg = self.registry.lock().expect("bad registry lock");
+                reg.retain(|(w, _)| w.strong_count() > 0);
+                let mut r = 0u64;
+                let mut s = 0u64;
+                let mut n = 0usize;
+                for (_, fd) in reg.iter() {
+                    if let Some(info) = get_tcp_info_ext_raw(*fd) {
+                        r += info.tcpi_bytes_received;
+                        s += info.tcpi_bytes_acked;
+                        n += 1;
+                    }
+                }
+                (r, s, n)
+            };
+
+            if alive == 0 {
+                continue;
+            }
+
+            let now = now_secs();
+            let prev_recv = self.last_total_recv.swap(recv, Ordering::Relaxed);
+            let prev_sent = self.last_total_sent.swap(sent, Ordering::Relaxed);
+            let prev_secs = self.last_check_secs.swap(now, Ordering::Relaxed);
+
+            if !self.tcp_info_initialized.swap(true, Ordering::Relaxed) {
+                continue;
+            }
+
+            let delta_recv = recv.saturating_sub(prev_recv);
+            let delta_sent = sent.saturating_sub(prev_sent);
+            let delta_bytes = delta_recv + delta_sent;
+            let delta_secs = now.saturating_sub(prev_secs).max(1);
+
+            if let Some(raw) = calc_throughput_score(delta_bytes, Duration::from_secs(delta_secs)) {
+                let old = self.tcp_score.load(Ordering::Relaxed);
+                // 50/50，历史与新数据同等权重
+                let blended = (old * 5 + raw * 5) / 10;
+                let speed_mibps = delta_bytes as f64 / 1024.0 / 1024.0 / delta_secs as f64;
+
+                self.tcp_score.store(blended, Ordering::Relaxed);
+                debug!(
+                    "upstream aggregate score: id={}, alive={}, delta_mb={:.2}, speed={:.2}MiB/s, score={}",
+                    self.id,
+                    alive,
+                    delta_bytes as f64 / 1024.0 / 1024.0,
+                    speed_mibps,
+                    blended,
+                );
+            }
+        }
     }
 
     /// 最终选路分数：QUIC 探针主导（70%），TCP 吞吐兜底（30%）。
@@ -377,70 +379,96 @@ pub struct ShadowQuicReport {
     pub mtu: u16,
 }
 
-pub async fn run_upstream_stats_listener(state: Arc<AppState>) {
+pub async fn run_upstream_stats_listener(
+    state_swap: Arc<ArcSwap<AppState>>,
+    cancel: CancellationToken,
+) {
     const PATH: &str = "/tmp/xtp-rs-report.sock";
 
+    // 启动时清理可能存在的旧文件（仅进程启动时执行一次）
     let _ = tokio::fs::remove_file(PATH).await;
+
     let sock = match UnixDatagram::bind(PATH) {
         Ok(s) => s,
         Err(e) => {
-            error!("Failed to bind upstream stats socket {}: {}", PATH, e);
+            error!("stats listener bind failed at {}: {}", PATH, e);
             return;
         }
     };
 
     #[cfg(target_os = "linux")]
-    let _ = std::fs::set_permissions(PATH, std::fs::Permissions::from_mode(0o777));
+    if let Err(e) = std::fs::set_permissions(PATH, std::fs::Permissions::from_mode(0o777)) {
+        error!("stats listener chmod failed: {}", e);
+        // chmod 失败但 socket 已创建，清理掉避免残留
+        let _ = tokio::fs::remove_file(PATH).await;
+        return;
+    }
 
-    info!("Upstream stats listener bound to {}", PATH);
+    info!("upstream stats listener bound to {}", PATH);
 
     let mut buf = vec![0u8; 2048];
+
     loop {
-        match sock.recv_from(&mut buf).await {
-            Ok((n, _)) => {
-                let rep = match serde_json::from_slice::<ShadowQuicReport>(&buf[..n]) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        trace!("upstream stats JSON parse failed: {}", e);
-                        continue;
-                    }
-                };
+        tokio::select! {
+           biased;
+           _ = cancel.cancelled() => {
+               info!("upstream stats listener shutting down");
+               break;
+           }
+           res = sock.recv_from(&mut buf) => {
+               match res {
+                   Ok((n, _)) => {
+                       let rep: ShadowQuicReport = match serde_json::from_slice(&buf[..n]) {
+                           Ok(r) => r,
+                           Err(e) => {
+                               trace!("upstream stats JSON parse failed: {}", e);
+                               continue;
+                           }
+                       };
 
-                trace!(
-                    "stats recv: id={}, peer={}, rtt={:.1}ms, loss={:.2}%, mtu={}",
-                    rep.upstream_id,
-                    rep.peer,
-                    rep.rtt_ms,
-                    rep.loss_rate * 100.0,
-                    rep.mtu
-                );
+                       trace!(
+                           "upstream stats: id={} peer={}, rtt={}ms loss={:.2}% mtu={}",
+                           rep.upstream_id,
+                           rep.peer,
+                           rep.rtt_ms,
+                           rep.loss_rate * 100.0,
+                           rep.mtu
+                       );
 
-                // 直接用 upstream.id 匹配 shadowquic 的 upstream_id
-                if let Some(up) = state.upstreams.find_by_id(&rep.upstream_id) {
-                    if let Some(score) = calc_quic_score(rep.rtt_ms, rep.loss_rate, rep.mtu) {
-                        debug!(
-                            "quic probe score: upstream={}, rtt={:.1}ms, loss={:.2}%, mtu={}, score={}",
-                            up.id,
-                            rep.rtt_ms,
-                            rep.loss_rate * 100.0,
-                            rep.mtu,
-                            score
-                        );
-                        up.update_quic_score(Some(score));
-                    }
-                } else {
-                    trace!("stats upstream_id not matched: {}", rep.upstream_id);
+                       let state = state_swap.load();
+
+                       if state.config.disable_upstream_score {
+                           trace!("upstream score disabled, ignoring stats report");
+                           continue;
+                       }
+
+                       if let Some(up) = state.upstreams.find_by_id(&rep.upstream_id) && let Some(score) = calc_quic_score(rep.rtt_ms, rep.loss_rate, rep.mtu) {
+                           debug!("upstream {} quic_score updated to {}", up.id, score);
+                           up.update_quic_score(Some(score));
+                       }
+                   }
+                   Err(e) => {
+                       error!("stats recv error: {}", e);
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                info!("upstream stats listener shutting down");
+                                break;
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
+                   }
                 }
-            }
-            Err(e) => {
-                error!("stats recv error: {}", e);
             }
         }
     }
+
+    let _ = tokio::fs::remove_file(PATH).await;
+    info!("upstream stats listener exited, socket removed");
 }
 
 pub fn calc_quic_score(rtt_ms: f64, loss_rate: f64, mtu: u16) -> Option<u32> {
-    if !loss_rate.is_finite() || loss_rate < 0.0 || rtt_ms < 0.0 {
+    if !rtt_ms.is_finite() || rtt_ms < 0.0 || !loss_rate.is_finite() || loss_rate < 0.0 {
         return None;
     }
 
@@ -515,67 +543,84 @@ async fn check_upstream_health(
     n >= 8 && buf[..n].windows(8).any(|w| w == b"HTTP/1.1")
 }
 
-pub fn spawn_health_check_task(state: Arc<AppState>) {
+pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationToken) {
     let interval_secs = state.config.health_check_interval_secs;
-    if interval_secs == 0 {
-        return;
-    }
+    info!("health check task started, interval={}s", interval_secs);
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let timeout_secs = state.config.health_check_timeout_secs;
-    let fail_threshold = state.config.health_check_fail_threshold;
-    let check_url = state.config.health_check_url.clone();
-    let fwmark = state.config.fwmark;
-    let creds = state
-        .socks5_credentials()
-        .map(|(u, p)| (u.to_string(), p.to_string()));
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("health check task shutting down");
+                break;
+            }
+            _ = interval.tick() => {},
+        }
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let c = &state.config;
+        let (timeout_secs, fail_threshold, check_url, fwmark, creds) = (
+            c.health_check_timeout_secs,
+            c.health_check_fail_threshold,
+            c.health_check_url.clone(),
+            c.fwmark,
+            state
+                .socks5_credentials()
+                .map(|(u, p)| (u.to_string(), p.to_string())),
+        );
 
-        loop {
-            interval.tick().await;
+        // 逐个检查，每检查一个前都先看 cancel 是否已触发
+        'upstreams: for up in state.upstreams.iter() {
+            let alive = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    info!("health check task shutting down");
+                    break 'upstreams;
+                }
+                r = check_upstream_health(
+                    up,
+                    fwmark,
+                    creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+                    &check_url,
+                    timeout_secs,
+                ) => r,
+            };
 
-            for up in state.upstreams.iter() {
-                let creds_ref = creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-                let alive =
-                    check_upstream_health(up, fwmark, creds_ref, &check_url, timeout_secs).await;
-
-                if alive {
-                    let failures = up.health_failures.swap(0, Ordering::Relaxed);
-                    if failures > 0 {
-                        debug!(
-                            "upstream {} health check ok (recovered from {} failures)",
-                            up.id, failures
-                        );
-                    } else {
-                        debug!("upstream {} health check ok", up.id);
-                    }
-                    if failures >= fail_threshold {
-                        up.tcp_score.store(300, Ordering::Relaxed);
-                        info!("upstream {} health recovered, score reset to 300", up.id);
-                    }
+            if alive {
+                let failures = up.health_failures.swap(0, Ordering::Relaxed);
+                if failures > 0 {
+                    debug!(
+                        "upstream {} health check ok (recovered from {} failures)",
+                        up.id, failures
+                    );
                 } else {
-                    let f = up.health_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                    if f == fail_threshold {
-                        up.penalize();
-                        warn!(
-                            "upstream {} health check dead, penalized ({}/{})",
-                            up.id, f, fail_threshold
-                        );
-                    } else if f > fail_threshold {
-                        debug!(
-                            "upstream {} health check still dead ({}/{})",
-                            up.id, f, fail_threshold
-                        );
-                    } else {
-                        debug!(
-                            "upstream {} health check failed ({}/{})",
-                            up.id, f, fail_threshold
-                        );
-                    }
+                    debug!("upstream {} health check ok", up.id);
+                }
+                if failures >= fail_threshold {
+                    up.tcp_score.store(300, Ordering::Relaxed);
+                    info!("upstream {} health recovered, score reset to 300", up.id);
+                }
+            } else {
+                let f = up.health_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if f == fail_threshold {
+                    up.penalize();
+                    warn!(
+                        "upstream {} health check dead, penalized ({}/{})",
+                        up.id, f, fail_threshold
+                    );
+                } else if f > fail_threshold {
+                    debug!(
+                        "upstream {} health check still dead ({}/{})",
+                        up.id, f, fail_threshold
+                    );
+                } else {
+                    debug!(
+                        "upstream {} health check failed ({}/{})",
+                        up.id, f, fail_threshold
+                    );
                 }
             }
         }
-    });
+    }
 }

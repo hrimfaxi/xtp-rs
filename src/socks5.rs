@@ -134,6 +134,10 @@ pub fn parse_socks5_udp_packet_with_fallback_src(
 
 pub async fn socks5_auth(stream: &mut TcpStream, creds: Option<(&str, &str)>) -> Result<()> {
     if let Some((user, pass)) = creds {
+        if user.is_empty() || user.len() > 255 || pass.is_empty() || pass.len() > 255 {
+            bail!("invalid SOCKS5 username/password length");
+        }
+
         stream
             .write_all(&[0x05, 0x02, 0x00, 0x02])
             .await
@@ -270,8 +274,19 @@ pub async fn socks5_connect(
         .await
         .context("failed to read SOCKS5 connect response")?;
 
+    if resp[0] != 0x05 {
+        bail!("invalid SOCKS5 version in connect response: {:#x}", resp[0]);
+    }
+
     if resp[1] != 0x00 {
         bail!("SOCKS5 connect failed, reply code {:#x}", resp[1]);
+    }
+
+    if resp[2] != 0x00 {
+        bail!(
+            "invalid SOCKS5 reserved field in connect response: {:#x}",
+            resp[2]
+        );
     }
 
     let skip_len = match resp[3] {
@@ -359,6 +374,13 @@ pub async fn socks5_udp_associate_for_client(
         bail!("SOCKS5 UDP ASSOCIATE failed, reply code {:#x}", head[1]);
     }
 
+    if head[2] != 0x00 {
+        bail!(
+            "invalid SOCKS5 reserved field in UDP ASSOCIATE reply: {:#x}",
+            head[2]
+        );
+    }
+
     let trace_resp = |body: &[u8]| {
         if tracing::enabled!(tracing::Level::TRACE) {
             let mut full = Vec::with_capacity(head.len() + body.len());
@@ -413,6 +435,13 @@ pub async fn socks5_udp_associate_for_client(
             "invalid address type in SOCKS5 UDP ASSOCIATE reply: {:#x}",
             head[3]
         ),
+    };
+
+    // SOCKS5 服务器返回 0.0.0.0 / [::] 时，应 fallback 到 socks5 server 本身的地址
+    let relay_addr = if relay_addr.ip().is_unspecified() {
+        SocketAddr::new(socks5_addr.ip(), relay_addr.port())
+    } else {
+        relay_addr
     };
 
     let udp_domain = if relay_addr.is_ipv4() {

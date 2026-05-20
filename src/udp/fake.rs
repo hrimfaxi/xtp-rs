@@ -1,12 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::socket_factory::create_fake_udp_socket;
 use crate::util::now_secs;
@@ -24,12 +24,14 @@ pub(crate) struct FakeUdpEntry {
 
 pub(crate) struct FakeUdpManager {
     sockets: Mutex<HashMap<FakeUdpKey, Arc<FakeUdpEntry>>>,
+    closed: AtomicBool,
 }
 
 impl FakeUdpManager {
     pub(crate) fn new() -> Self {
         Self {
             sockets: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -38,11 +40,19 @@ impl FakeUdpManager {
         src_addr: SocketAddr,
         fwmark: u32,
     ) -> Result<Arc<UdpSocket>> {
+        if self.closed.load(Ordering::SeqCst) {
+            bail!("fake UDP manager is closed");
+        }
+
         let key = FakeUdpKey { src_addr, fwmark };
         let now = now_secs();
 
         {
             let sockets = self.sockets.lock().await;
+
+            if self.closed.load(Ordering::SeqCst) {
+                bail!("fake UDP manager is closed");
+            }
 
             if let Some(entry) = sockets.get(&key) {
                 entry.last_used_secs.store(now, Ordering::Relaxed);
@@ -57,6 +67,10 @@ impl FakeUdpManager {
         });
 
         let mut sockets = self.sockets.lock().await;
+
+        if self.closed.load(Ordering::SeqCst) {
+            bail!("fake UDP manager is closed");
+        }
 
         if let Some(existing) = sockets.get(&key) {
             existing.last_used_secs.store(now, Ordering::Relaxed);
@@ -82,7 +96,7 @@ impl FakeUdpManager {
     ) -> Result<usize> {
         let socket = self.get_or_create(src_addr, fwmark).await?;
 
-        debug!(
+        trace!(
             "fake UDP send: spoofed_src={}, dst={}, payload_len={}",
             src_addr,
             dst_addr,
@@ -114,5 +128,11 @@ impl FakeUdpManager {
 
             alive
         });
+    }
+
+    pub(crate) async fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let mut sockets = self.sockets.lock().await;
+        sockets.clear();
     }
 }

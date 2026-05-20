@@ -33,6 +33,9 @@ pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffE
 
     let mut off = 0usize;
 
+    let mut saw_ech = false;
+    let mut found_sni: Option<String> = None;
+
     off += 2; // legacy_version
     off += 32; // random
 
@@ -81,49 +84,51 @@ pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffE
             return Err(TlsSniffError::ParseError);
         }
 
-        if ext_type == 0xfe0d {
-            // encrypted_client_hello extension.
-            // 被动 sniff 无法解密 ECH，按无目标处理，回退 IP 路由。
-            return Err(TlsSniffError::TlsNoSni);
-        }
-
-        if ext_type == 0x0000 {
-            let ext = &body[off..off + ext_len];
-            if ext.len() < 2 {
-                return Err(TlsSniffError::ParseError);
+        match ext_type {
+            0xfe0d => {
+                saw_ech = true;
             }
-
-            let list_len = be_u16(&ext[0..2])? as usize;
-            if list_len + 2 != ext.len() {
-                return Err(TlsSniffError::ParseError);
-            }
-
-            let mut p = 2usize;
-            while p + 3 <= ext.len() {
-                let name_type = ext[p];
-                let name_len = be_u16(&ext[p + 1..p + 3])? as usize;
-                p += 3;
-
-                if p + name_len > ext.len() {
+            0x0000 => {
+                let ext = &body[off..off + ext_len];
+                if ext.len() < 2 {
                     return Err(TlsSniffError::ParseError);
                 }
 
-                if name_type == 0 {
-                    let host = std::str::from_utf8(&ext[p..p + name_len])
-                        .map_err(|_| TlsSniffError::InvalidHostname)?
-                        .to_ascii_lowercase();
-
-                    if !is_valid_sni_hostname(&host) {
-                        return Err(TlsSniffError::InvalidHostname);
-                    }
-
-                    return Ok(host);
+                let list_len = be_u16(&ext[0..2])? as usize;
+                if list_len + 2 != ext.len() {
+                    return Err(TlsSniffError::ParseError);
                 }
 
-                p += name_len;
-            }
+                let mut p = 2usize;
+                while p + 3 <= ext.len() {
+                    let name_type = ext[p];
+                    let name_len = be_u16(&ext[p + 1..p + 3])? as usize;
+                    p += 3;
 
-            return Err(TlsSniffError::TlsNoSni);
+                    if p + name_len > ext.len() {
+                        return Err(TlsSniffError::ParseError);
+                    }
+
+                    if name_type == 0 {
+                        let host = std::str::from_utf8(&ext[p..p + name_len])
+                            .map_err(|_| TlsSniffError::InvalidHostname)?
+                            .to_ascii_lowercase();
+
+                        if !is_valid_sni_hostname(&host) {
+                            return Err(TlsSniffError::InvalidHostname);
+                        }
+
+                        found_sni = Some(host);
+                    }
+
+                    p += name_len;
+                }
+
+                if p != ext.len() {
+                    return Err(TlsSniffError::ParseError);
+                }
+            }
+            _ => {}
         }
 
         off += ext_len;
@@ -133,5 +138,14 @@ pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffE
         return Err(TlsSniffError::ParseError);
     }
 
-    Err(TlsSniffError::TlsNoSni)
+    // 扫描完所有扩展后统一决定：
+    // 如果有 ECH，按无目标处理（无法解密 inner SNI）
+    if saw_ech {
+        return Err(TlsSniffError::TlsNoSni);
+    }
+
+    match found_sni {
+        Some(host) => Ok(host),
+        None => Err(TlsSniffError::TlsNoSni),
+    }
 }

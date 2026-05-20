@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, trace};
 
@@ -178,11 +179,7 @@ pub async fn handle_tcp_connection(
     };
 
     let start = Instant::now();
-    let _token = if let Some(ref up) = up {
-        Some(up.track(upstream.as_raw_fd()))
-    } else {
-        None
-    };
+    let _token = up.as_ref().map(|up| up.track(upstream.as_raw_fd()));
     let splice_result =
         splice_or_copy_bidirectional(state.config.splice, &mut client, &mut upstream).await;
     let duration = start.elapsed();
@@ -232,103 +229,136 @@ pub async fn handle_tcp_connection(
 }
 
 pub async fn run_tcp_port_forward(
-    listen_addr: SocketAddr,
+    listener: TcpListener,
     remote: SocketAddr,
     state: Arc<AppState>,
+    cancel: CancellationToken,
 ) -> Result<()> {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("bind port-forward TCP {listen_addr} failed"))?;
-
     info!(
         "port-forward TCP: listening on {}, forwarding to {} via SOCKS5",
-        listen_addr, remote
+        listener.local_addr()?,
+        remote
     );
 
+    let listen_addr = listener.local_addr()?;
+
     loop {
-        let (mut client, peer_addr) = listener.accept().await?;
-        let state = state.clone();
-
-        tokio::spawn(async move {
-            info!("port-forward TCP: {} -> {} via SOCKS5", peer_addr, remote);
-
-            let target = TcpUpstreamTarget::Socks5Ip(remote);
-            let (mut upstream, up) = match try_connect_socks5(&target, &state).await {
-                Ok((s, up)) => {
-                    debug!(
-                        "selected upstream {} at {} (score={:.0}) for port-forward {}",
-                        up.id,
-                        up.addr,
-                        up.score(),
-                        remote
-                    );
-                    (s, up)
-                }
-                Err(e) => {
-                    error!(
-                        "port-forward upstream connect failed: remote={}, error={:#}",
-                        remote, e
-                    );
-                    return;
-                }
-            };
-
-            let start = Instant::now();
-            let _token = up.track(upstream.as_raw_fd());
-            let splice_result =
-                splice_or_copy_bidirectional(state.config.splice, &mut client, &mut upstream).await;
-            let duration = start.elapsed();
-
-            match splice_result {
-                Ok((sent, recv)) => {
-                    info!(
-                        "TCP port-forward finished: remote={}, peer={}, upstream={}, score={:.0}, sent={}, recv={}, duration_ms={}",
-                        remote,
-                        peer_addr,
-                        up.id,
-                        up.score(),
-                        sent,
-                        recv,
-                        duration.as_millis(),
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "port-forward TCP relay error: remote={}, upstream={}, score={:.0}, error={:#}",
-                        remote,
-                        up.id,
-                        up.score(),
-                        e
-                    );
-                }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("port-forward TCP {} -> {} shutting down", listen_addr, remote);
+                break;
             }
-        });
-    }
-}
-
-pub async fn tcp_accept_loop(listener: TcpListener, state: Arc<AppState>) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                let state = state.clone();
-                tokio::spawn(async move {
-                    let orig_dst = match stream.local_addr() {
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            error!("failed to get local_addr: {:#}", e);
-                            return;
+            res = listener.accept() => {
+                let (mut client, peer_addr) = res
+                    .with_context(|| format!("accept on port-forward {}", listen_addr))?;
+                let state_for_task = state.clone();
+                state.tcp_handlers.spawn(|cancel| async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            debug!("port-forward TCP {} -> {} handler cancelled", peer_addr, remote);
                         }
-                    };
+                        _ = async {
+                            let state = state_for_task;
+                            info!("port-forward TCP: {} -> {} via SOCKS5", peer_addr, remote);
 
-                    info!("TCP connection: {} -> {}", peer_addr, orig_dst);
+                            let target = TcpUpstreamTarget::Socks5Ip(remote);
+                            let (mut upstream, up) = match try_connect_socks5(&target, &state).await {
+                                Ok((s, up)) => {
+                                    debug!(
+                                        "selected upstream {} at {} (score={:.0}) for port-forward {}",
+                                        up.id, up.addr, up.score(), remote
+                                    );
+                                    (s, up)
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "port-forward upstream connect failed: remote={}, error={:#}",
+                                        remote, e
+                                    );
+                                    return;
+                                }
+                            };
 
-                    if let Err(e) = handle_tcp_connection(stream, orig_dst, state).await {
-                        error!("tcp {} handling error: {:#}", peer_addr, e);
+                            let start = Instant::now();
+                            let _token = up.track(upstream.as_raw_fd());
+                            let splice_result = splice_or_copy_bidirectional(
+                                state.config.splice,
+                                &mut client,
+                                &mut upstream,
+                            ).await;
+                            let duration = start.elapsed();
+
+                            match splice_result {
+                                Ok((sent, recv)) => {
+                                    info!(
+                                        "TCP port-forward finished: remote={}, peer={}, upstream={}, score={:.0}, sent={}, recv={}, duration_ms={}",
+                                        remote, peer_addr, up.id, up.score(), sent, recv, duration.as_millis(),
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "port-forward TCP relay error: remote={}, upstream={}, score={:.0}, error={:#}",
+                                        remote, up.id, up.score(), e
+                                    );
+                                }
+                            }
+                        } => {}
                     }
                 });
             }
-            Err(e) => {
-                error!("failed to accept TCP connection: {:#}", e);
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn tcp_accept_loop(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("TCP accept loop shutting down");
+                break;
+            }
+            // accept 分支放到后面
+            res = listener.accept() => {
+                match res {
+                    Ok((stream, peer_addr)) => {
+                        let state_for_task = state.clone();
+                        state.tcp_handlers.spawn(|cancel| async move {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    debug!("TCP handler {} cancelled", peer_addr);
+                                }
+                                _ = async {
+                                    let state = state_for_task;
+                                    let orig_dst = match stream.local_addr() {
+                                        Ok(addr) => addr,
+                                        Err(e) => {
+                                            error!("failed to get local_addr: {:#}", e);
+                                            return;
+                                        }
+                                    };
+
+                                    info!("TCP connection: {} -> {}", peer_addr, orig_dst);
+                                    if let Err(e) = handle_tcp_connection(stream, orig_dst, state).await {
+                                        error!("tcp {} handling error: {:#}", peer_addr, e);
+                                    }
+                                } => {}
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("failed to accept TCP connection: {:#}", e);
+                    }
+                }
             }
         }
     }

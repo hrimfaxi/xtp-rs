@@ -153,12 +153,39 @@ fn parse_http_host_header_value(value: &str) -> Result<String, HttpSniffError> {
     Ok(host)
 }
 
+fn definitely_not_http_1x_prefix(buf: &[u8]) -> bool {
+    // 如果已经看到第一行 \r\n，立即校验 request line 格式
+    let Some(line_end) = buf.windows(2).position(|w| w == b"\r\n") else {
+        return false; // 还没看到完整 request line，不能判断
+    };
+
+    let line = match std::str::from_utf8(&buf[..line_end]) {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+
+    if !looks_like_http_1x_request_line(line) {
+        return true;
+    }
+
+    false
+}
+
 pub fn sniff_http_host_from_prefix(
     buf: &[u8],
     max_header_size: usize,
 ) -> Result<String, HttpSniffError> {
     if buf.is_empty() {
         return Err(HttpSniffError::PeekEmpty);
+    }
+
+    // 轻量协议判定：HTTP/1.x 请求行必须以大写字母开头
+    if !buf[0].is_ascii_uppercase() {
+        return Err(HttpSniffError::ProtocolNotMatched);
+    }
+
+    if definitely_not_http_1x_prefix(buf) {
+        return Err(HttpSniffError::ProtocolNotMatched);
     }
 
     let header_end = match find_http_header_end(buf) {
