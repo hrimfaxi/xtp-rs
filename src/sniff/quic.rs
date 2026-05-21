@@ -16,11 +16,17 @@ const QUIC_SNI_INPUT_CAP: usize = 16 * 1024;
 const QUIC_CRYPTO_REASSEMBLY_CAP: usize = 32 * 1024;
 
 const QUIC_VERSION_V1: u32 = 0x0000_0001;
+const QUIC_VERSION_V2: u32 = 0x6b33_43cf;
 const QUIC_VERSION_DRAFT29: u32 = 0xff00_001d;
 
 const QUIC_V1_INITIAL_SALT: [u8; 20] = [
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
     0xcc, 0xbb, 0x7f, 0x0a,
+];
+
+const QUIC_V2_INITIAL_SALT: [u8; 20] = [
+    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+    0xf9, 0xbd, 0x2e, 0xd9,
 ];
 
 const QUIC_DRAFT29_INITIAL_SALT: [u8; 20] = [
@@ -38,6 +44,7 @@ struct QuicInitialKeys {
 fn quic_initial_salt(version: u32) -> Option<&'static [u8; 20]> {
     match version {
         QUIC_VERSION_V1 => Some(&QUIC_V1_INITIAL_SALT),
+        QUIC_VERSION_V2 => Some(&QUIC_V2_INITIAL_SALT),
         QUIC_VERSION_DRAFT29 => Some(&QUIC_DRAFT29_INITIAL_SALT),
         _ => None,
     }
@@ -379,17 +386,23 @@ fn quic_parse_one_initial_packet(
         return Err(UdpSniffError::ProtocolNotMatched);
     }
 
-    let packet_type = (first & 0x30) >> 4;
-    if packet_type != 0 {
-        return Err(UdpSniffError::ProtocolNotMatched);
-    }
-
     let mut off = packet_start + 1;
 
     let version = quic_read_u32(datagram, off)?;
     off += 4;
 
     if quic_initial_salt(version).is_none() {
+        return Err(UdpSniffError::ProtocolNotMatched);
+    }
+
+    let packet_type = (first & 0x30) >> 4;
+    let is_initial = match version {
+        QUIC_VERSION_V1 | QUIC_VERSION_DRAFT29 => packet_type == 0,
+        QUIC_VERSION_V2 => packet_type == 1,
+        _ => false,
+    };
+
+    if !is_initial {
         return Err(UdpSniffError::ProtocolNotMatched);
     }
 
