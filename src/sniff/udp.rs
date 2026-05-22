@@ -57,3 +57,38 @@ pub fn udp_sniff_error_reason(error: UdpSniffError) -> &'static str {
         UdpSniffError::TooLarge => "too_large",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_name() {
+        assert_eq!(
+            udp_sniff_protocol_name(UdpSniffProtocol::QuicSni),
+            "quic_sni"
+        );
+    }
+
+    #[test]
+    fn error_reasons() {
+        assert_eq!(
+            udp_sniff_error_reason(UdpSniffError::ProtocolNotMatched),
+            "protocol_not_matched"
+        );
+        assert_eq!(
+            udp_sniff_error_reason(UdpSniffError::InsufficientPrefix),
+            "insufficient_prefix"
+        );
+        assert_eq!(udp_sniff_error_reason(UdpSniffError::NoTarget), "no_target");
+        assert_eq!(
+            udp_sniff_error_reason(UdpSniffError::ParseError),
+            "parse_error"
+        );
+        assert_eq!(
+            udp_sniff_error_reason(UdpSniffError::InvalidHostname),
+            "invalid_hostname"
+        );
+        assert_eq!(udp_sniff_error_reason(UdpSniffError::TooLarge), "too_large");
+    }
+}

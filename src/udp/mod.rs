@@ -271,7 +271,8 @@ impl UdpSession {
         match &self.spec.reply_path {
             UdpReplyPath::Tproxy => {
                 match state
-                    .udp_runtime
+                    .runtime
+                    .udp
                     .fake_udp
                     .send_to(remote_src, key.client_addr, payload, state.config.fwmark)
                     .await
@@ -360,7 +361,7 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
     let key = spec.key;
     let outbound = match spec.routing {
         UdpRoutingMode::Auto => {
-            if state.should_direct(key.target_addr.ip()) {
+            if state.should_direct(key.target_addr.ip(), None) {
                 let socket = create_direct_udp_socket(key.target_addr, state.config.fwmark)?;
                 UdpOutbound::Direct { socket }
             } else {
@@ -626,11 +627,12 @@ pub async fn run_udp_gc_loop(state: Arc<AppState>, cancel: CancellationToken) {
             _ = tokio::time::sleep(interval) => {},
         }
 
-        state.udp_runtime.cleanup_expired_sessions().await;
+        state.runtime.udp.cleanup_expired_sessions().await;
         state
-            .udp_runtime
+            .runtime
+            .udp
             .fake_udp
-            .cleanup_expired(state.udp_runtime.timeout)
+            .cleanup_expired(state.runtime.udp.timeout)
             .await;
     }
 }

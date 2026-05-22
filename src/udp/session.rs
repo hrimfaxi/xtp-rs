@@ -198,3 +198,41 @@ impl UdpSession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn for_tproxy_sets_correct_fields() {
+        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 12345);
+        let orig_dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443);
+        let spec = UdpSessionSpec::for_tproxy(client, orig_dst);
+        assert_eq!(spec.key.client_addr, client);
+        assert_eq!(spec.key.target_addr, orig_dst);
+        assert!(matches!(spec.key.kind, UdpSessionKind::Tproxy));
+        assert!(matches!(spec.routing, UdpRoutingMode::Auto));
+        assert!(matches!(spec.reply_path, UdpReplyPath::Tproxy));
+        assert!(spec.sniffed_host.is_none());
+    }
+
+    #[tokio::test]
+    async fn for_port_forward_sets_correct_fields() {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let listen = "127.0.0.1:5353".parse().unwrap();
+        let client = "127.0.0.1:12345".parse().unwrap();
+        let remote = "8.8.8.8:53".parse().unwrap();
+
+        let spec = UdpSessionSpec::for_port_forward(listen, client, remote, sock);
+
+        assert_eq!(spec.key.client_addr, client);
+        assert_eq!(spec.key.target_addr, remote);
+        assert!(matches!(
+                spec.key.kind,
+                UdpSessionKind::PortForward { listen_addr } if listen_addr == listen
+        ));
+        assert!(matches!(spec.routing, UdpRoutingMode::ForceSocks5));
+        assert!(matches!(spec.reply_path, UdpReplyPath::PortForward { .. }));
+    }
+}

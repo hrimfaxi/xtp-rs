@@ -145,19 +145,19 @@ pub async fn handle_tcp_connection(
     orig_dst: SocketAddr,
     state: Arc<AppState>,
 ) -> Result<()> {
-    let direct = state.should_direct(orig_dst.ip());
-
     let sniff_cfg = SniffConfig {
         tcp_peek_buffer_size: state.config.tcp_peek_buffer_size,
     };
 
-    let sniffed_host = if direct {
-        None
-    } else {
+    let domain: Option<String> = if state.need_domain_sniff() {
         sniff_domain(&client, orig_dst, &state.sniffers, &sniff_cfg).await
+    } else {
+        None
     };
 
-    let target = decide_tcp_upstream_target(orig_dst, direct, sniffed_host.as_deref());
+    // 分流判断
+    let direct = state.should_direct(orig_dst.ip(), domain.as_deref());
+    let target = decide_tcp_upstream_target(orig_dst, direct, domain.as_deref());
 
     // 分流：直连不碰 upstream，不评分
     let (mut upstream, up) = match target {
@@ -360,6 +360,51 @@ pub async fn tcp_accept_loop(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decide_direct() {
+        let dst = "8.8.8.8:443".parse().unwrap();
+        let target = decide_tcp_upstream_target(dst, true, None);
+        assert!(matches!(target, TcpUpstreamTarget::Direct(a) if a == dst));
+    }
+
+    #[test]
+    fn decide_socks5_ip() {
+        let dst = "8.8.8.8:443".parse().unwrap();
+        let target = decide_tcp_upstream_target(dst, false, None);
+        assert!(matches!(target, TcpUpstreamTarget::Socks5Ip(a) if a == dst));
+    }
+
+    #[test]
+    fn decide_socks5_domain() {
+        let dst = "8.8.8.8:443".parse().unwrap();
+        let target = decide_tcp_upstream_target(dst, false, Some("example.com"));
+        match target {
+            TcpUpstreamTarget::Socks5Domain { host, port } => {
+                assert_eq!(host, "example.com");
+                assert_eq!(port, 443);
+            }
+            _ => panic!("expected Socks5Domain"),
+        }
+    }
+
+    #[test]
+    fn decide_socks5_domain_keeps_orig_port() {
+        let dst = "1.2.3.4:8080".parse().unwrap();
+        let target = decide_tcp_upstream_target(dst, false, Some("foo.bar"));
+        match target {
+            TcpUpstreamTarget::Socks5Domain { host, port } => {
+                assert_eq!(host, "foo.bar");
+                assert_eq!(port, 8080);
+            }
+            _ => panic!("expected Socks5Domain"),
         }
     }
 }

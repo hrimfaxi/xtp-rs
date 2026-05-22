@@ -12,8 +12,8 @@ start_service() {
     procd_set_param user nobody
     procd_set_param group nobody
     procd_set_param no_new_privs 1
-    procd_add_jail_mount /etc/xtp-rs/*
-    procd_add_jail_mount /etc/tsubamegaeshi-rs/*
+    procd_add_jail_mount /etc/xtp-rs
+    procd_add_jail_mount /etc/tsubamegaeshi-rs
   fi
   procd_set_param env xtp-rs_LOCATION_ASSET="/usr/local/xtp-rs"
   procd_set_param limits nofile="1024768 1024768"

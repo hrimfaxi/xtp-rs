@@ -343,3 +343,103 @@ impl Drop for TaskGuard {
         self.cancel.cancel();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iptrie::IpPrefix;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ---- parse_ip_net_list ----
+    #[test]
+    fn parse_ip_and_cidr() {
+        let list = vec!["1.2.3.4".to_string(), "10.0.0.0/8".to_string()];
+        let nets = parse_ip_net_list(&list).unwrap();
+        assert_eq!(nets.len(), 2);
+    }
+
+    #[test]
+    fn parse_empty_string_error() {
+        let list = vec!["".to_string()];
+        assert!(parse_ip_net_list(&list).is_err());
+    }
+
+    #[test]
+    fn parse_invalid() {
+        let list = vec!["not_an_ip".to_string()];
+        assert!(parse_ip_net_list(&list).is_err());
+    }
+
+    // ---- build_ip_tries ----
+    #[test]
+    fn build_and_lookup_v4() {
+        let net: IpNet = "192.168.1.0/24".parse().unwrap();
+        let (v4, _) = build_ip_tries(&[net]).unwrap();
+        assert!(
+            v4.lookup(&"192.168.1.55".parse::<Ipv4Addr>().unwrap())
+                .len()
+                > 0
+        );
+        assert!(v4.lookup(&"192.168.2.1".parse::<Ipv4Addr>().unwrap()).len() == 0);
+    }
+
+    #[test]
+    fn build_and_lookup_v6() {
+        let net: IpNet = "2001:db8::/32".parse().unwrap();
+        let (_, v6) = build_ip_tries(&[net]).unwrap();
+        let hit: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let miss: Ipv6Addr = "2001:db9::1".parse().unwrap();
+        assert!(v6.lookup(&hit).len() > 0);
+        assert!(v6.lookup(&miss).len() == 0);
+    }
+
+    // ---- hex_encode ----
+    #[test]
+    fn hex_encode_works() {
+        assert_eq!(hex_encode(&[0x00, 0xab, 0xff]), "00 ab ff");
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    // ---- unspecified_addr_for ----
+    #[test]
+    fn unspecified_v4() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80);
+        let unspec = unspecified_addr_for(addr);
+        assert_eq!(
+            unspec,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        );
+    }
+
+    #[test]
+    fn unspecified_v6() {
+        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(1, 2, 3, 4, 5, 6, 7, 8)), 443);
+        let unspec = unspecified_addr_for(addr);
+        assert_eq!(
+            unspec,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        );
+    }
+
+    // ---- is_io_emsgsize ----
+    #[test]
+    fn detects_emsgsize() {
+        let e = std::io::Error::from_raw_os_error(libc::EMSGSIZE);
+        assert!(is_io_emsgsize(&e));
+    }
+
+    #[test]
+    fn non_emsgsize() {
+        let e = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(!is_io_emsgsize(&e));
+    }
+
+    // ---- now_secs ----
+    #[test]
+    fn now_secs_is_monotonic() {
+        let t1 = now_secs();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let t2 = now_secs();
+        assert!(t2 >= t1);
+    }
+}

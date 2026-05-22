@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -e
+
+cargo test --all-features
+cargo test --no-default-features
+cargo test --features sniff-http
+cargo test --features sniff-tls-common,sniff-tls
+cargo test --features sniff-tls-common,sniff-quic
+cargo clippy --all-targets --all-features -- -D warnings

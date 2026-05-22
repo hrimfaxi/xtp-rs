@@ -9,7 +9,24 @@ splice = true
 log_level = "info,xtp_rs=debug"
 direct_countries = [ "CN" ]
 
+# 代理模式：smart / global / bypass
+# 运行时可通过 SIGUSR1 临时切换，SIGHUP 重载后恢复为此值
+#   smart: 智能分流（默认）
+#   global: 自动路由统一走代理
+#   bypass: 自动路由统一直连（调试用）
+proxy_mode = "smart"
+
 disable_upstream_score = false
+
+# geosite.dat 文件路径，为空则不启用 geosite 分流
+# geosite_path = "/usr/local/xray/geosite.dat"
+
+# 走代理的 geosite 分类
+# proxy_geosite_tags = [ "gfw", "twitter", "google", "geolocation-!cn" ]
+
+# 走直连的 geosite 分类
+# direct_geosite_tags = [ "geolocation-cn", "private" ]
+
 
 # upstream_switch_tolerance 配置项（默认 0）
 #  - 0：不启用粘性，每次 pick 都重新做平方加权随机
@@ -34,6 +51,9 @@ health_check_fail_threshold = 2
 # 健康检查的目标 URL，用于 HTTP HEAD 探测。
 health_check_url = "cp.cloudflare.com"
 
+# 用于控制 QUIC 探针分数在最终上游选路中的权重占比，
+# 默认值为 70，对应 TCP:QUIC = 3:7。
+quic_weight = 70
 
 # 是否对非直连 TCP 连接进行 HTTP/1.x Host 头 sniff。
 # 当 TLS SNI sniff 失败或不匹配时，可继续尝试 HTTP Host sniff。

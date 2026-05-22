@@ -388,3 +388,132 @@ pub fn is_valid_sni_hostname(host: &str) -> bool {
 
     has_alpha
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ------ is_valid_sni_hostname ------
+    #[test]
+    fn valid_hostname() {
+        assert!(is_valid_sni_hostname("example.com"));
+        assert!(is_valid_sni_hostname("EXAMPLE.com"));
+        assert!(is_valid_sni_hostname("a-b.example"));
+        assert!(is_valid_sni_hostname("localhost"));
+    }
+
+    #[test]
+    fn empty_or_too_long_hostname() {
+        assert!(!is_valid_sni_hostname(""));
+        let long = "a".repeat(254);
+        assert!(!is_valid_sni_hostname(&long));
+    }
+
+    #[test]
+    fn leading_or_trailing_dot() {
+        assert!(!is_valid_sni_hostname(".example.com"));
+        assert!(!is_valid_sni_hostname("example.com."));
+    }
+
+    #[test]
+    fn double_dot() {
+        assert!(!is_valid_sni_hostname("example..com"));
+    }
+
+    #[test]
+    fn label_start_or_end_with_dash() {
+        assert!(!is_valid_sni_hostname("-example.com"));
+        assert!(!is_valid_sni_hostname("example-.com"));
+    }
+
+    #[test]
+    fn non_ascii_or_underscore() {
+        assert!(!is_valid_sni_hostname("exa_mple.com"));
+        assert!(!is_valid_sni_hostname("例子.com"));
+    }
+
+    #[test]
+    fn pure_ipv4_form() {
+        assert!(!is_valid_sni_hostname("127.0.0.1"));
+        assert!(!is_valid_sni_hostname("192.168.1.1"));
+    }
+
+    #[test]
+    fn label_too_long() {
+        let label = "a".repeat(64);
+        let host = format!("{}.com", label);
+        assert!(!is_valid_sni_hostname(&host));
+    }
+
+    // ------ should_retry_sniff ------
+    #[test]
+    fn retry_when_attempt_below_max_and_data_grew() {
+        let orig = "127.0.0.1:1234".parse().unwrap();
+        // attempt < max_retries, cur_len > last_peek_len => true
+        assert!(should_retry_sniff("test", 0, 3, 100, 50, orig));
+        // attempt >= max_retries => false
+        assert!(!should_retry_sniff("test", 3, 3, 100, 50, orig));
+        // cur_len == 0 => false
+        assert!(!should_retry_sniff("test", 0, 3, 0, 0, orig));
+        // cur_len <= last_peek_len => false
+        assert!(!should_retry_sniff("test", 0, 3, 50, 100, orig));
+    }
+
+    // peek 测试可用本地 TcpListener + TcpStream（需 tokio runtime）
+    #[tokio::test]
+    async fn peek_does_not_consume() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        client.write_all(b"hello").await.unwrap();
+
+        let peeked = peek_client_prefix(&server, 10).await.unwrap();
+        assert_eq!(peeked, b"hello");
+
+        let mut buf = [0u8; 5];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[tokio::test]
+    async fn wait_for_more_peek_data_sees_growth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        // 先发送 5 字节
+        server.writable().await.unwrap();
+        server.try_write(b"hello").unwrap();
+
+        let peeked = peek_client_prefix(&client, 10).await.unwrap();
+        assert_eq!(peeked.len(), 5);
+
+        // 再发送更多
+        server.try_write(b" world").unwrap();
+
+        let more = wait_for_more_peek_data(&client, 100, 5, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(more.len() > 5);
+        assert_eq!(&more[..11], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn wait_for_more_peek_data_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (_server, _) = listener.accept().await.unwrap();
+
+        let result = wait_for_more_peek_data(&client, 100, 0, Duration::from_millis(10)).await;
+        // 超时应返回 Ok(None)
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+    }
+}

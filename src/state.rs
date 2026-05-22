@@ -4,10 +4,18 @@ use maxminddb::Reader;
 use maxminddb::geoip2::Country;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
-use tracing::{error, info, warn};
 
-use crate::cli::{Config, PortForwardProto, parse_listen_addr};
+#[allow(unused_imports)]
+use tracing::{debug, error, info, trace, warn};
+
+#[cfg(feature = "geosite")]
+use geosite_rs::{GeoSite, GeoSiteList};
+#[cfg(feature = "geosite")]
+use prost::Message;
+
+use crate::cli::{Config, PortForwardProto, ProxyMode, parse_listen_addr};
 use crate::sniff::udp::UdpSnifferEngine;
 use crate::sniff::{Sniffer, build_sniffers, build_udp_sniffers};
 use crate::socket_factory::{
@@ -18,11 +26,18 @@ use crate::udp::{UdpRuntime, run_udp_gc_loop, run_udp_loop, run_udp_port_forward
 use crate::upstream::{UpstreamSet, run_health_check_task};
 use crate::util::{TaskGuard, build_ip_tries, parse_ip_net_list, warn_if_splice_with_forwarding};
 
+pub struct AppRuntime {
+    pub proxy_mode: AtomicU8,
+    pub udp: Arc<UdpRuntime>,
+}
+
+#[cfg(feature = "geosite")]
+type GeositeIndex = std::collections::HashMap<String, Vec<geosite_rs::Domain>>;
+
 pub struct AppState {
     pub mmdb: Option<Arc<Reader<Vec<u8>>>>,
     pub config: Config,
     pub config_path: String,
-    pub udp_runtime: Arc<UdpRuntime>,
     pub force_direct_v4: Ipv4RTrieSet,
     pub force_direct_v6: Ipv6RTrieSet,
     pub force_socks5_v4: Ipv4RTrieSet,
@@ -37,6 +52,9 @@ pub struct AppState {
     pub tcp_handlers: TaskGuard,
     pub health_check: TaskGuard,
     pub udp_gc: TaskGuard,
+    pub runtime: Arc<AppRuntime>,
+    #[cfg(feature = "geosite")]
+    pub geosite: Option<Arc<GeositeIndex>>,
 }
 
 fn ipv4_trie_contains(trie: &Ipv4RTrieSet, ip: &Ipv4Addr) -> bool {
@@ -47,8 +65,159 @@ fn ipv6_trie_contains(trie: &Ipv6RTrieSet, ip: &Ipv6Addr) -> bool {
     trie.lookup(ip).len() != 0
 }
 
+#[cfg(feature = "geosite")]
+fn canonical_domain(domain: &str) -> String {
+    domain
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// 域名后缀匹配。
+///
+/// 匹配：
+/// - `example.com` == `example.com`
+/// - `www.example.com` ends with `.example.com`
+///
+/// 不匹配：
+/// - `badexample.com` 不应匹配 `example.com`
+#[cfg(feature = "geosite")]
+fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
+    let d_norm = canonical_domain(domain);
+    let s_norm = canonical_domain(suffix);
+
+    let d_len = d_norm.len();
+    let s_len = s_norm.len();
+
+    // 2. 长度边界短路
+    if d_len < s_len {
+        return false;
+    }
+
+    // 3. 规范化后完全相等 (例如 domain: "google.com", suffix: "google.com")
+    if d_len == s_len {
+        return d_norm == s_norm;
+    }
+
+    // 4. 处理子域名后缀匹配 (例如 domain: "www.google.com", suffix: "google.com")
+    if d_norm.ends_with(&s_norm) {
+        let prev_char_idx = d_len - s_len - 1;
+        if let Some(c) = d_norm.as_bytes().get(prev_char_idx) {
+            return *c == b'.';
+        }
+    }
+
+    false
+}
+
+#[cfg(feature = "geosite")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeositeDomainType {
+    Plain,
+    Regex,
+    Domain,
+    Full,
+    Unknown(i32),
+}
+
+#[cfg(feature = "geosite")]
+impl From<i32> for GeositeDomainType {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => Self::Plain,
+            1 => Self::Regex,
+            2 => Self::Domain,
+            3 => Self::Full,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+#[cfg(feature = "geosite")]
+fn geosite_domain_match(rule: &geosite_rs::Domain, domain: &str) -> bool {
+    let domain = canonical_domain(domain);
+    let value = canonical_domain(&rule.value);
+
+    match GeositeDomainType::from(rule.r#type) {
+        GeositeDomainType::Plain => !value.is_empty() && domain.contains(&value),
+        GeositeDomainType::Regex => false, // 不支持正则
+        GeositeDomainType::Domain => domain_matches_suffix(&domain, &value),
+        GeositeDomainType::Full => !value.is_empty() && domain == value,
+        GeositeDomainType::Unknown(t) => {
+            trace!(rule_type = t, value = %rule.value, "unknown geosite domain type");
+            false
+        }
+    }
+}
+
+#[cfg(feature = "geosite")]
+fn geosite_contains(index: &GeositeIndex, tag: &str, domain: &str) -> bool {
+    let Some(rules) = index.get(&tag.to_lowercase()) else {
+        return false;
+    };
+
+    rules.iter().any(|rule| geosite_domain_match(rule, domain))
+}
+
 impl AppState {
-    pub fn should_direct(&self, ip: IpAddr) -> bool {
+    pub fn need_domain_sniff(&self) -> bool {
+        #[cfg(feature = "geosite")]
+        {
+            self.geosite.is_some()
+                && (!self.config.proxy_geosite_tags.is_empty()
+                    || !self.config.direct_geosite_tags.is_empty())
+                && matches!(
+                    ProxyMode::from_u8(self.runtime.proxy_mode.load(Ordering::Relaxed)),
+                    ProxyMode::Smart
+                )
+        }
+        #[cfg(not(feature = "geosite"))]
+        {
+            false
+        }
+    }
+
+    /// 判断目标 IP 是否应直连。
+    ///
+    /// 当前运行时模式通过全局 `PROXY_MODE` 获取，
+    /// 在 Global/Bypass 模式下直接短路返回，否则进入智能规则匹配。
+    /// 注意：该方法依赖进程级全局状态，测试时需注意模式隔离。
+    pub fn should_direct(&self, ip: IpAddr, domain: Option<&str>) -> bool {
+        let mode = ProxyMode::from_u8(self.runtime.proxy_mode.load(Ordering::Relaxed));
+        match mode {
+            ProxyMode::Global => {
+                debug!(%ip, "force proxy (global mode)");
+                return false;
+            }
+            ProxyMode::Bypass => {
+                debug!(%ip, "force direct (bypass mode)");
+                return true;
+            }
+            ProxyMode::Smart => {}
+        }
+
+        #[cfg(not(feature = "geosite"))]
+        {
+            _ = domain;
+        }
+
+        // 域名规则优先
+        #[cfg(feature = "geosite")]
+        if let (Some(geo), Some(domain)) = (&self.geosite, domain) {
+            for tag in &self.config.proxy_geosite_tags {
+                if geosite_contains(geo, tag, domain) {
+                    debug!(%domain, %tag, "force proxy (geosite)");
+                    return false;
+                }
+            }
+            for tag in &self.config.direct_geosite_tags {
+                if geosite_contains(geo, tag, domain) {
+                    debug!(%domain, %tag, "force direct (geosite)");
+                    return true;
+                }
+            }
+        }
+
         match ip {
             IpAddr::V4(ipv4) => {
                 if ipv4_trie_contains(&self.force_socks5_v4, &ipv4) {
@@ -120,7 +289,7 @@ impl AppState {
         ok &= self.udp_gc.shutdown(timeout).await;
 
         // 3. 再清理现有 UDP session：把还在跑的 recv loop 全部 cancel
-        ok &= self.udp_runtime.shutdown(timeout).await;
+        ok &= self.runtime.udp.shutdown(timeout).await;
 
         // 4. 停 score task（不依赖 fd，随时可停）
         ok &= self.upstream_scores.shutdown(timeout).await;
@@ -148,7 +317,6 @@ impl AppState {
     /// 从 Config 从头构建，MMDB 也重新加载
     pub async fn build(config: Config, config_path: String) -> Result<Self> {
         warn_if_splice_with_forwarding(config.splice);
-        validate_port_forward_binds(&config)?;
 
         let mmdb = match config.mmdb_path.as_deref() {
             Some("") | None => {
@@ -208,11 +376,94 @@ impl AppState {
             config.udp_session_timeout_secs,
         )));
 
+        let proxy_mode = config.proxy_mode.as_u8();
+
+        #[cfg(feature = "geosite")]
+        let geosite: Option<Arc<GeositeIndex>> = if let Some(ref path) = config.geosite_path {
+            use std::collections::HashSet;
+
+            // Read the geosite.dat file
+            let data = std::fs::read(path)
+                .with_context(|| format!("failed to read geosite file: {}", path))?;
+
+            // Decode the entire dataset
+            let full = GeoSiteList::decode(data.as_slice())
+                .with_context(|| "failed to decode geosite data")?;
+
+            if tracing::enabled!(tracing::Level::TRACE) {
+                for entry in &full.entry {
+                    trace!("available geosite tag: {}", entry.country_code);
+                }
+            }
+
+            // Collect needed tags (case‑insensitive)
+            let needed_lower: HashSet<String> = config
+                .proxy_geosite_tags
+                .iter()
+                .chain(config.direct_geosite_tags.iter())
+                .map(|s| s.to_lowercase())
+                .collect();
+
+            // Filter entries: keep only those whose tag matches (case‑insensitive)
+            let filtered_entries: Vec<GeoSite> = full
+                .entry
+                .into_iter()
+                .filter(|e| needed_lower.contains(&e.country_code.to_lowercase()))
+                .collect();
+
+            // Warn about tags that were configured but not found in the data
+            for tag in &config.proxy_geosite_tags {
+                if !filtered_entries
+                    .iter()
+                    .any(|e| e.country_code.eq_ignore_ascii_case(tag))
+                {
+                    warn!("geosite tag not found in data: {}", tag);
+                }
+            }
+            for tag in &config.direct_geosite_tags {
+                if !filtered_entries
+                    .iter()
+                    .any(|e| e.country_code.eq_ignore_ascii_case(tag))
+                {
+                    warn!("geosite tag not found in data: {}", tag);
+                }
+            }
+
+            let index: GeositeIndex = filtered_entries
+                .into_iter()
+                .map(|entry| (entry.country_code.to_lowercase(), entry.domain))
+                .collect();
+
+            Some(Arc::new(index))
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "geosite"))]
+        {
+            if config.geosite_path.is_some()
+                || !config.proxy_geosite_tags.is_empty()
+                || !config.direct_geosite_tags.is_empty()
+            {
+                warn!(
+                    "geosite support is not compiled in, but geosite config is present; ignoring all geosite rules"
+                );
+            }
+        }
+
+        #[cfg(feature = "geosite")]
+        if config.geosite_path.is_none()
+            && (!config.proxy_geosite_tags.is_empty() || !config.direct_geosite_tags.is_empty())
+        {
+            warn!(
+                "geosite tags are configured but geosite_path is empty; geosite routing is disabled"
+            );
+        }
+
         Ok(AppState {
             mmdb,
             config,
             config_path,
-            udp_runtime,
             force_direct_v4,
             force_direct_v6,
             force_socks5_v4,
@@ -227,6 +478,12 @@ impl AppState {
             tcp_handlers: TaskGuard::new(),
             health_check: TaskGuard::new(),
             udp_gc: TaskGuard::new(),
+            runtime: Arc::new(AppRuntime {
+                proxy_mode: AtomicU8::new(proxy_mode),
+                udp: udp_runtime,
+            }),
+            #[cfg(feature = "geosite")]
+            geosite,
         })
     }
 
@@ -456,47 +713,356 @@ pub fn is_must_direct_local_ip(ip: IpAddr) -> bool {
     }
 }
 
-fn validate_port_forward_binds(config: &Config) -> Result<()> {
-    use std::collections::HashSet;
-
-    let mut tcp_binds = HashSet::new();
-    let mut udp_binds = HashSet::new();
-
-    for pf in &config.port_forward {
-        let bind: SocketAddr = pf
-            .bind
-            .parse()
-            .with_context(|| format!("invalid port-forward bind '{}'", pf.bind))?;
-
-        match pf.network {
-            PortForwardProto::Tcp => {
-                if !tcp_binds.insert(bind) {
-                    anyhow::bail!("duplicate TCP port-forward bind: {}", bind);
-                }
-            }
-            PortForwardProto::Udp => {
-                if !udp_binds.insert(bind) {
-                    anyhow::bail!("duplicate UDP port-forward bind: {}", bind);
-                }
-            }
-            PortForwardProto::Both => {
-                if !tcp_binds.insert(bind) {
-                    anyhow::bail!("duplicate TCP port-forward bind: {}", bind);
-                }
-                if !udp_binds.insert(bind) {
-                    anyhow::bail!("duplicate UDP port-forward bind: {}", bind);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn is_must_direct_local_ipv4(ip: Ipv4Addr) -> bool {
     ip.is_loopback() || ip.is_link_local() || ip.is_broadcast() || ip.is_unspecified()
 }
 
 fn is_must_direct_local_ipv6(ip: Ipv6Addr) -> bool {
     ip.is_loopback() || ip.is_unspecified() || ip.is_unicast_link_local()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::UpstreamConfig;
+    use crate::upstream::Upstream;
+    use std::net::IpAddr;
+
+    #[test]
+    fn local_ipv4_loopback() {
+        assert!(is_must_direct_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn local_ipv4_link_local() {
+        assert!(is_must_direct_local_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 1
+        ))));
+    }
+
+    #[test]
+    fn local_ipv4_broadcast() {
+        assert!(is_must_direct_local_ip(IpAddr::V4(Ipv4Addr::BROADCAST)));
+    }
+
+    #[test]
+    fn local_ipv4_unspecified() {
+        assert!(is_must_direct_local_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn local_ipv6_loopback() {
+        assert!(is_must_direct_local_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn local_ipv6_unspecified() {
+        assert!(is_must_direct_local_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn local_ipv6_link_local() {
+        let ip = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        assert!(is_must_direct_local_ip(IpAddr::V6(ip)));
+    }
+
+    #[test]
+    fn not_local_public_ip() {
+        assert!(!is_must_direct_local_ip(IpAddr::V4(Ipv4Addr::new(
+            8, 8, 8, 8
+        ))));
+        assert!(!is_must_direct_local_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888
+        ))));
+    }
+
+    // Helper to create a minimal AppState for should_direct tests
+    fn minimal_app_state() -> AppState {
+        let upstream = Upstream::new("test", "127.0.0.1:1080".parse().unwrap());
+        let upstreams = UpstreamSet::new(vec![upstream], 0, 70);
+        let udp_runtime = Arc::new(UdpRuntime::new(Duration::from_secs(60)));
+        AppState {
+            mmdb: None,
+            config: Config {
+                direct_local_ip: true,
+                ..create_test_config()
+            },
+            config_path: String::new(),
+            force_direct_v4: Ipv4RTrieSet::new(),
+            force_direct_v6: Ipv6RTrieSet::new(),
+            force_socks5_v4: Ipv4RTrieSet::new(),
+            force_socks5_v6: Ipv6RTrieSet::new(),
+            sniffers: vec![],
+            udp_sniffers: vec![],
+            upstreams,
+            tcp_listeners: TaskGuard::new(),
+            udp_listeners: TaskGuard::new(),
+            port_forwards: TaskGuard::new(),
+            upstream_scores: TaskGuard::new(),
+            tcp_handlers: TaskGuard::new(),
+            health_check: TaskGuard::new(),
+            udp_gc: TaskGuard::new(),
+            runtime: Arc::new(AppRuntime {
+                proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
+                udp: udp_runtime,
+            }),
+            #[cfg(feature = "geosite")]
+            geosite: None,
+        }
+    }
+
+    fn create_test_config() -> Config {
+        Config {
+            listen: "[::]:10810".into(),
+            udp: true,
+            socks5_user: None,
+            socks5_password: None,
+            fwmark: 2,
+            mmdb_path: None,
+            udp_session_timeout_secs: 60,
+            splice: false,
+            sniff_tls_sni: false,
+            sniff_http_host: false,
+            sniff_quic_sni: false,
+            tcp_peek_buffer_size: 32 * 1024,
+            tls_sniff_peek_len: 2048,
+            tls_sniff_max_len: 32 * 1024,
+            tls_sniff_max_retries: 5,
+            tls_sniff_wait_more_ms: 100,
+            tls_sniff_timeout_ms: 1000,
+            http_sniff_peek_len: 512,
+            http_sniff_max_len: 16 * 1024,
+            http_sniff_max_retries: 5,
+            http_sniff_wait_more_ms: 100,
+            http_sniff_timeout_ms: 1000,
+            log_level: None,
+            direct_countries: vec![],
+            force_direct_ips: vec![],
+            force_socks5_ips: vec![],
+            force_direct_ips_file: None,
+            force_socks5_ips_file: None,
+            port_forward: vec![],
+            direct_local_ip: true,
+            upstream: vec![UpstreamConfig {
+                id: "test".into(),
+                addr: "127.0.0.1:1080".parse().unwrap(),
+            }],
+            disable_upstream_score: false,
+            upstream_switch_tolerance: 0,
+            health_check_interval_secs: 0,
+            health_check_timeout_secs: 5,
+            health_check_fail_threshold: 2,
+            health_check_url: "cp.cloudflare.com".into(),
+            quic_weight: 70,
+            proxy_mode: ProxyMode::default(),
+            geosite_path: None,
+            direct_geosite_tags: vec![],
+            proxy_geosite_tags: vec![],
+        }
+    }
+
+    #[test]
+    fn should_direct_local_with_flag_true() {
+        let state = minimal_app_state();
+        assert!(state.should_direct(IpAddr::V4(Ipv4Addr::LOCALHOST), None));
+        assert!(state.should_direct(IpAddr::V6(Ipv6Addr::LOCALHOST), None));
+    }
+
+    // For brevity, we demonstrate one direct test; extending to other cases is similar
+    #[test]
+    fn should_direct_force_socks5_has_higher_priority() {
+        // build state with force_socks5_ips containing 8.8.8.8
+        let socks5_nets = parse_ip_net_list(&["8.8.8.8".to_string()]).unwrap();
+        let (_, _) = build_ip_tries(&socks5_nets).unwrap(); // returns v4, v6 tries
+        let (force_socks5_v4, _) = build_ip_tries(&socks5_nets).unwrap();
+        let state = AppState {
+            force_socks5_v4,
+            force_socks5_v6: Ipv6RTrieSet::new(),
+            ..minimal_app_state()
+        };
+        assert!(!state.should_direct(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), None));
+    }
+
+    #[test]
+    fn force_socks5_has_higher_priority_than_force_direct() {
+        let nets = parse_ip_net_list(&["8.8.8.8".to_string()]).unwrap();
+        let (v4, v6) = build_ip_tries(&nets).unwrap();
+        let mut state = minimal_app_state();
+        state.force_direct_v4 = v4.clone();
+        state.force_direct_v6 = v6.clone();
+        state.force_socks5_v4 = v4;
+        state.force_socks5_v6 = v6;
+        assert!(!state.should_direct("8.8.8.8".parse().unwrap(), None));
+    }
+
+    #[test]
+    fn force_direct_returns_true() {
+        let nets = parse_ip_net_list(&["8.8.8.8".to_string()]).unwrap();
+        let (v4, v6) = build_ip_tries(&nets).unwrap();
+        let mut state = minimal_app_state();
+        state.force_direct_v4 = v4;
+        state.force_direct_v6 = v6;
+        assert!(state.should_direct("8.8.8.8".parse().unwrap(), None));
+    }
+
+    #[test]
+    fn local_ip_not_direct_when_flag_false() {
+        let mut state = minimal_app_state();
+        state.config.direct_local_ip = false;
+        assert!(!state.should_direct(IpAddr::V4(Ipv4Addr::LOCALHOST), None));
+    }
+
+    #[cfg(feature = "geosite")]
+    mod geosite_tests {
+        use super::*;
+
+        #[test]
+        fn test_domain_matches_suffix() {
+            // 1. 完全相等的情况
+            assert!(domain_matches_suffix("google.com", "google.com"));
+            assert!(
+                domain_matches_suffix("Google.Com", "google.com"),
+                "应该忽略大小写"
+            );
+
+            // 2. 标准子域名匹配
+            assert!(domain_matches_suffix("www.google.com", "google.com"));
+            assert!(domain_matches_suffix("mail.www.google.com", "google.com"));
+            assert!(domain_matches_suffix("a.b.c.d.google.com", "google.com"));
+
+            // 3. 相似但【不应该】匹配的情况（经典边界漏洞）
+            assert!(
+                !domain_matches_suffix("notgoogle.com", "google.com"),
+                "防止字符串部分包含的伪匹配"
+            );
+            assert!(!domain_matches_suffix("fakegoogle.com", "google.com"));
+            assert!(
+                !domain_matches_suffix("google.com.cn", "google.com"),
+                "后缀不同不应匹配"
+            );
+            assert!(
+                !domain_matches_suffix("com", "google.com"),
+                "长度不够不应匹配"
+            );
+
+            // 4. 各种恶心的 FQDN 尾部点（Trailing Dot）情况
+            // 因为入口进来了 canonical_domain，所以这些行为必须表现一致且安全
+            assert!(domain_matches_suffix("google.com.", "google.com"));
+            assert!(domain_matches_suffix("google.com", "google.com."));
+            assert!(domain_matches_suffix("google.com.", "google.com."));
+            assert!(domain_matches_suffix("www.google.com.", "google.com"));
+            assert!(domain_matches_suffix("www.google.com", "google.com."));
+            assert!(domain_matches_suffix("www.google.com.", "google.com."));
+
+            // 5. 空字符或非法边界防御
+            assert!(!domain_matches_suffix("", "google.com"));
+            assert!(!domain_matches_suffix("google.com", ""));
+            assert!(domain_matches_suffix("", ""));
+        }
+
+        // ========== canonical_domain ==========
+
+        #[test]
+        fn test_canonical_domain_lowercase() {
+            assert_eq!(canonical_domain("Example.COM"), "example.com");
+        }
+
+        #[test]
+        fn test_canonical_domain_leading_dot() {
+            assert_eq!(canonical_domain(".example.com"), "example.com");
+        }
+
+        #[test]
+        fn test_canonical_domain_trailing_dot() {
+            assert_eq!(canonical_domain("example.com."), "example.com");
+        }
+
+        #[test]
+        fn test_canonical_domain_both_dots_and_case() {
+            assert_eq!(canonical_domain(".Example.COM."), "example.com");
+        }
+
+        #[test]
+        fn test_canonical_domain_empty() {
+            assert_eq!(canonical_domain(""), "");
+        }
+
+        #[test]
+        fn test_canonical_domain_only_dot() {
+            assert_eq!(canonical_domain("."), "");
+        }
+
+        // ========== domain_matches_suffix ==========
+
+        #[test]
+        fn test_domain_matches_suffix_exact() {
+            assert!(domain_matches_suffix("google.com", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_case_insensitive() {
+            assert!(domain_matches_suffix("Google.Com", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_single_subdomain() {
+            assert!(domain_matches_suffix("www.google.com", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_deep_subdomain() {
+            assert!(domain_matches_suffix("a.b.c.google.com", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_not_a_subdomain_1() {
+            assert!(!domain_matches_suffix("notgoogle.com", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_not_a_subdomain_2() {
+            assert!(!domain_matches_suffix("fakegoogle.com", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_longer_tld() {
+            assert!(!domain_matches_suffix("google.com.cn", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_shorter_domain() {
+            assert!(!domain_matches_suffix("com", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_trailing_dot_domain() {
+            assert!(domain_matches_suffix("google.com.", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_trailing_dot_suffix() {
+            assert!(domain_matches_suffix("google.com", "google.com."));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_both_trailing_dots() {
+            assert!(domain_matches_suffix("www.google.com.", "google.com."));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_empty_domain() {
+            assert!(!domain_matches_suffix("", "google.com"));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_empty_suffix() {
+            assert!(!domain_matches_suffix("google.com", ""));
+        }
+
+        #[test]
+        fn test_domain_matches_suffix_both_empty() {
+            // 与当前实现保持一致：空字符串视为相等
+            assert!(domain_matches_suffix("", ""));
+        }
+    }
 }

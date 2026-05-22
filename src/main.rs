@@ -12,13 +12,16 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::signal::unix::SignalKind;
+use tokio::signal::unix::signal;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry, reload};
 
-use crate::cli::{Cli, Config};
+use crate::cli::{Cli, Config, ProxyMode};
 use crate::state::AppState;
 use crate::upstream::run_upstream_stats_listener;
 use crate::util::TaskGuard;
@@ -42,7 +45,9 @@ async fn main() -> Result<()> {
     let config_str = tokio::fs::read_to_string(&cli.config)
         .await
         .with_context(|| format!("failed to read config file {}", cli.config))?;
-    let config: Config = toml::from_str(&config_str).context("invalid config")?;
+    let mut config: Config = toml::from_str(&config_str).context("invalid config")?;
+    config.normalize_geosite_tags();
+    config.validate()?;
 
     let env_filter = build_env_filter(&config)?;
     let (reload_layer, reload_handle) = reload::Layer::new(env_filter);
@@ -77,8 +82,7 @@ async fn main() -> Result<()> {
     let sighup_guard = TaskGuard::new();
     let state_for_sighup = Arc::clone(&state);
     sighup_guard.spawn(move |cancel| async move {
-        let mut sighup =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
         loop {
             tokio::select! {
                 biased;
@@ -101,6 +105,35 @@ async fn main() -> Result<()> {
         }
     });
 
+    // SIGUSR1: 循环切换代理模式 (smart -> global -> bypass -> smart)
+    let usr1_guard = TaskGuard::new();
+    let state_for_usr1 = Arc::clone(&state);
+    usr1_guard.spawn(|cancel| async move {
+        let mut stream = match signal(SignalKind::user_defined1()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("SIGUSR1 handler install failed: {}", e);
+                return;
+            }
+        };
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    info!("SIGUSR1 handler shutting down");
+                    break;
+                }
+                Some(()) = stream.recv() => {
+                    let current = state_for_usr1.load();
+                    let old = ProxyMode::from_u8(current.runtime.proxy_mode.load(Ordering::Relaxed));
+                    let new = old.next();
+                    current.runtime.proxy_mode.store(new.as_u8(), Ordering::Relaxed);
+                    info!("Proxy mode rotated: {} -> {}", old, new);
+                }
+            }
+        }
+    });
+
     tokio::signal::ctrl_c().await?;
     info!("shutting down");
 
@@ -112,6 +145,11 @@ async fn main() -> Result<()> {
     // 停 SIGHUP handler
     if !sighup_guard.shutdown(Duration::from_secs(10)).await {
         warn!("sighup handler shutdown timed out");
+    }
+
+    // 停 SIGUSR1 handler
+    if !usr1_guard.shutdown(Duration::from_secs(2)).await {
+        warn!("SIGUSR1 handler shutdown timed out");
     }
 
     let current = state.load_full();
@@ -134,7 +172,9 @@ async fn reload_config(state: Arc<ArcSwap<AppState>>) -> Result<()> {
         .await
         .with_context(|| format!("failed to read config file {}", path))?;
 
-    let config: Config = toml::from_str(&config_str).context("invalid config")?;
+    let mut config: Config = toml::from_str(&config_str).context("invalid config")?;
+    config.normalize_geosite_tags();
+    config.validate()?;
     // 提前校验 log filter，失败时旧 generation 不动
     let new_filter = build_env_filter(&config)?;
     let new_arc = Arc::new(AppState::build(config, path.clone()).await?);
@@ -154,6 +194,9 @@ async fn reload_config(state: Arc<ArcSwap<AppState>>) -> Result<()> {
     // state.swap() 会返回被替换掉的旧 generation。
     // 这一步之后，stats listener 等全局任务会读到 new_arc。
     let old_arc = state.swap(new_arc.clone());
+
+    let reset_mode = ProxyMode::from_u8(new_arc.runtime.proxy_mode.load(Ordering::Relaxed));
+    info!("Proxy mode reset to config value: {}", reset_mode);
 
     // 4. 热更新 tracing filter。
     //

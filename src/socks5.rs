@@ -475,3 +475,158 @@ pub async fn socks5_udp_associate_for_client(
         udp_socket,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn build_udp_ipv4() {
+        let target =
+            Socks5UdpTarget::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443));
+        let pkt = build_socks5_udp_packet(target, b"data").unwrap();
+        // RSV 0x0000
+        assert_eq!(&pkt[0..3], &[0x00, 0x00, 0x00]);
+        assert_eq!(pkt[3], 0x01); // ATYP IPv4
+        assert_eq!(&pkt[4..8], &[1, 2, 3, 4]);
+        assert_eq!(u16::from_be_bytes([pkt[8], pkt[9]]), 443);
+        assert_eq!(&pkt[10..], b"data");
+    }
+
+    #[test]
+    fn build_udp_ipv6() {
+        let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let target = Socks5UdpTarget::Ip(SocketAddr::new(IpAddr::V6(ip), 8080));
+        let pkt = build_socks5_udp_packet(target, b"hello").unwrap();
+        assert_eq!(pkt[3], 0x04);
+        assert_eq!(&pkt[4..20], &ip.octets());
+        assert_eq!(u16::from_be_bytes([pkt[20], pkt[21]]), 8080);
+        assert_eq!(&pkt[22..], b"hello");
+    }
+
+    #[test]
+    fn build_udp_domain() {
+        let target = Socks5UdpTarget::Domain {
+            host: "example.com",
+            port: 53,
+        };
+        let pkt = build_socks5_udp_packet(target, b"dns").unwrap();
+        assert_eq!(pkt[3], 0x03);
+        let len = pkt[4] as usize;
+        assert_eq!(len, 11);
+        assert_eq!(&pkt[5..5 + 11], b"example.com");
+        assert_eq!(u16::from_be_bytes([pkt[16], pkt[17]]), 53);
+        assert_eq!(&pkt[18..], b"dns");
+    }
+
+    #[test]
+    fn build_udp_empty_domain_error() {
+        let target = Socks5UdpTarget::Domain { host: "", port: 80 };
+        assert!(build_socks5_udp_packet(target, b"").is_err());
+    }
+
+    #[test]
+    fn parse_ipv4_packet() {
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        let addr = SocketAddr::new(IpAddr::V4(ip), 9999);
+        let mut raw = vec![0x00, 0x00, 0x00, 0x01];
+        raw.extend_from_slice(&ip.octets());
+        raw.extend_from_slice(&9999u16.to_be_bytes());
+        raw.extend_from_slice(b"payload");
+        let (src, payload) =
+            parse_socks5_udp_packet_with_fallback_src(&raw, "192.168.1.1:0".parse().unwrap())
+                .unwrap();
+        assert_eq!(src, addr);
+        assert_eq!(payload, b"payload");
+    }
+
+    #[test]
+    fn parse_domain_fallback() {
+        let fallback = "192.168.1.1:0".parse().unwrap();
+        let mut raw = vec![0x00, 0x00, 0x00, 0x03]; // RSV FRAG ATYP=domain
+        raw.push(7); // length
+        raw.extend_from_slice(b"foo.com");
+        raw.extend_from_slice(&443u16.to_be_bytes());
+        raw.extend_from_slice(b"data");
+        let (src, payload) = parse_socks5_udp_packet_with_fallback_src(&raw, fallback).unwrap();
+        assert_eq!(src, fallback); // 应返回 fallback
+        assert_eq!(payload, b"data");
+    }
+
+    #[test]
+    fn parse_invalid_rsv() {
+        let raw = vec![0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        assert!(
+            parse_socks5_udp_packet_with_fallback_src(&raw, "0.0.0.0:0".parse().unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_frag_not_zero() {
+        let raw = vec![0x00, 0x00, 0x01, 0x01, 0, 0, 0, 0, 0, 0];
+        assert!(
+            parse_socks5_udp_packet_with_fallback_src(&raw, "0.0.0.0:0".parse().unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn build_udp_domain_too_long() {
+        let host = "a".repeat(256);
+        let target = Socks5UdpTarget::Domain {
+            host: &host,
+            port: 80,
+        };
+        assert!(build_socks5_udp_packet(target, b"").is_err());
+    }
+
+    #[test]
+    fn parse_ipv6_packet() {
+        let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let addr = SocketAddr::new(IpAddr::V6(ip), 443);
+        let mut raw = vec![0x00, 0x00, 0x00, 0x04];
+        raw.extend_from_slice(&ip.octets());
+        raw.extend_from_slice(&443u16.to_be_bytes());
+        raw.extend_from_slice(b"data");
+        let (src, payload) = parse_socks5_udp_packet_with_fallback_src(
+            &raw,
+            "[::]:0".parse().unwrap(), // 合法的 fallback 地址
+        )
+        .unwrap();
+        assert_eq!(src, addr);
+        assert_eq!(payload, b"data");
+    }
+
+    #[test]
+    fn parse_unknown_atyp() {
+        let raw = vec![0x00, 0x00, 0x00, 0x09];
+        assert!(
+            parse_socks5_udp_packet_with_fallback_src(&raw, "0.0.0.0:0".parse().unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_short_ipv4_packet() {
+        let raw = vec![0x00, 0x00, 0x00, 0x01, 1, 2, 3]; // 缺少完整地址+端口
+        assert!(
+            parse_socks5_udp_packet_with_fallback_src(&raw, "0.0.0.0:0".parse().unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_short_domain_packet() {
+        let raw = vec![0x00, 0x00, 0x00, 0x03, 20]; // 声称 name_len=20 但无数据
+        assert!(
+            parse_socks5_udp_packet_with_fallback_src(&raw, "0.0.0.0:0".parse().unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_short_ipv6_packet() {
+        let raw = vec![0x00, 0x00, 0x00, 0x04, 0, 1, 2, 3];
+
+        assert!(
+            parse_socks5_udp_packet_with_fallback_src(&raw, "0.0.0.0:0".parse().unwrap()).is_err()
+        );
+    }
+}

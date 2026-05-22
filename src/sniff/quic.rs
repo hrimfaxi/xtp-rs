@@ -1,6 +1,6 @@
 use aes::Aes128;
 use aes::cipher::{Block, BlockCipherEncrypt, KeyInit as AesKeyInit};
-use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit, Payload as AeadPayload};
+use aes_gcm::aead::{Aead, Payload as AeadPayload};
 use aes_gcm::{Aes128Gcm, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -283,10 +283,12 @@ fn quic_remove_header_protection_and_decrypt(
     if ciphertext.len() < 16 {
         return Err(UdpSniffError::InsufficientPrefix);
     }
-    let nonce = quic_build_nonce(&keys.iv, packet_number);
+    let nonce_bytes = quic_build_nonce(&keys.iv, packet_number);
     let aead = Aes128Gcm::new_from_slice(&keys.key).map_err(|_| UdpSniffError::ParseError)?;
+    let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| UdpSniffError::ParseError)?;
+
     aead.decrypt(
-        Nonce::from_slice(&nonce),
+        &nonce,
         AeadPayload {
             msg: ciphertext,
             aad: &header,
@@ -573,5 +575,96 @@ impl From<TlsSniffError> for UdpSniffError {
             TlsSniffError::InvalidHostname => UdpSniffError::InvalidHostname,
             TlsSniffError::TooLargeClientHello => UdpSniffError::TooLarge,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quic_varint_1byte() {
+        let buf = [0x3fu8];
+        let mut off = 0;
+        assert_eq!(quic_read_varint(&buf, &mut off).unwrap(), 63);
+        assert_eq!(off, 1);
+    }
+
+    #[test]
+    fn quic_varint_2byte() {
+        let buf = [0x40u8 | 0x3f, 0xff]; // 最大: 0x7fff
+        let mut off = 0;
+        let val = quic_read_varint(&buf, &mut off).unwrap();
+        assert_eq!(val, 0x3fff);
+        assert_eq!(off, 2);
+    }
+
+    #[test]
+    fn quic_varint_4byte() {
+        let buf = [0x80u8 | 0x3f, 0xff, 0xff, 0xff]; // 最大 4 字节
+        let mut off = 0;
+        let val = quic_read_varint(&buf, &mut off).unwrap();
+        assert_eq!(val, 0x3fffffff);
+        assert_eq!(off, 4);
+    }
+
+    #[test]
+    fn quic_varint_8byte() {
+        let buf = [0xc0u8, 0, 0, 0, 0, 0, 0, 1];
+        let mut off = 0;
+        let val = quic_read_varint(&buf, &mut off).unwrap();
+
+        assert_eq!(val, 1);
+        assert_eq!(off, 8);
+    }
+
+    #[test]
+    fn quic_varint_insufficient() {
+        let buf = [0x80u8]; // 需要 4 字节但只给 1
+        let mut off = 0;
+        assert_eq!(
+            quic_read_varint(&buf, &mut off),
+            Err(UdpSniffError::InsufficientPrefix)
+        );
+    }
+
+    // ---- QuicCryptoReassembly ----
+    #[test]
+    fn reassembly_contiguous() {
+        let mut r = QuicCryptoReassembly::new();
+        r.write(0, b"hello").unwrap();
+        assert_eq!(r.contiguous(), b"hello");
+    }
+
+    #[test]
+    fn reassembly_out_of_order() {
+        let mut r = QuicCryptoReassembly::new();
+        r.write(3, b"lo").unwrap();
+        r.write(0, b"hel").unwrap();
+        assert_eq!(r.contiguous(), b"hello");
+    }
+
+    #[test]
+    fn reassembly_gap() {
+        let mut r = QuicCryptoReassembly::new();
+        r.write(0, b"hel").unwrap();
+        r.write(10, b"lo").unwrap();
+        assert_eq!(r.contiguous(), b"hel");
+    }
+
+    #[test]
+    fn reassembly_capacity_exceeded() {
+        let mut r = QuicCryptoReassembly::new();
+        assert!(r.write(QUIC_CRYPTO_REASSEMBLY_CAP, b"x").is_err());
+    }
+
+    // parse_tls_client_hello_from_crypto 的测试可结合已知 ClientHello 片段
+    #[test]
+    fn parse_crypto_handshake_not_client_hello() {
+        let crypto = vec![0x02, 0x00, 0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05];
+        assert_eq!(
+            quic_parse_tls_client_hello_from_crypto(&crypto),
+            Err(UdpSniffError::ProtocolNotMatched)
+        );
     }
 }

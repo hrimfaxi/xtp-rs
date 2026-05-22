@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
@@ -53,6 +53,50 @@ pub struct UpstreamConfig {
     pub addr: SocketAddr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    #[default]
+    Smart,
+    Global,
+    Bypass,
+}
+
+impl ProxyMode {
+    pub const fn next(self) -> Self {
+        match self {
+            ProxyMode::Smart => ProxyMode::Global,
+            ProxyMode::Global => ProxyMode::Bypass,
+            ProxyMode::Bypass => ProxyMode::Smart,
+        }
+    }
+
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            ProxyMode::Smart => 0,
+            ProxyMode::Global => 1,
+            ProxyMode::Bypass => 2,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ProxyMode::Global,
+            2 => ProxyMode::Bypass,
+            _ => ProxyMode::Smart,
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProxyMode::Smart => "smart",
+            ProxyMode::Global => "global",
+            ProxyMode::Bypass => "bypass",
+        })
+    }
+}
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_listen")]
@@ -327,6 +371,32 @@ pub struct Config {
     ///
     /// 默认使用 Cloudflare 的探测端点。
     pub health_check_url: String,
+
+    /// QUIC 探针在最终选路分数中的权重百分比（0-100）。
+    /// 越高越依赖 RTT/丢包率/MTU 探针，越低越依赖实际 TCP 吞吐。
+    /// 默认 70（即 TCP:QUIC = 3:7）。
+    #[serde(default = "default_quic_weight")]
+    pub quic_weight: u32,
+
+    #[serde(default)]
+    /// 代理模式：smart / global / bypass。
+    /// 运行时可通过 `SIGUSR1` 临时切换，`SIGHUP` 重载后恢复为此值。
+    /// - smart: 智能分流（默认）
+    /// - global: 自动路由统一走代理
+    /// - bypass: 自动路由统一直连（调试用）
+    pub proxy_mode: ProxyMode,
+
+    #[serde(default)]
+    /// geosite.dat 文件路径，为空则不启用 geosite 分流
+    pub geosite_path: Option<String>,
+
+    #[serde(default)]
+    /// 走代理的 geosite 分类，例如 ["gfw", "twitter", "google", "geolocation=!cn" ]
+    pub proxy_geosite_tags: Vec<String>,
+
+    #[serde(default)]
+    /// 走直连的 geosite 分类，例如 ["geolocation-cn", "private" ]
+    pub direct_geosite_tags: Vec<String>,
 }
 
 pub fn default_listen() -> String {
@@ -433,6 +503,10 @@ pub fn default_health_check_fail_threshold() -> u32 {
     2
 }
 
+pub fn default_quic_weight() -> u32 {
+    70
+}
+
 pub fn default_health_check_url() -> String {
     "cp.cloudflare.com".to_string()
 }
@@ -468,6 +542,264 @@ impl Config {
             .map(|u| Upstream::new(u.id.trim().to_string(), u.addr))
             .collect();
 
-        Ok(UpstreamSet::new(items, self.upstream_switch_tolerance))
+        Ok(UpstreamSet::new(
+            items,
+            self.upstream_switch_tolerance,
+            self.quic_weight,
+        ))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.quic_weight > 100 {
+            bail!("quic_weight must be in range 0..=100");
+        }
+
+        let (listen_ip, listen_port) =
+            parse_listen_addr(&self.listen).context("invalid listen address")?;
+
+        for pf in &self.port_forward {
+            let bind: SocketAddr = pf
+                .bind
+                .parse()
+                .with_context(|| format!("invalid port-forward bind '{}'", pf.bind))?;
+
+            if bind.ip() == listen_ip && bind.port() == listen_port {
+                bail!(
+                    "port-forward bind {} conflicts with tproxy listen address",
+                    bind
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn normalize_geosite_tags(&mut self) {
+        let f = |tags: &mut Vec<String>| {
+            for tag in tags.iter_mut() {
+                let trimmed = tag.trim();
+                let lower = trimmed.to_lowercase();
+                *tag = lower.strip_prefix("geosite:").unwrap_or(&lower).to_string();
+            }
+        };
+        f(&mut self.proxy_geosite_tags);
+        f(&mut self.direct_geosite_tags);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config() -> Config {
+        Config {
+            listen: "[::]:10810".into(),
+            udp: true,
+            socks5_user: None,
+            socks5_password: None,
+            fwmark: 2,
+            mmdb_path: None,
+            udp_session_timeout_secs: 60,
+            splice: false,
+            sniff_tls_sni: false,
+            sniff_http_host: false,
+            sniff_quic_sni: false,
+            tcp_peek_buffer_size: 32 * 1024,
+            tls_sniff_peek_len: 2048,
+            tls_sniff_max_len: 32 * 1024,
+            tls_sniff_max_retries: 5,
+            tls_sniff_wait_more_ms: 100,
+            tls_sniff_timeout_ms: 1000,
+            http_sniff_peek_len: 512,
+            http_sniff_max_len: 16 * 1024,
+            http_sniff_max_retries: 5,
+            http_sniff_wait_more_ms: 100,
+            http_sniff_timeout_ms: 1000,
+            log_level: None,
+            direct_countries: vec![],
+            force_direct_ips: vec![],
+            force_socks5_ips: vec![],
+            force_direct_ips_file: None,
+            force_socks5_ips_file: None,
+            port_forward: vec![],
+            direct_local_ip: true,
+            upstream: vec![UpstreamConfig {
+                id: "u1".into(),
+                addr: "127.0.0.1:1080".parse().unwrap(),
+            }],
+            disable_upstream_score: false,
+            upstream_switch_tolerance: 0,
+            health_check_interval_secs: 0,
+            health_check_timeout_secs: 5,
+            health_check_fail_threshold: 2,
+            health_check_url: "cp.cloudflare.com".into(),
+            quic_weight: 70,
+            proxy_mode: ProxyMode::Smart,
+            geosite_path: None,
+            proxy_geosite_tags: vec![],
+            direct_geosite_tags: vec![],
+        }
+    }
+
+    #[test]
+    fn parse_listen_addr_invalid() {
+        assert!(parse_listen_addr("not_an_addr").is_err());
+        assert!(parse_listen_addr("127.0.0.1:999999").is_err());
+    }
+
+    #[test]
+    fn validate_port_forward_conflict() {
+        let cfg = Config {
+            listen: "0.0.0.0:12345".into(),
+            port_forward: vec![PortForward {
+                name: None,
+                bind: "0.0.0.0:12345".into(),
+                remote: "8.8.8.8:53".into(),
+                network: PortForwardProto::Both,
+            }],
+            upstream: vec![UpstreamConfig {
+                id: "x".into(),
+                addr: "127.0.0.1:1080".parse().unwrap(),
+            }],
+            ..minimal_config()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn build_upstream_set_empty() {
+        let cfg = Config {
+            upstream: vec![],
+            ..minimal_config()
+        };
+        assert!(cfg.build_upstream_set().is_err());
+    }
+
+    #[test]
+    fn build_upstream_set_duplicate_id() {
+        let cfg = Config {
+            upstream: vec![
+                UpstreamConfig {
+                    id: "dup".into(),
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                },
+                UpstreamConfig {
+                    id: "dup".into(),
+                    addr: "127.0.0.1:2".parse().unwrap(),
+                },
+            ],
+            ..minimal_config()
+        };
+        assert!(cfg.build_upstream_set().is_err());
+    }
+
+    #[test]
+    fn parse_listen_addr_valid_ipv4_and_ipv6() {
+        let (ip, port) = parse_listen_addr("127.0.0.1:1080").unwrap();
+        assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(port, 1080);
+
+        let (ip, port) = parse_listen_addr("[::]:1080").unwrap();
+        assert_eq!(ip, "::".parse::<IpAddr>().unwrap());
+        assert_eq!(port, 1080);
+    }
+
+    #[test]
+    fn validate_port_forward_no_conflict() {
+        let cfg = Config {
+            listen: "0.0.0.0:12345".into(),
+            port_forward: vec![PortForward {
+                name: None,
+                bind: "0.0.0.0:12346".into(),
+                remote: "8.8.8.8:53".into(),
+                network: PortForwardProto::Udp,
+            }],
+            ..minimal_config()
+        };
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn build_upstream_set_empty_id() {
+        let cfg = Config {
+            upstream: vec![UpstreamConfig {
+                id: "   ".into(),
+                addr: "127.0.0.1:1080".parse().unwrap(),
+            }],
+            ..minimal_config()
+        };
+
+        assert!(cfg.build_upstream_set().is_err());
+    }
+
+    mod proxy_mode_tests {
+        use super::ProxyMode;
+
+        #[test]
+        fn default_is_smart() {
+            assert_eq!(ProxyMode::default(), ProxyMode::Smart);
+        }
+
+        #[test]
+        fn as_u8_and_from_u8_roundtrip() {
+            for mode in &[ProxyMode::Smart, ProxyMode::Global, ProxyMode::Bypass] {
+                let v = mode.as_u8();
+                assert_eq!(
+                    ProxyMode::from_u8(v),
+                    *mode,
+                    "roundtrip failed for {:?}",
+                    mode
+                );
+            }
+        }
+
+        #[test]
+        fn from_u8_invalid_defaults_to_smart() {
+            assert_eq!(ProxyMode::from_u8(100), ProxyMode::Smart);
+            assert_eq!(ProxyMode::from_u8(255), ProxyMode::Smart);
+        }
+
+        #[test]
+        fn next_cycles() {
+            let modes = [ProxyMode::Smart, ProxyMode::Global, ProxyMode::Bypass];
+            for (i, &mode) in modes.iter().enumerate() {
+                let next = mode.next();
+                let expected = modes[(i + 1) % modes.len()];
+                assert_eq!(next, expected, "next({:?}) should be {:?}", mode, expected);
+            }
+        }
+
+        #[test]
+        fn display_output() {
+            assert_eq!(format!("{}", ProxyMode::Smart), "smart");
+            assert_eq!(format!("{}", ProxyMode::Global), "global");
+            assert_eq!(format!("{}", ProxyMode::Bypass), "bypass");
+        }
+
+        #[test]
+        fn deserialize_proxy_mode_default() {
+            let toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            let cfg: super::Config = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.proxy_mode, ProxyMode::Smart);
+        }
+
+        #[test]
+        fn deserialize_proxy_mode_in_config() {
+            let upstream_toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            for (mode_str, expected) in &[
+                ("smart", ProxyMode::Smart),
+                ("global", ProxyMode::Global),
+                ("bypass", ProxyMode::Bypass),
+            ] {
+                let toml = format!("proxy_mode = \"{}\"\n{}", mode_str, upstream_toml);
+                let cfg: super::Config = toml::from_str(&toml).expect("deserialize");
+                assert_eq!(
+                    cfg.proxy_mode, *expected,
+                    "failed for mode_str: {}",
+                    mode_str
+                );
+            }
+        }
     }
 }

@@ -105,7 +105,8 @@ pub(crate) async fn forward_udp_payload(
     let key = spec.key;
 
     let session = match state
-        .udp_runtime
+        .runtime
+        .udp
         .get_or_create_udp_session(state.clone(), spec)
         .await
     {
@@ -182,7 +183,7 @@ pub(crate) async fn handle_udp_client_payload(
 ) {
     let key = spec.key;
 
-    if let Some(session) = state.udp_runtime.get_ready_udp_session(key).await {
+    if let Some(session) = state.runtime.udp.get_ready_udp_session(key).await {
         pending_sniff.remove(&key);
 
         trace!(
@@ -307,7 +308,7 @@ pub(crate) async fn handle_new_udp_sniff(
     }
 
     let target_ip_direct = matches!(spec.routing, UdpRoutingMode::Auto)
-        && state.should_direct(spec.key.target_addr.ip());
+        && state.should_direct(spec.key.target_addr.ip(), None);
 
     if target_ip_direct {
         return false;
@@ -463,5 +464,114 @@ pub(crate) fn enforce_pending_udp_sniff_capacity(
 
             drop(pending);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sniff::udp::{UdpSniffOutcome, UdpSniffProtocol, UdpSnifferSessionEngine};
+    use std::collections::HashMap;
+
+    struct DummySniffer;
+    impl UdpSnifferSessionEngine for DummySniffer {
+        fn feed(&mut self, _payload: &[u8]) -> UdpSniffOutcome {
+            UdpSniffOutcome::NeedMore {
+                protocol: UdpSniffProtocol::QuicSni,
+            }
+        }
+    }
+
+    // ---- PendingReplayBuffer ----
+    #[test]
+    fn replay_buffer_starts_with_one_datagram() {
+        let buf = PendingReplayBuffer::new(b"hello");
+        assert_eq!(buf.datagram_count(), 1);
+        assert_eq!(buf.cached_bytes(), 5);
+    }
+
+    #[test]
+    fn push_within_limits() {
+        let mut buf = PendingReplayBuffer::new(b"a");
+        assert!(buf.push_datagram(b"b"));
+        assert_eq!(buf.datagram_count(), 2);
+    }
+
+    #[test]
+    fn push_exceeds_count() {
+        let mut buf = PendingReplayBuffer::new(b"a");
+        for _ in 0..UDP_SNIFF_MAX_CACHED_DATAGRAMS - 1 {
+            assert!(buf.push_datagram(b"x"));
+        }
+        assert!(!buf.push_datagram(b"overflow"));
+    }
+
+    #[test]
+    fn push_exceeds_bytes() {
+        let big = vec![0u8; UDP_SNIFF_MAX_CACHED_BYTES];
+        let mut buf = PendingReplayBuffer::new(&big[..]);
+        assert!(!buf.push_datagram(b"x"));
+    }
+
+    #[test]
+    fn into_datagrams_preserves_order() {
+        let mut buf = PendingReplayBuffer::new(b"first");
+        buf.push_datagram(b"second");
+        let datagrams = buf.into_datagrams();
+        assert_eq!(datagrams, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    // ---- PendingUdpSniff ----
+    #[test]
+    fn pending_sniff_expired() {
+        let spec = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        );
+        let sniffer = Box::new(DummySniffer);
+        let mut pending = PendingUdpSniff::new(spec, sniffer, b"data");
+        // 将 started_secs 设为很久以前，使其过期
+        pending.started_secs = 0;
+        assert!(pending.expired());
+    }
+
+    #[test]
+    fn pending_sniff_not_expired() {
+        let spec = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        );
+        let sniffer = Box::new(DummySniffer);
+        let pending = PendingUdpSniff::new(spec, sniffer, b"data");
+        // 刚创建应未过期
+        assert!(!pending.expired());
+    }
+
+    // ---- enforce_pending_udp_sniff_capacity ----
+    #[test]
+    fn enforce_removes_oldest_when_over_capacity() {
+        let mut map = HashMap::new();
+        // 超过最大容量的条目
+        let total = UDP_SNIFF_MAX_PENDING_SESSIONS + 2;
+        for i in 0..total {
+            let spec = UdpSessionSpec::for_tproxy(
+                format!("127.0.0.1:{}", 1000 + i).parse().unwrap(),
+                "10.0.0.1:443".parse().unwrap(),
+            );
+            let sniffer = Box::new(DummySniffer);
+            let mut pending = PendingUdpSniff::new(spec, sniffer, b"x");
+            pending.started_secs = i as u64; // 序号越小越老
+            map.insert(pending.spec.key, pending);
+        }
+        enforce_pending_udp_sniff_capacity(&mut map);
+        assert!(map.len() <= UDP_SNIFF_MAX_PENDING_SESSIONS);
+
+        // 最老的条目 (started_secs == 0) 应被删除
+        let oldest_key = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        )
+        .key;
+        assert!(!map.contains_key(&oldest_key));
     }
 }

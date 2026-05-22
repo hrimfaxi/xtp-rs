@@ -149,3 +149,182 @@ pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffE
         None => Err(TlsSniffError::TlsNoSni),
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    // ----- 辅助函数：构造最小 ClientHello body -----
+    pub fn client_hello_body(sni: Option<&str>, ech: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        // legacy_version (TLS 1.2)
+        body.extend_from_slice(&[0x03, 0x03]);
+        // random (32 bytes)
+        body.extend_from_slice(&[0u8; 32]);
+        // session_id (length 0)
+        body.push(0);
+        // cipher_suites (length 2, one suite)
+        body.extend_from_slice(&[0x00, 0x02, 0x00, 0xff]);
+        // compression_methods (length 1, method null)
+        body.extend_from_slice(&[0x01, 0x00]);
+
+        // extensions
+        let mut exts = Vec::new();
+        if let Some(host) = sni {
+            let host_bytes = host.as_bytes();
+            let name_len = host_bytes.len();
+            // server_name_list 内容：1 byte name_type, 2 bytes name_length, name_data
+            let sni_list_len = 3 + name_len; // name_type(1) + name_length(2) + name_data
+            let ext_data_len = 2 + sni_list_len; // 2 bytes for server_name_list length
+            let mut sni_ext = Vec::new();
+            sni_ext.extend_from_slice(&[0x00, 0x00]); // extension type: server_name
+            sni_ext.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
+            sni_ext.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+            sni_ext.push(0x00); // name_type = host_name
+            sni_ext.extend_from_slice(&(name_len as u16).to_be_bytes());
+            sni_ext.extend_from_slice(host_bytes);
+            exts.extend_from_slice(&sni_ext);
+        }
+        if ech {
+            // ECH extension: type 0xfe0d, empty payload
+            let mut ech_ext = Vec::new();
+            ech_ext.extend_from_slice(&[0xfe, 0x0d]);
+            ech_ext.extend_from_slice(&[0x00, 0x00]); // zero-length payload
+            exts.extend_from_slice(&ech_ext);
+        }
+        // 写入 extensions 总长度及数据
+        if !exts.is_empty() {
+            body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+            body.extend_from_slice(&exts);
+        }
+        body
+    }
+
+    #[test]
+    fn be_u16_works() {
+        assert_eq!(be_u16(&[0x12, 0x34]).unwrap(), 0x1234);
+        assert!(be_u16(&[0x12]).is_err());
+    }
+
+    #[test]
+    fn be_u24_works() {
+        assert_eq!(be_u24(&[0x01, 0x02, 0x03]).unwrap(), 0x010203);
+        assert!(be_u24(&[0x01, 0x02]).is_err());
+    }
+
+    #[test]
+    fn parse_sni_valid() {
+        let body = client_hello_body(Some("example.com"), false);
+        let host = parse_sni_from_client_hello_body(&body).unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn sni_lowercase() {
+        let body = client_hello_body(Some("EXAMPLE.COM"), false);
+        let host = parse_sni_from_client_hello_body(&body).unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn no_extensions() {
+        // 无 extensions 的 body
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0); // session_id
+        body.extend_from_slice(&[0x00, 0x02, 0x00, 0xff]);
+        body.extend_from_slice(&[0x01, 0x00]); // compressions
+        // 没有 extensions length → off == body.len()
+        assert_eq!(
+            parse_sni_from_client_hello_body(&body),
+            Err(TlsSniffError::TlsNoSni)
+        );
+    }
+
+    #[test]
+    fn ech_returns_no_sni_even_with_outer_sni() {
+        let body = client_hello_body(Some("example.com"), true);
+        assert_eq!(
+            parse_sni_from_client_hello_body(&body),
+            Err(TlsSniffError::TlsNoSni)
+        );
+    }
+
+    #[test]
+    fn invalid_sni_hostname() {
+        // 非法 hostname（空字符串）
+        let body = client_hello_body(Some(""), false);
+        assert!(matches!(
+            parse_sni_from_client_hello_body(&body),
+            Err(TlsSniffError::InvalidHostname)
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_sni() {
+        let mut body = client_hello_body(Some("example.com"), false);
+        let pos = body
+            .windows(b"example.com".len())
+            .position(|w| w == b"example.com")
+            .unwrap();
+        body[pos] = 0xff; // 非法 UTF-8
+        assert_eq!(
+            parse_sni_from_client_hello_body(&body),
+            Err(TlsSniffError::InvalidHostname)
+        );
+    }
+
+    #[test]
+    fn cipher_suites_odd_length() {
+        // 在 cipher_suites_len 后减少一个字节，使长度变为奇数
+        // 简便方法：直接在构建时写入奇数长度
+        // 这里手动构建一个异常 body
+        let mut bad = vec![0x03, 0x03];
+        bad.extend_from_slice(&[0u8; 32]);
+        bad.push(0); // session_id len=0
+        bad.extend_from_slice(&[0x00, 0x03]); // cipher_suites_len=3 (奇数)
+        bad.extend_from_slice(&[0x00, 0xff, 0x00]); // 3字节
+        bad.extend_from_slice(&[0x01, 0x00]); // compressions
+        // 无 extensions
+        assert_eq!(
+            parse_sni_from_client_hello_body(&bad),
+            Err(TlsSniffError::ParseError)
+        );
+    }
+
+    #[test]
+    fn compression_methods_len_zero() {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0); // session_id
+        body.extend_from_slice(&[0x00, 0x02, 0x00, 0xff]);
+        body.extend_from_slice(&[0x00]); // compressions_len=0，错误
+        assert_eq!(
+            parse_sni_from_client_hello_body(&body),
+            Err(TlsSniffError::ParseError)
+        );
+    }
+
+    #[test]
+    fn sni_list_length_mismatch() {
+        let mut body = client_hello_body(Some("example.com"), false);
+
+        let pos = body
+            .windows(b"example.com".len())
+            .position(|w| w == b"example.com")
+            .unwrap();
+
+        // SNI 扩展里 list_len 在 host 前 5 字节附近：
+        // ext_type(2), ext_len(2), list_len(2), name_type(1), name_len(2), host
+        // 这里简单从 host 位置往前推到 list_len。
+        let list_len_pos = pos - 5;
+        body[list_len_pos] = 0x00;
+        body[list_len_pos + 1] = 0x01;
+
+        assert_eq!(
+            parse_sni_from_client_hello_body(&body),
+            Err(TlsSniffError::ParseError)
+        );
+    }
+}

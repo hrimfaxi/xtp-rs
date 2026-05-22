@@ -221,3 +221,182 @@ pub fn sniff_http_host_from_prefix(
 
     Err(HttpSniffError::HttpNoHost)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http_req(host: &str) -> Vec<u8> {
+        format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            host
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn empty_buffer() {
+        assert_eq!(
+            sniff_http_host_from_prefix(&[], 4096),
+            Err(HttpSniffError::PeekEmpty)
+        );
+    }
+
+    #[test]
+    fn first_byte_not_uppercase() {
+        let buf = b"get / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        assert_eq!(
+            sniff_http_host_from_prefix(&buf, 4096),
+            Err(HttpSniffError::ProtocolNotMatched)
+        );
+    }
+
+    #[test]
+    fn valid_http_host() {
+        let req = http_req("example.com");
+        let host = sniff_http_host_from_prefix(&req, 4096).unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn host_with_port() {
+        let req = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".to_vec();
+        let host = sniff_http_host_from_prefix(&req, 4096).unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn host_case_insensitive() {
+        let req = b"GET / HTTP/1.1\r\nHOST: Example.COM\r\n\r\n".to_vec();
+        let host = sniff_http_host_from_prefix(&req, 4096).unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn no_host_header() {
+        let req = b"GET / HTTP/1.1\r\nAccept: */*\r\n\r\n".to_vec();
+        assert_eq!(
+            sniff_http_host_from_prefix(&req, 4096),
+            Err(HttpSniffError::HttpNoHost)
+        );
+    }
+
+    #[test]
+    fn request_line_not_http1x() {
+        let req = b"GET / HTTP/2\r\nHost: example.com\r\n\r\n".to_vec();
+        assert_eq!(
+            sniff_http_host_from_prefix(&req, 4096),
+            Err(HttpSniffError::ProtocolNotMatched)
+        );
+    }
+
+    #[test]
+    fn header_too_large() {
+        let mut req = Vec::new();
+        req.extend_from_slice(b"GET / HTTP/1.1\r\nHost: example.com\r\n");
+        // 填充到超过 max，但不加结尾
+        while req.len() < 5000 {
+            req.extend_from_slice(b"X-Fill: a\r\n");
+        }
+        assert_eq!(
+            sniff_http_host_from_prefix(&req, 4000),
+            Err(HttpSniffError::TooLargeHeader)
+        );
+    }
+
+    #[test]
+    fn parse_http_host_header_value_rejects_ipv6_bracket() {
+        assert_eq!(
+            parse_http_host_header_value("[::1]:80"),
+            Err(HttpSniffError::InvalidHostname)
+        );
+    }
+
+    #[test]
+    fn parse_http_host_header_value_rejects_ipv4() {
+        assert_eq!(
+            parse_http_host_header_value("127.0.0.1"),
+            Err(HttpSniffError::InvalidHostname)
+        );
+    }
+
+    #[test]
+    fn non_utf8_header() {
+        let req = b"GET / HTTP/1.1\r\nHost: exam\xffple.com\r\n\r\n".to_vec();
+
+        assert_eq!(
+            sniff_http_host_from_prefix(&req, 4096),
+            Err(HttpSniffError::ProtocolNotMatched)
+        );
+    }
+
+    #[test]
+    fn non_utf8_request_line() {
+        let req = b"GE\xff / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+
+        assert_eq!(
+            sniff_http_host_from_prefix(&req, 4096),
+            Err(HttpSniffError::ProtocolNotMatched)
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_in_host_value() {
+        // 整个头部包含非法 UTF-8 → 协议未匹配
+        let req = b"GET / HTTP/1.1\r\nHost: exa\xFFmple.com\r\n\r\n".to_vec();
+        assert_eq!(
+            sniff_http_host_from_prefix(&req, 4096),
+            Err(HttpSniffError::ProtocolNotMatched)
+        );
+    }
+
+    #[test]
+    fn incomplete_request_line() {
+        let req = b"GET / HTT";
+        assert_eq!(
+            sniff_http_host_from_prefix(req, 4096),
+            Err(HttpSniffError::InsufficientPrefix)
+        );
+    }
+
+    #[test]
+    fn malformed_header_line_no_colon() {
+        let req = b"GET / HTTP/1.1\r\nBadHeader\r\n\r\n";
+        assert_eq!(
+            sniff_http_host_from_prefix(req, 4096),
+            Err(HttpSniffError::ParseError)
+        );
+    }
+
+    #[test]
+    fn invalid_host_with_non_numeric_port() {
+        let req = b"GET / HTTP/1.1\r\nHost: example.com:https\r\n\r\n";
+        assert_eq!(
+            sniff_http_host_from_prefix(req, 4096),
+            Err(HttpSniffError::InvalidHostname)
+        );
+    }
+
+    #[test]
+    fn host_empty_value() {
+        let req = b"GET / HTTP/1.1\r\nHost: \r\n\r\n";
+        assert_eq!(
+            sniff_http_host_from_prefix(req, 4096),
+            Err(HttpSniffError::ParseError)
+        );
+    }
+
+    #[test]
+    fn http_1_0_works() {
+        let req = b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n";
+        let host = sniff_http_host_from_prefix(req, 4096).unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn host_case_insensitive_header_name() {
+        let req = b"GET / HTTP/1.1\r\nhOsT: Example.COM\r\n\r\n";
+        let host = sniff_http_host_from_prefix(req, 4096).unwrap();
+        assert_eq!(host, "example.com");
+    }
+}

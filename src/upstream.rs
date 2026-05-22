@@ -24,14 +24,17 @@ pub struct Upstream {
 
     tcp_score: AtomicU32,
 
-    quic_score: AtomicU32,
-    quic_last_update_secs: AtomicU64,
-
     last_total_recv: AtomicU64,
     last_total_sent: AtomicU64,
     last_check_secs: AtomicU64,
     tcp_info_initialized: AtomicBool,
     health_failures: AtomicU32, // 连续失败次数
+
+    quic_uplink_score: AtomicU32,
+    quic_downlink_score: AtomicU32,
+    quic_uplink_last_update_secs: AtomicU64,
+    quic_downlink_last_update_secs: AtomicU64,
+    quic_weight: AtomicU32, // 0-100，默认 70
 }
 
 impl Upstream {
@@ -41,14 +44,21 @@ impl Upstream {
             registry: Mutex::new(Vec::new()),
             addr,
             tcp_score: AtomicU32::new(500),
-            quic_score: AtomicU32::new(500),
-            quic_last_update_secs: AtomicU64::new(0),
+            quic_uplink_score: AtomicU32::new(500),
+            quic_downlink_score: AtomicU32::new(500),
+            quic_uplink_last_update_secs: AtomicU64::new(0),
+            quic_downlink_last_update_secs: AtomicU64::new(0),
             last_total_recv: AtomicU64::new(0),
             last_total_sent: AtomicU64::new(0),
             last_check_secs: AtomicU64::new(0),
             tcp_info_initialized: AtomicBool::new(false),
             health_failures: AtomicU32::new(0),
+            quic_weight: AtomicU32::new(70),
         })
+    }
+
+    pub fn set_quic_weight(&self, w: u32) {
+        self.quic_weight.store(w.clamp(0, 100), Ordering::Relaxed);
     }
 
     pub fn track(&self, fd: std::os::fd::RawFd) -> Arc<()> {
@@ -123,49 +133,81 @@ impl Upstream {
         }
     }
 
-    /// 最终选路分数：QUIC 探针主导（70%），TCP 吞吐兜底（30%）。
-    /// 如果某个池子从未更新过（仍为初始 500），自动降权。
     pub fn score(&self) -> u32 {
         let tcp = self.tcp_score.load(Ordering::Relaxed);
-        let quic = self.quic_score.load(Ordering::Relaxed);
+        let uplink = self.quic_uplink_score.load(Ordering::Relaxed);
+        let downlink = self.quic_downlink_score.load(Ordering::Relaxed);
+
+        let uplink_valid = self.quic_uplink_last_update_secs.load(Ordering::Relaxed) != 0;
+        let downlink_valid = self.quic_downlink_last_update_secs.load(Ordering::Relaxed) != 0;
+
+        let quic = match (uplink_valid, downlink_valid) {
+            (true, true) => (uplink + downlink) / 2,
+            (true, false) => uplink,
+            (false, true) => downlink,
+            (false, false) => 500,
+        };
 
         let tcp_valid = tcp != 500;
-        let quic_valid = quic != 500;
+        let quic_valid = uplink_valid || downlink_valid;
+        let qw = self.quic_weight.load(Ordering::Relaxed);
+        let tw = 100 - qw;
 
         match (tcp_valid, quic_valid) {
-            (true, true) => (tcp * 3 + quic * 7) / 10,
-            (false, true) => quic, // 只有 QUIC 有数据
-            (true, false) => tcp,  // 只有 TCP 有数据
-            (false, false) => 500, // 初始态，等效随机
+            (true, true) => (tcp * tw + quic * qw) / 100,
+            (false, true) => quic,
+            (true, false) => tcp,
+            (false, false) => 500,
         }
     }
 
-    /// QUIC 探针实时更新（冷却期 5s）
-    pub fn update_quic_score(&self, raw: Option<u32>) {
+    /// 更新上行 QUIC 分数（冷却 5 秒）
+    pub fn update_uplink_score(&self, raw: Option<u32>) {
+        self.update_link_score(
+            raw,
+            &self.quic_uplink_score,
+            &self.quic_uplink_last_update_secs,
+        );
+    }
+
+    /// 更新下行 QUIC 分数（冷却 5 秒）
+    pub fn update_downlink_score(&self, raw: Option<u32>) {
+        self.update_link_score(
+            raw,
+            &self.quic_downlink_score,
+            &self.quic_downlink_last_update_secs,
+        );
+    }
+
+    fn update_link_score(&self, raw: Option<u32>, score: &AtomicU32, last_update: &AtomicU64) {
         let Some(raw) = raw else { return };
         let raw = raw.clamp(0, 1000);
 
         let now = now_secs();
-        let last = self.quic_last_update_secs.load(Ordering::Relaxed);
+        let last = last_update.load(Ordering::Relaxed);
         if now.saturating_sub(last) < 5 {
             return;
         }
 
-        if self
-            .quic_last_update_secs
+        if last_update
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            let old = self.quic_score.load(Ordering::Relaxed);
+            let old = score.load(Ordering::Relaxed);
             let blended = (old * 3 + raw * 7) / 10;
-            self.quic_score.store(blended, Ordering::Relaxed);
+            score.store(blended, Ordering::Relaxed);
         }
     }
 
-    /// 连接失败惩罚（双池都降，避免继续选中）
     pub fn penalize(&self) {
         self.tcp_score.store(100, Ordering::Relaxed);
-        self.quic_score.store(100, Ordering::Relaxed);
+        self.quic_uplink_score.store(100, Ordering::Relaxed);
+        self.quic_downlink_score.store(100, Ordering::Relaxed);
+        let now = now_secs();
+        self.quic_uplink_last_update_secs
+            .store(now, Ordering::Relaxed);
+        self.quic_downlink_last_update_secs
+            .store(now, Ordering::Relaxed);
     }
 }
 
@@ -177,13 +219,18 @@ pub struct UpstreamSet {
 }
 
 impl UpstreamSet {
-    pub fn new(items: Vec<Arc<Upstream>>, tolerance: u32) -> Self {
+    pub fn new(items: Vec<Arc<Upstream>>, tolerance: u32, quic_weight: u32) -> Self {
         assert!(!items.is_empty());
         let single = if items.len() == 1 {
             Some(Arc::clone(&items[0]))
         } else {
             None
         };
+
+        for up in &items {
+            up.set_quic_weight(quic_weight);
+        }
+
         Self {
             items,
             single,
@@ -377,6 +424,8 @@ pub struct ShadowQuicReport {
     pub rtt_ms: f64,
     pub loss_rate: f64,
     pub mtu: u16,
+    #[serde(default)] // 兼容没有 link 的旧报告
+    pub link: Option<String>,
 }
 
 pub async fn run_upstream_stats_listener(
@@ -427,12 +476,13 @@ pub async fn run_upstream_stats_listener(
                        };
 
                        trace!(
-                           "upstream stats: id={} peer={}, rtt={}ms loss={:.2}% mtu={}",
+                           "upstream stats: id={} peer={}, rtt={}ms loss={:.2}% mtu={} link={:?}",
                            rep.upstream_id,
                            rep.peer,
                            rep.rtt_ms,
                            rep.loss_rate * 100.0,
-                           rep.mtu
+                           rep.mtu,
+                           rep.link,
                        );
 
                        let state = state_swap.load();
@@ -442,10 +492,13 @@ pub async fn run_upstream_stats_listener(
                            continue;
                        }
 
-                       if let Some(up) = state.upstreams.find_by_id(&rep.upstream_id) && let Some(score) = calc_quic_score(rep.rtt_ms, rep.loss_rate, rep.mtu) {
-                           debug!("upstream {} quic_score updated to {}", up.id, score);
-                           up.update_quic_score(Some(score));
-                       }
+                        if let Some(up) = state.upstreams.find_by_id(&rep.upstream_id) {
+                            let score = calc_quic_score(rep.rtt_ms, rep.loss_rate, rep.mtu);
+                            match rep.link.as_deref() {
+                                Some("downlink") => up.update_downlink_score(score),
+                                _ => up.update_uplink_score(score), // 默认按上行处理（兼容旧报告）
+                            }
+                        }
                    }
                    Err(e) => {
                        error!("stats recv error: {}", e);
@@ -467,7 +520,7 @@ pub async fn run_upstream_stats_listener(
     info!("upstream stats listener exited, socket removed");
 }
 
-pub fn calc_quic_score(rtt_ms: f64, loss_rate: f64, mtu: u16) -> Option<u32> {
+fn calc_quic_score(rtt_ms: f64, loss_rate: f64, mtu: u16) -> Option<u32> {
     if !rtt_ms.is_finite() || rtt_ms < 0.0 || !loss_rate.is_finite() || loss_rate < 0.0 {
         return None;
     }
@@ -622,5 +675,214 @@ pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationTok
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- calc_throughput_score ----------
+    #[test]
+    fn score_none_on_low_bytes() {
+        assert_eq!(calc_throughput_score(1000, Duration::from_secs(2)), None);
+    }
+
+    #[test]
+    fn score_none_on_zero_duration() {
+        assert_eq!(calc_throughput_score(100_000, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn score_around_1000_for_50mib() {
+        let bytes = 50 * 1024 * 1024;
+        let dur = Duration::from_secs(1);
+        let score = calc_throughput_score(bytes, dur).unwrap();
+        assert!(score >= 1000); // 50 MiB/s -> max
+    }
+
+    #[test]
+    fn score_around_800_for_10mib() {
+        let bytes = 10 * 1024 * 1024;
+        let dur = Duration::from_secs(1);
+        let score = calc_throughput_score(bytes, dur).unwrap();
+        assert!((800..1000).contains(&score));
+    }
+
+    #[test]
+    fn score_never_exceeds_1000() {
+        let bytes = 500 * 1024 * 1024;
+        let dur = Duration::from_secs(1);
+        let score = calc_throughput_score(bytes, dur).unwrap();
+        assert_eq!(score, 1000);
+    }
+
+    // ---------- calc_quic_score ----------
+    #[test]
+    fn quic_score_rejects_nan() {
+        assert_eq!(calc_quic_score(f64::NAN, 0.0, 1450), None);
+    }
+
+    #[test]
+    fn quic_score_perfect() {
+        let score = calc_quic_score(10.0, 0.0, 1450).unwrap();
+        assert_eq!(score, 1000);
+    }
+
+    #[test]
+    fn quic_score_high_loss_penalty() {
+        let score = calc_quic_score(50.0, 0.15, 1450).unwrap();
+        assert!(score < 500, "high loss should reduce score significantly");
+    }
+
+    #[test]
+    fn quic_score_low_mtu_penalty() {
+        let score = calc_quic_score(10.0, 0.0, 800).unwrap();
+        assert!(score < 600);
+    }
+
+    #[test]
+    fn quic_score_minimum_50() {
+        let score = calc_quic_score(999.0, 0.5, 500).unwrap();
+        assert_eq!(score, 50); // worst case clamped
+    }
+
+    // ---------- Upstream::score ----------
+    fn make_upstream(id: &str) -> Arc<Upstream> {
+        Upstream::new(id, "127.0.0.1:1080".parse().unwrap())
+    }
+
+    /// 直接设置 QUIC 分数并标记为已更新（绕过 3:7 平滑混合）
+    fn set_quic_uplink(up: &Upstream, score: u32) {
+        up.quic_uplink_score.store(score, Ordering::Relaxed);
+        up.quic_uplink_last_update_secs.store(1, Ordering::Relaxed);
+    }
+
+    fn set_quic_downlink(up: &Upstream, score: u32) {
+        up.quic_downlink_score.store(score, Ordering::Relaxed);
+        up.quic_downlink_last_update_secs
+            .store(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn score_initial_500() {
+        let up = make_upstream("a");
+        assert_eq!(up.score(), 500);
+    }
+
+    #[test]
+    fn score_uses_downlink_when_uplink_missing() {
+        let up = make_upstream("c");
+        up.tcp_score.store(600, Ordering::Relaxed);
+        set_quic_downlink(&up, 700);
+        // uplink never updated => invalid, quic = downlink = 700
+        let expected = (600 * 30 + 700 * 70) / 100; // 670
+        assert_eq!(up.score(), expected);
+    }
+
+    #[test]
+    fn score_averages_both_links() {
+        let up = make_upstream("d");
+        up.tcp_score.store(600, Ordering::Relaxed);
+        set_quic_uplink(&up, 800);
+        set_quic_downlink(&up, 600);
+        let expected = (600 * 30 + 700 * 70) / 100; // 670
+        assert_eq!(up.score(), expected);
+    }
+
+    #[test]
+    fn penalize_sets_all_to_100() {
+        let up = make_upstream("e");
+        up.penalize();
+        assert_eq!(up.tcp_score.load(Ordering::Relaxed), 100);
+        assert_eq!(up.quic_uplink_score.load(Ordering::Relaxed), 100);
+        assert_eq!(up.quic_downlink_score.load(Ordering::Relaxed), 100);
+    }
+
+    // ---------- UpstreamSet ----------
+    fn upstream(id: &str) -> Arc<Upstream> {
+        Upstream::new(id, "127.0.0.1:1080".parse().unwrap())
+    }
+
+    fn upstream_set(ids: &[&str], tolerance: u32) -> UpstreamSet {
+        let items: Vec<_> = ids.iter().map(|id| upstream(id)).collect();
+        UpstreamSet::new(items, tolerance, 70)
+    }
+
+    #[test]
+    fn single_upstream_always_picked() {
+        let set = upstream_set(&["a"], 0);
+        let picked = set.pick();
+        assert_eq!(picked.id, "a");
+    }
+
+    #[test]
+    fn pick_excluding_single_returns_none() {
+        let set = upstream_set(&["a"], 0);
+        assert!(set.pick_excluding("a").is_none());
+    }
+
+    #[test]
+    fn pick_excluding_removes_matching() {
+        let set = upstream_set(&["a", "b"], 0);
+        let picked = set.pick_excluding("a").unwrap();
+        assert_eq!(picked.id, "b");
+    }
+
+    #[test]
+    fn tolerance_sticky_when_best_not_exceeding() {
+        let set = upstream_set(&["a", "b"], 50);
+        for u in set.iter() {
+            u.tcp_score.store(500, Ordering::Relaxed);
+            set_quic_uplink(u, 500);
+        }
+        // sticky to "a"
+        {
+            let mut cur = set.current.lock().unwrap();
+            *cur = Some("a".to_string());
+        }
+        let picked = set.pick();
+        assert_eq!(picked.id, "a", "should stick because scores equal");
+    }
+
+    #[test]
+    fn tolerance_switches_when_best_exceeds() {
+        fastrand::seed(42); // 固定随机种子，避免偶然选中低分 upstream
+        let set = upstream_set(&["a", "b"], 100);
+        // sticky to "a"
+        {
+            let mut cur = set.current.lock().unwrap();
+            *cur = Some("a".to_string());
+        }
+        // "a" at 500
+        for u in set.iter() {
+            u.tcp_score.store(500, Ordering::Relaxed);
+            set_quic_uplink(u, 500);
+        }
+        // "b" quic=700 => score=(500*3+700*7)/10=640, diff=140 > 100
+        let up_b = set.find_by_id("b").unwrap();
+        set_quic_uplink(&up_b, 700);
+        let picked = set.pick();
+        assert_eq!(picked.id, "b");
+    }
+
+    #[test]
+    fn score_blends_tcp_and_quic() {
+        let up = make_upstream("b");
+        up.tcp_score.store(600, Ordering::Relaxed);
+        set_quic_uplink(&up, 800);
+        // 默认 qw=70, tw=30
+        let expected = (600 * 30 + 800 * 70) / 100; // 740
+        assert_eq!(up.score(), expected);
+    }
+
+    #[test]
+    fn score_respects_custom_quic_weight() {
+        let up = make_upstream("f");
+        up.set_quic_weight(50); // 5:5
+        up.tcp_score.store(600, Ordering::Relaxed);
+        set_quic_uplink(&up, 800);
+        let expected = (600 * 50 + 800 * 50) / 100; // 700
+        assert_eq!(up.score(), expected);
     }
 }
