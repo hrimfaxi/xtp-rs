@@ -99,9 +99,11 @@ sudo ./unsetup-xtp-rs.sh
 > **重要**：`setup-xtp-rs.sh` 脚本会自动配置：
 > - 路由表 ID `100`，添加 `local default dev lo` 路由；
 > - 策略规则：`fwmark 1` 查找路由表 `100`；
-> - nftables 表 `inet xtp-rs`，将 TCP 80/443 以及 UDP 53/443 流量 TPROXY 到 `127.0.0.1:10810` 或 `[::1]:10810`（同时标记 fwmark=1 绕过代理自身的出站流量）。
+> - nftables 表 `inet xtp-rs`：
+>   - 在 `prerouting` 链（处理转发的入站流量）和 `output` 链（处理本机发出的出站流量）中，匹配 TCP 80/443 以及 UDP 53/443，对这些需要代理的包**设置 `fwmark=1`**，使其走上述策略路由；
+>   - 同时，xtp-rs 程序自身发出的出站连接会设置 `SO_MARK=2`（即 `XTP_BYPASS_MARK`），nftables 规则中遇到 `meta mark 2` 直接放行，从而避免代理流量被再次劫持形成环路。
 >
-> 如需修改默认端口或 fwmark，可编辑 `common.sh` 中的变量。
+> 如需修改默认端口或 fwmark，可编辑 `common.sh` 中的 `XTP_TPROXY_PORT`、`XTP_FWMARK`、`XTP_BYPASS_MARK` 变量。
 
 ### 2. 编写配置文件
 

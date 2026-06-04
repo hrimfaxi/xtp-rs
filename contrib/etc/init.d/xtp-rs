@@ -60,4 +60,8 @@ stop_service() {
   service_stop /usr/bin/xtp-rs
 }
 
+reload_service() {
+  procd_send_signal xtp-rs -HUP
+}
+
 # vim: set sw=2 ts=2 et:

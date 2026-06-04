@@ -1,3 +1,5 @@
+use tracing::trace;
+
 use crate::sniff::is_valid_sni_hostname;
 
 #[allow(dead_code)]
@@ -85,7 +87,7 @@ pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffE
         }
 
         match ext_type {
-            0xfe0d => {
+            0xfe0d | 0xff07 => {
                 saw_ech = true;
             }
             0x0000 => {
@@ -141,6 +143,10 @@ pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffE
     // 扫描完所有扩展后统一决定：
     // 如果有 ECH，按无目标处理（无法解密 inner SNI）
     if saw_ech {
+        trace!(
+            body_len = body.len(),
+            "tls sniff: ECH detected, inner SNI encrypted"
+        );
         return Err(TlsSniffError::TlsNoSni);
     }
 
