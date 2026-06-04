@@ -1,6 +1,204 @@
-listen = "::"
-listen_port = 10810
-socks5_addr = "127.0.0.1:20808"
-direct_fwmark = 2
+# ==================================================
+# xtp-rs 默认配置文件（所有选项均采用程序默认值）
+# ==================================================
+# 您可以按需修改任意字段。
+
+# -------------------------------
+# 基本选项
+# -------------------------------
+
+# TPROXY 监听地址（TCP/UDP 入口）
+# 默认值："[::]:10810"
+listen = "[::]:10810"
+
+# 是否启用 UDP 转发（TPROXY UDP）
+# 默认值：true
+udp = true
+
+# SOCKS5 认证（用户名/密码需同时提供才启用）
+# 默认值：None（无认证）
+# socks5_user = "your_username"
+# socks5_password = "your_password"
+
+# 出站 socket 的 fwmark，用于策略路由
+# 默认值：2
+fwmark = 2
+
+# MaxMind GeoIP2 Country 数据库路径（空字符串表示禁用国家判定）
+# 默认值：None
 mmdb_path = "/etc/xtp-rs/Country-only-cn-private.mmdb"
-log_level = "info,xtp_rs=debug"
+
+# UDP 会话空闲超时（秒）
+# 默认值：60
+udp_session_timeout_secs = 60
+
+# TCP 转发是否优先使用 splice 零拷贝
+# 默认值：false
+splice = false
+
+# -------------------------------
+# TLS SNI 嗅探（TCP）
+# -------------------------------
+
+# 是否对非直连 TCP 连接进行 TLS ClientHello SNI 嗅探
+# 仅当连接最终准备走 SOCKS5 时使用，直连流量不会嗅探
+sniff_tls_sni = false
+
+# TLS SNI sniff 首次 peek 长度（字节）
+tls_sniff_peek_len = 2048
+
+# TLS SNI sniff 最大探测长度（字节）
+# 实际生效值 = min(tls_sniff_max_len, tcp_peek_buffer_size)
+tls_sniff_max_len = 32768
+
+# TLS SNI sniff 因数据不足时最大重试次数
+tls_sniff_max_retries = 5
+
+# TLS SNI sniff 每次等待更多数据的最大时间（毫秒）
+tls_sniff_wait_more_ms = 100
+
+# TLS SNI sniff 总超时时间（毫秒）
+tls_sniff_timeout_ms = 1000
+
+# -------------------------------
+# HTTP Host 嗅探（TCP）
+# -------------------------------
+
+# 是否对非直连 TCP 连接进行 HTTP/1.x Host 头嗅探
+# 当 TLS SNI 未命中或不适用时作为补充
+sniff_http_host = false
+
+# HTTP Host sniff 首次 peek 长度（字节）
+http_sniff_peek_len = 512
+
+# HTTP Host sniff 最大探测长度（字节）
+# 实际生效值 = min(http_sniff_max_len, tcp_peek_buffer_size)
+http_sniff_max_len = 16384
+
+# HTTP Host sniff 因数据不足时最大重试次数
+http_sniff_max_retries = 5
+
+# HTTP Host sniff 每次等待更多数据的最大时间（毫秒）
+http_sniff_wait_more_ms = 100
+
+# HTTP Host sniff 总超时时间（毫秒）
+http_sniff_timeout_ms = 1000
+
+# -------------------------------
+# QUIC SNI 嗅探（UDP）
+# -------------------------------
+
+# 是否对 UDP/QUIC Initial Packet 进行 TLS ClientHello SNI 嗅探
+# 默认 false，避免在嵌入式平台产生额外 CPU 开销
+# 这是一个总开关：开启后可以解析 QUIC 连接的 SNI 用于分流/日志
+sniff_quic_sni = false
+
+# -------------------------------
+# 全局 peek 缓冲区
+# -------------------------------
+
+# TCP 首包 sniff 全局缓冲区上限（字节）
+# 所有 sniff 的最大读取长度均受此限制
+tcp_peek_buffer_size = 32768
+
+# -------------------------------
+# 日志级别
+# -------------------------------
+
+# 默认：从环境变量 RUST_LOG 读取，若无则 "info"
+# log_level = "info"
+
+# -------------------------------
+# 分流规则
+# -------------------------------
+
+# 直连国家/地区代码（ISO 3166-1 alpha-2）
+# 仅在 mmdb_path 有效时生效
+direct_countries = ["CN"]
+
+# 强制直连 IP/CIDR（优先级低于 force_socks5_ips）
+# 默认值：空列表
+# force_direct_ips = []
+
+# 强制走 SOCKS5 的 IP/CIDR（最高优先级）
+# 默认值：空列表
+# force_socks5_ips = []
+
+# 从外部文件加载额外规则（每行一个 IP/CIDR）
+# force_direct_ips_file = "/path/to/direct.txt"
+# force_socks5_ips_file = "/path/to/proxy.txt"
+
+# 是否将本地/回环/链路本地 IP 强制视为直连
+# 默认值：true
+direct_local_ip = true
+
+# -------------------------------
+# 代理模式
+# -------------------------------
+
+# 可选值：smart / global / bypass
+# 默认值：smart
+proxy_mode = "smart"
+
+# -------------------------------
+# Geosite 分流（可选）
+# -------------------------------
+
+# geosite.dat 数据库文件路径（留空表示不启用）
+# geosite_path = ""
+
+# 走代理的 geosite 分类标签（自动忽略 "geosite:" 前缀）
+# proxy_geosite_tags = []
+
+# 走直连的 geosite 分类标签
+# direct_geosite_tags = []
+
+# -------------------------------
+# 上游动态评分与健康检查
+# -------------------------------
+
+# 禁用上游动态评分（默认 false：启用 TCP_INFO 监控 + 加权随机）
+disable_upstream_score = false
+
+# 上游粘性切换容忍度（单位：分）
+# - 0：不启用粘性，每次 pick 都重新做平方加权随机
+# - >0：仅当新上游分数比当前高超过此值时才允许切换
+upstream_switch_tolerance = 0
+
+# 主动健康检查间隔（秒），0 表示禁用主动探测
+# 默认值：0（依赖 TCP_INFO 聚合和 shadowquic 探针）
+health_check_interval_secs = 0
+
+# 单次健康检查超时（秒）
+health_check_timeout_secs = 5
+
+# 连续失败多少次后判定 upstream 死亡并 penalize
+health_check_fail_threshold = 2
+
+# 健康检查 URL（HTTP HEAD 请求目标）
+health_check_url = "cp.cloudflare.com"
+
+# QUIC 探针在最终选路分数中的权重百分比（0‑100）
+# 默认值：70（即 TCP 权重 30，QUIC 权重 70）
+quic_weight = 70
+
+# ==================================================
+# 上游 SOCKS5 服务器（必须至少配置一个）
+# ==================================================
+
+# 示例（请根据实际修改）：
+# [[upstream]]
+# id = "default-upstream"
+# addr = "127.0.0.1:1080"
+
+# 注意：upstream 列表不能为空，否则程序启动失败！
+
+# ==================================================
+# 端口转发规则（独立规则，强制走 SOCKS5）
+# ==================================================
+
+# [[port_forward]]
+# name = "example-dns"
+# bind = "127.0.0.1:5353"
+# remote = "8.8.8.8:53"
+# network = "both"   # tcp / udp / both

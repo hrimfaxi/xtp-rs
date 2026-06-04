@@ -7,6 +7,26 @@ set -eu
 . "$(dirname "$0")/common.sh"
 
 # -------------------------------------------------------------------------
+# 0. 获取路由器本机 IPv4 地址
+# -------------------------------------------------------------------------
+# 自动收集当前系统上所有非回环、非链路本地的 IPv4 地址，并将其加入
+# local_ip，避免发往路由器本机服务的流量再次进入透明代理路径。
+# -------------------------------------------------------------------------
+LOCAL_IPV4_ENTRIES="$(
+  ip_cmd -4 -o addr show 2>/dev/null \
+    | awk '
+        {
+          split($4, a, "/");
+          ip = a[1];
+          if (ip !~ /^127\./ && ip !~ /^169\.254\./) {
+            print "      " ip ","
+          }
+        }
+      ' \
+    | sort -u
+)"
+
+# -------------------------------------------------------------------------
 # 1. 路由表（必须先于 rule 添加）
 # -------------------------------------------------------------------------
 # TPROXY 要求内核认为目标地址是"本机"，因此需要在独立路由表中声明
@@ -25,7 +45,7 @@ add_ip6_rule "$XTP_FWMARK" "$XTP_TABLE_ID"
 # -------------------------------------------------------------------------
 # 3. nftables 透明代理规则
 # -------------------------------------------------------------------------
-load_nft_table "$XTP_TABLE_NAME" <<'NFTABLES'
+load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 #
 # XTP-RS 透明代理 (TPROXY) 核心原理
 # ==================================
@@ -94,77 +114,96 @@ load_nft_table "$XTP_TABLE_NAME" <<'NFTABLES'
 #
 
 table inet xtp-rs {
-	set reserved_ip {
-		type ipv4_addr;
-		flags interval;
-		elements = {
-			10.0.0.0/8,
-			100.64.0.0/10,
-			127.0.0.0/8,
-			169.254.0.0/16,
-			172.16.0.0/12,
-			192.0.0.0/24,
-			224.0.0.0/4,
-			240.0.0.0/4,
-			47.108.136.105/32, # aliyun
-			8.210.12.134/32, # bird4
-			23.105.213.12/32, # wx
-			144.34.136.17/32, # niyaou
-			107.174.121.146/32, # rack
-			45.77.70.206/32, # vultr
-			23.185.200.253/32, # zgo
-			172.93.188.169/32, # bird2
-			206.237.23.241/32, # dogyun
-			66.112.212.45/32, # niyaou2
-			23.173.216.120/32, # vmshell
-		}
-	}
+  set local_ip {
+    type ipv4_addr;
+    elements = {
+${LOCAL_IPV4_ENTRIES}
+    }
+  }
 
-	set reserved_ip6 {
-		type ipv6_addr;
-		flags interval;
-		elements = {
-			::1,
-			fe80::/10,
-		}
-	}
+  set reserved_ip {
+    type ipv4_addr;
+    flags interval;
+    elements = {
+      # ==============================================================
+      # 1. 私有地址、保留地址、以及需要直连（不经过代理）的特定服务器 IP
+      # ==============================================================
+      10.0.0.0/8,
+      100.64.0.0/10,
+      127.0.0.0/8,
+      169.254.0.0/16,
+      172.16.0.0/12,
+      192.0.0.0/24,
+      224.0.0.0/4,
+      240.0.0.0/4,
+      # ==============================================================
+      # 2. 路由器本机 LAN IP：避免发往本机服务的流量被透明代理再次截获，
+      # 导致 xtp-rs 直连重发后形成环路或请求悬空。
+      # 如路由器 LAN IP 不是 192.168.15.1，请按实际地址修改。
+      # ==============================================================
+      192.168.15.1/32,
+      # ==============================================================
+      # 3. 用户自定义：添加需要强制直连的外部服务器 IP 或 CIDR
+      #    例如：你的上游 SOCKS5 服务器、内网网关、特定 API 服务器等。
+      #    这些 IP 不会走 TPROXY 代理，也无需为它们设置 fwmark=2 绕过。
+      #    注意：一行一个，末尾加逗号。
+      #
+      # 示例：
+      # ==============================================================
+      # 203.0.113.10/32,
+      # 198.51.100.0/24,
+    }
+  }
 
-	chain prerouting {
-		type filter hook prerouting priority filter; policy accept;
-		ip saddr 10.2.1.0/24 return
-		ip daddr @reserved_ip return
-		meta l4proto tcp ip daddr 192.168.0.0/16 return
-		ip daddr 192.168.0.0/16 udp dport != 53 return
-		ip6 daddr @reserved_ip6 return
-		meta l4proto tcp ip6 daddr fd00::/8 return
-		ip6 daddr fd00::/8 udp dport != 53 return
-		meta mark 2 return
-		meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
-		meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
-		meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
-		meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
-	}
+  set reserved_ip6 {
+    type ipv6_addr;
+    flags interval;
+    elements = {
+      ::1/128,                 # Loopback
+      fe80::/10,               # Link-Local
+      fc00::/7,                # Unique Local Unicast (ULA)
+    }
+  }
 
-	chain output {
-		type route hook output priority filter; policy accept;
-		# 如需要使用uid xtp-rs来标记进程的包，解除以下注释
-		# meta skuid xtp-rs counter return
-		ip daddr @reserved_ip return
-		meta l4proto tcp ip daddr 192.168.0.0/16 return
-		ip daddr 192.168.0.0/16 udp dport != 53 return
-		ip6 daddr @reserved_ip6 return
-		meta l4proto tcp ip6 daddr fd00::/8 return
-		ip6 daddr fd00::/8 udp dport != 53 return
-		meta mark 2 counter return
-		meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 accept
-		meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 accept
-	}
+  chain prerouting {
+    type filter hook prerouting priority filter; policy accept;
+    # 可选：根据源 IP 跳过代理（如内网管理段）
+    # ip saddr 10.2.1.0/24 return
+    ip daddr @local_ip return
+    ip daddr @reserved_ip return
+    meta l4proto tcp ip daddr 192.168.0.0/16 return
+    ip daddr 192.168.0.0/16 udp dport != 53 return
+    ip6 daddr @reserved_ip6 return
+    meta l4proto tcp ip6 daddr fd00::/8 return
+    ip6 daddr fd00::/8 udp dport != 53 return
+    meta mark 2 return
+    meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
+    meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
+    meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
+    meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
+  }
 
-	# divert表用于避免已有连接的包二次通过TPROXY，理论上有一定的性能提升
-	# openwrt: 需要kmod-nf-socket和kmod-nft-socket包支持
-	chain divert {
-		type filter hook prerouting priority mangle; policy accept;
-		meta l4proto tcp socket transparent 1 meta mark set 1 accept
-	}
+  chain output {
+    type route hook output priority filter; policy accept;
+    # 如需要使用uid xtp-rs来标记进程的包，解除以下注释
+    # meta skuid xtp-rs counter return
+    ip daddr @local_ip return
+    ip daddr @reserved_ip return
+    meta l4proto tcp ip daddr 192.168.0.0/16 return
+    ip daddr 192.168.0.0/16 udp dport != 53 return
+    ip6 daddr @reserved_ip6 return
+    meta l4proto tcp ip6 daddr fd00::/8 return
+    ip6 daddr fd00::/8 udp dport != 53 return
+    meta mark 2 counter return
+    meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 accept
+    meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 accept
+  }
+
+  # divert表用于避免已有连接的包二次通过TPROXY，理论上有一定的性能提升
+  # openwrt: 需要kmod-nf-socket和kmod-nft-socket包支持
+  chain divert {
+    type filter hook prerouting priority mangle; policy accept;
+    meta l4proto tcp socket transparent 1 meta mark set 1 accept
+  }
 }
 NFTABLES

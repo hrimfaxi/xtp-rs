@@ -12,7 +12,7 @@ use crate::upstream::{Upstream, UpstreamSet};
 )]
 pub struct Cli {
     /// 配置文件路径
-    #[arg(short = 'c', long, default_value = "xtp-rs.toml")]
+    #[arg(short = 'c', long, default_value = "config.toml")]
     pub config: String,
 }
 
