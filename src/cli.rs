@@ -1,9 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use tracing::warn;
 
 use crate::upstream::{Upstream, UpstreamSet};
+use crate::util::parse_ip_or_cidr;
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +54,9 @@ pub struct PortForward {
 pub struct UpstreamConfig {
     pub id: String,
     pub addr: SocketAddr,
+    #[serde(default)]
+    /// 所属分组，未设置则自动属于 ["default"]
+    pub groups: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -397,6 +403,14 @@ pub struct Config {
     #[serde(default)]
     /// 走直连的 geosite 分类，例如 ["geolocation-cn", "private" ]
     pub direct_geosite_tags: Vec<String>,
+
+    #[serde(default)]
+    /// 客户端源 IP → 默认 upstream 分组
+    pub client_routes: HashMap<String, String>,
+
+    #[serde(default)]
+    /// 客户端源 IP → {域名模式 → upstream 分组}
+    pub client_domain_routes: HashMap<String, HashMap<String, String>>,
 }
 
 pub fn default_listen() -> String {
@@ -539,7 +553,13 @@ impl Config {
         let items = self
             .upstream
             .iter()
-            .map(|u| Upstream::new(u.id.trim().to_string(), u.addr))
+            .map(|u| {
+                let groups = u
+                    .groups
+                    .clone()
+                    .unwrap_or_else(|| vec!["default".to_string()]);
+                Upstream::new(u.id.trim().to_string(), u.addr, groups)
+            })
             .collect();
 
         Ok(UpstreamSet::new(
@@ -552,6 +572,68 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.quic_weight > 100 {
             bail!("quic_weight must be in range 0..=100");
+        }
+
+        // 校验 upstream groups 及路由引用
+        {
+            let mut group_count: HashMap<&str, usize> = HashMap::new();
+            for up in &self.upstream {
+                let groups: Vec<&str> = match up.groups.as_deref() {
+                    Some(g) if !g.is_empty() => g.iter().map(|s| s.as_str()).collect(),
+                    _ => vec!["default"],
+                };
+                for g in groups {
+                    *group_count.entry(g).or_default() += 1;
+                }
+            }
+            // 未显式配置 groups 的 upstream 视为属于 default 组
+            let has_default = group_count.contains_key("default");
+            let has_client_routes =
+                !self.client_routes.is_empty() || !self.client_domain_routes.is_empty();
+            if !has_default {
+                if has_client_routes {
+                    warn!(
+                        "no upstream belongs to 'default' group; traffic without matching routes will have no upstream, but client_routes are configured"
+                    );
+                } else {
+                    bail!(
+                        "no upstream in 'default' group and no client routes configured; the proxy would be unusable"
+                    );
+                }
+            }
+
+            // 校验 client_routes 引用的分组存在且非空
+            for (ip_str, group) in &self.client_routes {
+                if parse_ip_or_cidr(ip_str).is_err() {
+                    bail!("invalid IP/CIDR in client_routes: '{}'", ip_str);
+                }
+                let count = group_count.get(group.as_str()).copied().unwrap_or(0);
+                if count == 0 {
+                    bail!(
+                        "client_routes '{}' references group '{}' which has no upstream",
+                        ip_str,
+                        group
+                    );
+                }
+            }
+
+            // 校验 client_domain_routes 引用的分组存在且非空
+            for (ip_str, domain_map) in &self.client_domain_routes {
+                if parse_ip_or_cidr(ip_str).is_err() {
+                    bail!("invalid IP/CIDR in client_domain_routes: '{}'", ip_str);
+                }
+                for (domain, group) in domain_map {
+                    let count = group_count.get(group.as_str()).copied().unwrap_or(0);
+                    if count == 0 {
+                        bail!(
+                            "client_domain_routes '{}' domain '{}' references group '{}' which has no upstream",
+                            ip_str,
+                            domain,
+                            group
+                        );
+                    }
+                }
+            }
         }
 
         let (listen_ip, listen_port) =
@@ -626,6 +708,7 @@ mod tests {
             upstream: vec![UpstreamConfig {
                 id: "u1".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
+                groups: None,
             }],
             disable_upstream_score: false,
             upstream_switch_tolerance: 0,
@@ -638,6 +721,8 @@ mod tests {
             geosite_path: None,
             proxy_geosite_tags: vec![],
             direct_geosite_tags: vec![],
+            client_routes: HashMap::new(),
+            client_domain_routes: HashMap::new(),
         }
     }
 
@@ -660,6 +745,7 @@ mod tests {
             upstream: vec![UpstreamConfig {
                 id: "x".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
+                groups: None,
             }],
             ..minimal_config()
         };
@@ -682,10 +768,12 @@ mod tests {
                 UpstreamConfig {
                     id: "dup".into(),
                     addr: "127.0.0.1:1".parse().unwrap(),
+                    groups: None,
                 },
                 UpstreamConfig {
                     id: "dup".into(),
                     addr: "127.0.0.1:2".parse().unwrap(),
+                    groups: None,
                 },
             ],
             ..minimal_config()
@@ -726,6 +814,7 @@ mod tests {
             upstream: vec![UpstreamConfig {
                 id: "   ".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
+                groups: None,
             }],
             ..minimal_config()
         };

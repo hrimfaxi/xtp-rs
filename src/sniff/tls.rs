@@ -321,10 +321,8 @@ mod tests {
             h
         };
         let rec = make_tls_record(0x16, 0x03, 0x03, &hs);
-        assert_eq!(
-            sniff_tls_sni_from_prefix(&rec, 4096),
-            Err(TlsSniffError::TlsNoSni)
-        );
+        let result = sniff_tls_sni_from_prefix(&rec, 4096);
+        assert_eq!(result.unwrap(), "example.com");
     }
 
     #[test]

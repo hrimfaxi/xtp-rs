@@ -4,6 +4,7 @@ mod session;
 mod tproxy;
 
 use anyhow::{Context, Result, anyhow};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +29,7 @@ use crate::udp::tproxy::TProxyUdpSocket;
 use crate::util::{hex_encode, is_anyhow_emsgsize, is_io_emsgsize, new_aligned_udp_buf, now_secs};
 
 pub struct UdpRuntime {
-    sessions: Mutex<std::collections::HashMap<UdpSessionKey, UdpSessionEntry>>,
+    sessions: Mutex<HashMap<UdpSessionKey, UdpSessionEntry>>,
     fake_udp: FakeUdpManager,
     timeout: Duration,
     closed: AtomicBool,
@@ -37,7 +38,7 @@ pub struct UdpRuntime {
 impl UdpRuntime {
     pub fn new(timeout: Duration) -> Self {
         Self {
-            sessions: Mutex::new(std::collections::HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
             fake_udp: FakeUdpManager::new(),
             timeout,
             closed: AtomicBool::new(false),
@@ -365,7 +366,18 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
                 let socket = create_direct_udp_socket(key.target_addr, state.config.fwmark)?;
                 UdpOutbound::Direct { socket }
             } else {
-                let up = state.upstreams.pick();
+                let group = state
+                    .runtime
+                    .client_routes
+                    .lookup(key.client_addr.ip())
+                    .map_or("default", |s| s.as_str());
+                let up = state
+                    .upstreams
+                    .pick_from_group(group)
+                    .or_else(|| state.upstreams.pick())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no upstream available for group '{}'", group)
+                    })?;
                 debug!(
                     "selected upstream {} at {} (score={:.0}) for UDP {:?}",
                     up.id,
@@ -384,7 +396,16 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
             }
         }
         UdpRoutingMode::ForceSocks5 => {
-            let up = state.upstreams.pick();
+            let group = state
+                .runtime
+                .client_routes
+                .lookup(key.client_addr.ip())
+                .map_or("default", |s| s.as_str());
+            let up = state
+                .upstreams
+                .pick_from_group(group)
+                .or_else(|| state.upstreams.pick())
+                .ok_or_else(|| anyhow::anyhow!("no upstream available for group '{}'", group))?;
             debug!(
                 "selected upstream {} at {} (score={:.0}) for UDP {:?}",
                 up.id,
@@ -645,8 +666,7 @@ pub async fn run_udp_loop(
     let tproxy_udp = TProxyUdpSocket::new(tproxy_udp);
     let mut buf = new_aligned_udp_buf();
 
-    let mut pending_sniff: std::collections::HashMap<UdpSessionKey, PendingUdpSniff> =
-        std::collections::HashMap::new();
+    let mut pending_sniff: HashMap<UdpSessionKey, PendingUdpSniff> = HashMap::new();
     let mut last_pending_reap_secs = now_secs();
 
     loop {
@@ -707,8 +727,7 @@ pub async fn run_udp_port_forward(
     );
 
     let mut buf = new_aligned_udp_buf();
-    let mut pending_sniff: std::collections::HashMap<UdpSessionKey, PendingUdpSniff> =
-        std::collections::HashMap::new();
+    let mut pending_sniff: HashMap<UdpSessionKey, PendingUdpSniff> = HashMap::new();
     let mut last_pending_reap_secs = now_secs();
 
     loop {

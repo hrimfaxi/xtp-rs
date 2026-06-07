@@ -1,7 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iptrie::{IpPrefix, Ipv4RTrieSet, Ipv6RTrieSet};
 use maxminddb::Reader;
 use maxminddb::geoip2::Country;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -24,15 +26,99 @@ use crate::socket_factory::{
 use crate::tcp::{run_tcp_port_forward, tcp_accept_loop};
 use crate::udp::{UdpRuntime, run_udp_gc_loop, run_udp_loop, run_udp_port_forward};
 use crate::upstream::{UpstreamSet, run_health_check_task};
-use crate::util::{TaskGuard, build_ip_tries, parse_ip_net_list, warn_if_splice_with_forwarding};
+use crate::util::{
+    TaskGuard, build_ip_tries, canonical_domain, domain_matches_suffix, parse_ip_net_list,
+    parse_ip_or_cidr, warn_if_splice_with_forwarding,
+};
+
+#[derive(Debug, Clone)]
+pub struct DomainRouteTable {
+    exact: HashMap<String, String>,
+    suffixes: Vec<(String, String)>,
+}
+
+impl DomainRouteTable {
+    pub fn lookup(&self, domain: &str) -> Option<&str> {
+        let domain = canonical_domain(domain);
+        if let Some(group) = self.exact.get(&domain) {
+            return Some(group);
+        }
+        for (suffix, group) in &self.suffixes {
+            if domain_matches_suffix(&domain, suffix) {
+                return Some(group);
+            }
+        }
+        None
+    }
+}
+
+/// 基于 CIDR 最长前缀匹配的客户端路由表。
+#[derive(Debug, Clone)]
+pub struct ClientCidrRoutes<T: Clone> {
+    v4: Vec<(Ipv4Net, T)>,
+    v6: Vec<(Ipv6Net, T)>,
+}
+
+impl<T: Clone> Default for ClientCidrRoutes<T> {
+    fn default() -> Self {
+        Self {
+            v4: Vec::new(),
+            v6: Vec::new(),
+        }
+    }
+}
+
+impl<T: Clone> ClientCidrRoutes<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, net: IpNet, value: T) {
+        match net {
+            IpNet::V4(v4) => self.v4.push((v4, value)),
+            IpNet::V6(v6) => self.v6.push((v6, value)),
+        }
+    }
+
+    /// 按前缀长度从大到小排序，保证 lookup 时优先命中更具体的网段。
+    pub fn finalize(&mut self) {
+        self.v4
+            .sort_by_key(|(net, _)| std::cmp::Reverse(net.prefix_len()));
+        self.v6
+            .sort_by_key(|(net, _)| std::cmp::Reverse(net.prefix_len()));
+    }
+
+    pub fn lookup(&self, ip: IpAddr) -> Option<&T> {
+        match ip {
+            IpAddr::V4(ip) => self
+                .v4
+                .iter()
+                .find(|(net, _)| net.contains(&ip))
+                .map(|(_, v)| v),
+            IpAddr::V6(ip) => self
+                .v6
+                .iter()
+                .find(|(net, _)| net.contains(&ip))
+                .map(|(_, v)| v),
+        }
+    }
+}
+
+/// 客户端 IP 路由表：基于 CIDR 最长前缀匹配，映射到 upstream 分组名。
+pub type ClientIpRoutes = ClientCidrRoutes<String>;
+
+/// 客户端域名路由表：基于 CIDR 最长前缀匹配，映射到域名路由表。
+pub type ClientDomainRoutes = ClientCidrRoutes<DomainRouteTable>;
 
 pub struct AppRuntime {
     pub proxy_mode: AtomicU8,
     pub udp: Arc<UdpRuntime>,
+    pub client_routes: ClientIpRoutes,
+    pub client_domain_routes: ClientDomainRoutes,
 }
 
 #[cfg(feature = "geosite")]
-type GeositeIndex = std::collections::HashMap<String, Vec<geosite_rs::Domain>>;
+type GeositeIndex = HashMap<String, Vec<geosite_rs::Domain>>;
 
 pub struct AppState {
     pub mmdb: Option<Arc<Reader<Vec<u8>>>>,
@@ -63,51 +149,6 @@ fn ipv4_trie_contains(trie: &Ipv4RTrieSet, ip: &Ipv4Addr) -> bool {
 
 fn ipv6_trie_contains(trie: &Ipv6RTrieSet, ip: &Ipv6Addr) -> bool {
     trie.lookup(ip).len() != 0
-}
-
-#[cfg(feature = "geosite")]
-fn canonical_domain(domain: &str) -> String {
-    domain
-        .trim_start_matches('.')
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-}
-
-/// 域名后缀匹配。
-///
-/// 匹配：
-/// - `example.com` == `example.com`
-/// - `www.example.com` ends with `.example.com`
-///
-/// 不匹配：
-/// - `badexample.com` 不应匹配 `example.com`
-#[cfg(feature = "geosite")]
-fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
-    let d_norm = canonical_domain(domain);
-    let s_norm = canonical_domain(suffix);
-
-    let d_len = d_norm.len();
-    let s_len = s_norm.len();
-
-    // 2. 长度边界短路
-    if d_len < s_len {
-        return false;
-    }
-
-    // 3. 规范化后完全相等 (例如 domain: "google.com", suffix: "google.com")
-    if d_len == s_len {
-        return d_norm == s_norm;
-    }
-
-    // 4. 处理子域名后缀匹配 (例如 domain: "www.google.com", suffix: "google.com")
-    if d_norm.ends_with(&s_norm) {
-        let prev_char_idx = d_len - s_len - 1;
-        if let Some(c) = d_norm.as_bytes().get(prev_char_idx) {
-            return *c == b'.';
-        }
-    }
-
-    false
 }
 
 #[cfg(feature = "geosite")]
@@ -460,6 +501,57 @@ impl AppState {
             );
         }
 
+        let client_routes = {
+            let mut routes = ClientIpRoutes::new();
+            for (ip_str, group) in &config.client_routes {
+                let net = parse_ip_or_cidr(ip_str)
+                    .with_context(|| format!("invalid client_routes ip/cidr '{}'", ip_str))?;
+                routes.insert(net, group.clone());
+            }
+            routes.finalize();
+            routes
+        };
+
+        let client_domain_routes = {
+            let mut routes = ClientDomainRoutes::new();
+            for (ip_str, domain_map) in &config.client_domain_routes {
+                let net = parse_ip_or_cidr(ip_str).with_context(|| {
+                    format!("invalid client_domain_routes ip/cidr '{}'", ip_str)
+                })?;
+
+                let mut exact = HashMap::new();
+                let mut suffixes = Vec::new();
+                for (domain_key, group) in domain_map {
+                    if domain_key.starts_with('.') {
+                        let suffix_norm = canonical_domain(&domain_key[1..]);
+                        if suffix_norm.is_empty() {
+                            bail!(
+                                "empty suffix domain pattern '{}' in client_domain_routes for IP '{}'",
+                                domain_key,
+                                ip_str
+                            );
+                        }
+                        suffixes.push((suffix_norm, group.clone()));
+                    } else {
+                        let exact_norm = canonical_domain(domain_key);
+                        if exact_norm.is_empty() {
+                            bail!(
+                                "empty exact domain pattern '{}' in client_domain_routes for IP '{}'",
+                                domain_key,
+                                ip_str
+                            );
+                        }
+                        exact.insert(exact_norm, group.clone());
+                    }
+                }
+                // 按后缀长度降序，保证最长匹配优先
+                suffixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                routes.insert(net, DomainRouteTable { exact, suffixes });
+            }
+            routes.finalize();
+            routes
+        };
+
         Ok(AppState {
             mmdb,
             config,
@@ -481,6 +573,8 @@ impl AppState {
             runtime: Arc::new(AppRuntime {
                 proxy_mode: AtomicU8::new(proxy_mode),
                 udp: udp_runtime,
+                client_routes,
+                client_domain_routes,
             }),
             #[cfg(feature = "geosite")]
             geosite,
@@ -778,7 +872,11 @@ mod tests {
 
     // Helper to create a minimal AppState for should_direct tests
     fn minimal_app_state() -> AppState {
-        let upstream = Upstream::new("test", "127.0.0.1:1080".parse().unwrap());
+        let upstream = Upstream::new(
+            "test",
+            "127.0.0.1:1080".parse().unwrap(),
+            vec!["default".to_string()],
+        );
         let upstreams = UpstreamSet::new(vec![upstream], 0, 70);
         let udp_runtime = Arc::new(UdpRuntime::new(Duration::from_secs(60)));
         AppState {
@@ -805,6 +903,8 @@ mod tests {
             runtime: Arc::new(AppRuntime {
                 proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
                 udp: udp_runtime,
+                client_routes: ClientIpRoutes::new(),
+                client_domain_routes: ClientDomainRoutes::new(),
             }),
             #[cfg(feature = "geosite")]
             geosite: None,
@@ -846,6 +946,7 @@ mod tests {
             upstream: vec![UpstreamConfig {
                 id: "test".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
+                groups: None,
             }],
             disable_upstream_score: false,
             upstream_switch_tolerance: 0,
@@ -858,6 +959,8 @@ mod tests {
             geosite_path: None,
             direct_geosite_tags: vec![],
             proxy_geosite_tags: vec![],
+            client_routes: HashMap::new(),
+            client_domain_routes: HashMap::new(),
         }
     }
 
@@ -912,157 +1015,256 @@ mod tests {
         assert!(!state.should_direct(IpAddr::V4(Ipv4Addr::LOCALHOST), None));
     }
 
-    #[cfg(feature = "geosite")]
-    mod geosite_tests {
-        use super::*;
+    #[test]
+    fn client_ip_routes_exact_ip_match() {
+        let mut routes = ClientIpRoutes::new();
+        routes.insert("192.168.1.10/32".parse::<IpNet>().unwrap(), "a".to_string());
+        routes.finalize();
 
-        #[test]
-        fn test_domain_matches_suffix() {
-            // 1. 完全相等的情况
-            assert!(domain_matches_suffix("google.com", "google.com"));
-            assert!(
-                domain_matches_suffix("Google.Com", "google.com"),
-                "应该忽略大小写"
-            );
+        assert_eq!(
+            routes.lookup("192.168.1.10".parse::<IpAddr>().unwrap()),
+            Some(&"a".to_string())
+        );
+        assert_eq!(
+            routes.lookup("192.168.1.11".parse::<IpAddr>().unwrap()),
+            None
+        );
+    }
 
-            // 2. 标准子域名匹配
-            assert!(domain_matches_suffix("www.google.com", "google.com"));
-            assert!(domain_matches_suffix("mail.www.google.com", "google.com"));
-            assert!(domain_matches_suffix("a.b.c.d.google.com", "google.com"));
+    #[test]
+    fn client_ip_routes_cidr_match() {
+        let mut routes = ClientIpRoutes::new();
+        routes.insert(
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+            "lan".to_string(),
+        );
+        routes.finalize();
 
-            // 3. 相似但【不应该】匹配的情况（经典边界漏洞）
-            assert!(
-                !domain_matches_suffix("notgoogle.com", "google.com"),
-                "防止字符串部分包含的伪匹配"
-            );
-            assert!(!domain_matches_suffix("fakegoogle.com", "google.com"));
-            assert!(
-                !domain_matches_suffix("google.com.cn", "google.com"),
-                "后缀不同不应匹配"
-            );
-            assert!(
-                !domain_matches_suffix("com", "google.com"),
-                "长度不够不应匹配"
-            );
+        assert_eq!(
+            routes.lookup("192.168.1.55".parse::<IpAddr>().unwrap()),
+            Some(&"lan".to_string())
+        );
+        assert_eq!(
+            routes.lookup("192.168.2.1".parse::<IpAddr>().unwrap()),
+            None
+        );
+    }
 
-            // 4. 各种恶心的 FQDN 尾部点（Trailing Dot）情况
-            // 因为入口进来了 canonical_domain，所以这些行为必须表现一致且安全
-            assert!(domain_matches_suffix("google.com.", "google.com"));
-            assert!(domain_matches_suffix("google.com", "google.com."));
-            assert!(domain_matches_suffix("google.com.", "google.com."));
-            assert!(domain_matches_suffix("www.google.com.", "google.com"));
-            assert!(domain_matches_suffix("www.google.com", "google.com."));
-            assert!(domain_matches_suffix("www.google.com.", "google.com."));
+    #[test]
+    fn client_ip_routes_longest_prefix_match() {
+        let mut routes = ClientIpRoutes::new();
+        routes.insert(
+            "192.168.0.0/16".parse::<IpNet>().unwrap(),
+            "broad".to_string(),
+        );
+        routes.insert(
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+            "narrow".to_string(),
+        );
+        routes.finalize();
 
-            // 5. 空字符或非法边界防御
-            assert!(!domain_matches_suffix("", "google.com"));
-            assert!(!domain_matches_suffix("google.com", ""));
-            assert!(domain_matches_suffix("", ""));
-        }
+        assert_eq!(
+            routes.lookup("192.168.1.42".parse::<IpAddr>().unwrap()),
+            Some(&"narrow".to_string())
+        );
+        assert_eq!(
+            routes.lookup("192.168.2.42".parse::<IpAddr>().unwrap()),
+            Some(&"broad".to_string())
+        );
+    }
 
-        // ========== canonical_domain ==========
+    #[test]
+    fn client_ip_routes_ipv6_match() {
+        let mut routes = ClientIpRoutes::new();
+        routes.insert("2001:db8::/32".parse::<IpNet>().unwrap(), "v6".to_string());
+        routes.finalize();
 
-        #[test]
-        fn test_canonical_domain_lowercase() {
-            assert_eq!(canonical_domain("Example.COM"), "example.com");
-        }
+        assert_eq!(
+            routes.lookup("2001:db8::1".parse::<IpAddr>().unwrap()),
+            Some(&"v6".to_string())
+        );
+        assert_eq!(
+            routes.lookup("2001:dead::1".parse::<IpAddr>().unwrap()),
+            None
+        );
+    }
 
-        #[test]
-        fn test_canonical_domain_leading_dot() {
-            assert_eq!(canonical_domain(".example.com"), "example.com");
-        }
+    #[test]
+    fn client_domain_routes_exact_ip_match() {
+        let mut routes = ClientDomainRoutes::new();
+        let mut exact = HashMap::new();
+        exact.insert("example.com".to_string(), "group_a".to_string());
+        routes.insert(
+            "192.168.1.10/32".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact,
+                suffixes: vec![],
+            },
+        );
+        routes.finalize();
 
-        #[test]
-        fn test_canonical_domain_trailing_dot() {
-            assert_eq!(canonical_domain("example.com."), "example.com");
-        }
+        assert_eq!(
+            routes
+                .lookup("192.168.1.10".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("example.com")),
+            Some("group_a")
+        );
+        assert_eq!(
+            routes
+                .lookup("192.168.1.11".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("example.com")),
+            None
+        );
+    }
 
-        #[test]
-        fn test_canonical_domain_both_dots_and_case() {
-            assert_eq!(canonical_domain(".Example.COM."), "example.com");
-        }
+    #[test]
+    fn client_domain_routes_cidr_suffix_match() {
+        let mut routes = ClientDomainRoutes::new();
+        let suffixes = vec![("google.com".to_string(), "group_b".to_string())];
+        routes.insert(
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact: HashMap::new(),
+                suffixes,
+            },
+        );
+        routes.finalize();
 
-        #[test]
-        fn test_canonical_domain_empty() {
-            assert_eq!(canonical_domain(""), "");
-        }
+        assert_eq!(
+            routes
+                .lookup("192.168.1.55".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("www.google.com")),
+            Some("group_b")
+        );
+        assert_eq!(
+            routes
+                .lookup("192.168.2.1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("www.google.com")),
+            None
+        );
+    }
 
-        #[test]
-        fn test_canonical_domain_only_dot() {
-            assert_eq!(canonical_domain("."), "");
-        }
+    #[test]
+    fn client_domain_routes_longest_prefix_match() {
+        let mut routes = ClientDomainRoutes::new();
+        let mut exact1 = HashMap::new();
+        exact1.insert("youtube.com".to_string(), "broad".to_string());
+        routes.insert(
+            "192.168.0.0/16".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact: exact1,
+                suffixes: vec![],
+            },
+        );
 
-        // ========== domain_matches_suffix ==========
+        let mut exact2 = HashMap::new();
+        exact2.insert("youtube.com".to_string(), "narrow".to_string());
+        routes.insert(
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact: exact2,
+                suffixes: vec![],
+            },
+        );
+        routes.finalize();
 
-        #[test]
-        fn test_domain_matches_suffix_exact() {
-            assert!(domain_matches_suffix("google.com", "google.com"));
-        }
+        assert_eq!(
+            routes
+                .lookup("192.168.1.42".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("youtube.com")),
+            Some("narrow")
+        );
+        assert_eq!(
+            routes
+                .lookup("192.168.2.42".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("youtube.com")),
+            Some("broad")
+        );
+    }
 
-        #[test]
-        fn test_domain_matches_suffix_case_insensitive() {
-            assert!(domain_matches_suffix("Google.Com", "google.com"));
-        }
+    #[test]
+    fn client_domain_routes_canonicalization() {
+        let mut routes = ClientDomainRoutes::new();
+        let mut exact = HashMap::new();
+        exact.insert("example.com".to_string(), "group_x".to_string());
+        routes.insert(
+            "10.0.0.0/8".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact,
+                suffixes: vec![],
+            },
+        );
+        routes.finalize();
 
-        #[test]
-        fn test_domain_matches_suffix_single_subdomain() {
-            assert!(domain_matches_suffix("www.google.com", "google.com"));
-        }
+        assert_eq!(
+            routes
+                .lookup("10.0.0.1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("Example.COM")),
+            Some("group_x")
+        );
+        assert_eq!(
+            routes
+                .lookup("10.0.0.1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("EXAMPLE.COM.")),
+            Some("group_x")
+        );
+    }
 
-        #[test]
-        fn test_domain_matches_suffix_deep_subdomain() {
-            assert!(domain_matches_suffix("a.b.c.google.com", "google.com"));
-        }
+    #[test]
+    fn client_domain_routes_suffix_priority() {
+        let mut routes = ClientDomainRoutes::new();
+        let suffixes = vec![
+            ("google.com".to_string(), "g1".to_string()),
+            ("com".to_string(), "g2".to_string()),
+        ];
+        routes.insert(
+            "10.0.0.0/8".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact: HashMap::new(),
+                suffixes,
+            },
+        );
+        routes.finalize();
 
-        #[test]
-        fn test_domain_matches_suffix_not_a_subdomain_1() {
-            assert!(!domain_matches_suffix("notgoogle.com", "google.com"));
-        }
+        assert_eq!(
+            routes
+                .lookup("10.0.0.1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("www.google.com")),
+            Some("g1")
+        );
+        assert_eq!(
+            routes
+                .lookup("10.0.0.1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("example.com")),
+            Some("g2")
+        );
+    }
 
-        #[test]
-        fn test_domain_matches_suffix_not_a_subdomain_2() {
-            assert!(!domain_matches_suffix("fakegoogle.com", "google.com"));
-        }
+    #[test]
+    fn client_domain_routes_ipv6_match() {
+        let mut routes = ClientDomainRoutes::new();
+        let mut exact = HashMap::new();
+        exact.insert("test.com".to_string(), "v6".to_string());
+        routes.insert(
+            "2001:db8::/32".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact,
+                suffixes: vec![],
+            },
+        );
+        routes.finalize();
 
-        #[test]
-        fn test_domain_matches_suffix_longer_tld() {
-            assert!(!domain_matches_suffix("google.com.cn", "google.com"));
-        }
-
-        #[test]
-        fn test_domain_matches_suffix_shorter_domain() {
-            assert!(!domain_matches_suffix("com", "google.com"));
-        }
-
-        #[test]
-        fn test_domain_matches_suffix_trailing_dot_domain() {
-            assert!(domain_matches_suffix("google.com.", "google.com"));
-        }
-
-        #[test]
-        fn test_domain_matches_suffix_trailing_dot_suffix() {
-            assert!(domain_matches_suffix("google.com", "google.com."));
-        }
-
-        #[test]
-        fn test_domain_matches_suffix_both_trailing_dots() {
-            assert!(domain_matches_suffix("www.google.com.", "google.com."));
-        }
-
-        #[test]
-        fn test_domain_matches_suffix_empty_domain() {
-            assert!(!domain_matches_suffix("", "google.com"));
-        }
-
-        #[test]
-        fn test_domain_matches_suffix_empty_suffix() {
-            assert!(!domain_matches_suffix("google.com", ""));
-        }
-
-        #[test]
-        fn test_domain_matches_suffix_both_empty() {
-            // 与当前实现保持一致：空字符串视为相等
-            assert!(domain_matches_suffix("", ""));
-        }
+        assert_eq!(
+            routes
+                .lookup("2001:db8::1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("test.com")),
+            Some("v6")
+        );
+        assert_eq!(
+            routes
+                .lookup("2001:dead::1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("test.com")),
+            None
+        );
     }
 }

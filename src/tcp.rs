@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -7,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 #[allow(unused_imports)]
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::sniff::{SniffConfig, sniff_domain};
 use crate::socks5::{Socks5Target, socks5_connect};
@@ -22,43 +23,54 @@ pub enum TcpUpstreamTarget {
     Socks5Domain { host: String, port: u16 },
 }
 
-/// 尝试连 SOCKS5，失败时惩罚当前 upstream 并自动换一个
-async fn try_connect_socks5(
+/// 在指定分组内尝试连接 SOCKS5，失败自动在同组内换 upstream，全组失败后 fallback 到 default 分组
+async fn try_connect_socks5_group(
     target: &TcpUpstreamTarget,
     state: &Arc<AppState>,
+    mut group: &str,
 ) -> Result<(TcpStream, Arc<Upstream>)> {
-    let up = state.upstreams.pick();
-    match connect_tcp_upstream(
-        target,
-        up.addr,
-        state.config.fwmark,
-        state.socks5_credentials(),
-    )
-    .await
-    {
-        Ok(s) => Ok((s, up)),
-        Err(e) => {
-            // 第一个 upstream 建连失败，惩罚它
-            if !state.config.disable_upstream_score {
-                up.penalize();
-            }
+    let mut failed: HashSet<String> = HashSet::new();
 
-            // 排除被惩罚的这个，选另一个
-            match state.upstreams.pick_excluding(&up.id) {
-                Some(up2) => {
-                    match connect_tcp_upstream(
-                        target,
-                        up2.addr,
-                        state.config.fwmark,
-                        state.socks5_credentials(),
-                    )
-                    .await
-                    {
-                        Ok(s) => Ok((s, up2)),
-                        Err(e2) => Err(e2), // 第二个也失败，不再惩罚
-                    }
+    loop {
+        let up = if failed.is_empty() {
+            state.upstreams.pick_from_group(group)
+        } else {
+            state
+                .upstreams
+                .pick_excluding_many_from_group(group, &failed)
+        };
+
+        let up = match up {
+            Some(u) => u,
+            None => {
+                if group == "default" {
+                    bail!("all upstreams in default group failed");
+                } else {
+                    warn!(
+                        "all upstreams in group '{}' failed, fallback to default",
+                        group
+                    );
+                    group = "default";
+                    failed.clear();
+                    continue;
                 }
-                None => Err(e), // 没别的可选了
+            }
+        };
+
+        match connect_tcp_upstream(
+            target,
+            up.addr,
+            state.config.fwmark,
+            state.socks5_credentials(),
+        )
+        .await
+        {
+            Ok(s) => return Ok((s, up)),
+            Err(_) => {
+                if !state.config.disable_upstream_score {
+                    up.penalize();
+                }
+                failed.insert(up.id.clone());
             }
         }
     }
@@ -142,6 +154,7 @@ pub async fn direct_connect(orig_dst: SocketAddr, fwmark: u32) -> Result<TcpStre
 
 pub async fn handle_tcp_connection(
     mut client: TcpStream,
+    client_addr: SocketAddr,
     orig_dst: SocketAddr,
     state: Arc<AppState>,
 ) -> Result<()> {
@@ -166,7 +179,28 @@ pub async fn handle_tcp_connection(
             (s, None)
         }
         _ => {
-            let (s, up) = try_connect_socks5(&target, &state).await?;
+            let group = if let Some(ref domain_str) = domain {
+                state
+                    .runtime
+                    .client_domain_routes
+                    .lookup(client_addr.ip())
+                    .and_then(|t| t.lookup(domain_str))
+                    .or_else(|| {
+                        state
+                            .runtime
+                            .client_routes
+                            .lookup(client_addr.ip())
+                            .map(|s| s.as_str())
+                    })
+                    .unwrap_or("default")
+            } else {
+                state
+                    .runtime
+                    .client_routes
+                    .lookup(client_addr.ip())
+                    .map_or("default", |s| s.as_str())
+            };
+            let (s, up) = try_connect_socks5_group(&target, &state, group).await?;
             debug!(
                 "selected upstream {} at {} (score={:.0}) for {}",
                 up.id,
@@ -264,7 +298,7 @@ pub async fn run_tcp_port_forward(
                             info!("port-forward TCP: {} -> {} via SOCKS5", peer_addr, remote);
 
                             let target = TcpUpstreamTarget::Socks5Ip(remote);
-                            let (mut upstream, up) = match try_connect_socks5(&target, &state).await {
+                            let (mut upstream, up) = match try_connect_socks5_group(&target, &state, "default").await {
                                 Ok((s, up)) => {
                                     debug!(
                                         "selected upstream {} at {} (score={:.0}) for port-forward {}",
@@ -348,7 +382,7 @@ pub async fn tcp_accept_loop(
                                     };
 
                                     info!("TCP connection: {} -> {}", peer_addr, orig_dst);
-                                    if let Err(e) = handle_tcp_connection(stream, orig_dst, state).await {
+                                    if let Err(e) = handle_tcp_connection(stream, peer_addr, orig_dst, state).await {
                                         error!("tcp {} handling error: {:#}", peer_addr, e);
                                     }
                                 } => {}

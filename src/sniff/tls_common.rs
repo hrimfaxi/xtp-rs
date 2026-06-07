@@ -140,20 +140,21 @@ pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffE
         return Err(TlsSniffError::ParseError);
     }
 
-    // 扫描完所有扩展后统一决定：
-    // 如果有 ECH，按无目标处理（无法解密 inner SNI）
+    // 只要有明文 SNI，就直接使用（即使同时有 ECH，也认为是 GREASE 填充）
+    if let Some(host) = found_sni {
+        return Ok(host);
+    }
+
+    // 无明文 SNI 但检测到 ECH 扩展 → 域名被加密
     if saw_ech {
         trace!(
             body_len = body.len(),
-            "tls sniff: ECH detected, inner SNI encrypted"
+            "tls sniff: ECH detected without outer SNI, inner SNI encrypted"
         );
         return Err(TlsSniffError::TlsNoSni);
     }
 
-    match found_sni {
-        Some(host) => Ok(host),
-        None => Err(TlsSniffError::TlsNoSni),
-    }
+    Err(TlsSniffError::TlsNoSni)
 }
 
 #[cfg(test)]
@@ -249,8 +250,15 @@ pub mod tests {
     }
 
     #[test]
-    fn ech_returns_no_sni_even_with_outer_sni() {
+    fn ech_with_outer_sni_returns_outer_sni() {
         let body = client_hello_body(Some("example.com"), true);
+        let host = parse_sni_from_client_hello_body(&body).unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn ech_without_outer_sni_returns_no_sni() {
+        let body = client_hello_body(None, true);
         assert_eq!(
             parse_sni_from_client_hello_body(&body),
             Err(TlsSniffError::TlsNoSni)

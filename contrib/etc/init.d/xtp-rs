@@ -25,7 +25,6 @@ start_service() {
     procd_add_jail_mount_rw /tmp
   fi
 
-  procd_set_param env xtp-rs_LOCATION_ASSET="/usr/local/xtp-rs"
   procd_set_param limits nofile="1024768 1024768"
   procd_set_param command /usr/bin/xtp-rs -c /etc/xtp-rs/config.toml
   procd_set_param respawn 3600 5 0 # 设置自动重启
@@ -57,11 +56,15 @@ stop_service() {
   fi
 
   # 2. 停止主进程
-  service_stop /usr/bin/xtp-rs
+  procd_kill xtp-rs
 }
 
 reload_service() {
-  procd_send_signal xtp-rs -HUP
+  procd_send_signal xtp-rs '*' HUP
+}
+
+service_triggers() {
+  procd_add_reload_trigger xtp-rs
 }
 
 # vim: set sw=2 ts=2 et:

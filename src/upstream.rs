@@ -1,5 +1,7 @@
 use arc_swap::ArcSwap;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use crate::util::{get_tcp_info_ext_raw, now_secs};
 pub struct Upstream {
     pub id: String,
     pub addr: SocketAddr,
+    pub groups: Vec<String>,
 
     registry: Mutex<Vec<(Weak<()>, std::os::fd::RawFd)>>,
 
@@ -38,11 +41,12 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn new(id: impl Into<String>, addr: SocketAddr) -> Arc<Self> {
+    pub fn new(id: impl Into<String>, addr: SocketAddr, groups: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             id: id.into(),
             registry: Mutex::new(Vec::new()),
             addr,
+            groups,
             tcp_score: AtomicU32::new(500),
             quic_uplink_score: AtomicU32::new(500),
             quic_downlink_score: AtomicU32::new(500),
@@ -212,64 +216,62 @@ impl Upstream {
 }
 
 pub struct UpstreamSet {
-    items: Vec<Arc<Upstream>>,
-    single: Option<Arc<Upstream>>,
-    current: Mutex<Option<String>>,
+    groups: HashMap<String, Vec<Arc<Upstream>>>,
+    all_items: Vec<Arc<Upstream>>,
+    current: Mutex<HashMap<String, Option<String>>>,
     tolerance: u32,
 }
 
 impl UpstreamSet {
     pub fn new(items: Vec<Arc<Upstream>>, tolerance: u32, quic_weight: u32) -> Self {
         assert!(!items.is_empty());
-        let single = if items.len() == 1 {
-            Some(Arc::clone(&items[0]))
-        } else {
-            None
-        };
+
+        let mut groups: HashMap<String, Vec<Arc<Upstream>>> = HashMap::new();
+        for up in &items {
+            for group in &up.groups {
+                groups
+                    .entry(group.clone())
+                    .or_default()
+                    .push(Arc::clone(up));
+            }
+        }
 
         for up in &items {
             up.set_quic_weight(quic_weight);
         }
 
         Self {
-            items,
-            single,
-            current: Mutex::new(None),
+            groups,
+            all_items: items,
+            current: Mutex::new(HashMap::new()),
             tolerance,
         }
     }
 
-    pub fn pick(&self) -> Arc<Upstream> {
-        if let Some(ref up) = self.single {
-            debug!("pick: single upstream={}, score={}", up.id, up.score());
-            return Arc::clone(up);
-        }
-
-        // 没有排除规则，直接对全量 items 做平方加权随机
-        self.pick_weighted(&self.items, None)
-            .expect("UpstreamSet::items is non-empty by construction")
+    pub fn pick(&self) -> Option<Arc<Upstream>> {
+        self.pick_from_group("default")
     }
 
-    /// 排除指定 id 后加权随机选。
-    /// 只剩一个或没有时返回 None。
-    pub fn pick_excluding(&self, exclude_id: &str) -> Option<Arc<Upstream>> {
-        // 单上游场景直接 None，没别的可选
-        if self.single.is_some() {
-            return None;
-        }
+    pub fn pick_from_group(&self, group: &str) -> Option<Arc<Upstream>> {
+        let items = self.groups.get(group)?;
+        self.pick_weighted(items, group, None)
+    }
 
-        let candidates: Vec<_> = self
-            .items
+    pub fn pick_excluding_many_from_group(
+        &self,
+        group: &str,
+        exclude: &HashSet<String>,
+    ) -> Option<Arc<Upstream>> {
+        let items = self.groups.get(group)?;
+        let candidates: Vec<_> = items
             .iter()
-            .filter(|u| u.id != exclude_id)
+            .filter(|u| !exclude.contains(&u.id))
             .cloned()
             .collect();
-
         if candidates.is_empty() {
             return None;
         }
-
-        self.pick_weighted(&candidates, Some(exclude_id))
+        self.pick_weighted(&candidates, group, None)
     }
 
     /// 公共的平方加权随机选择逻辑，带 tolerance 切换门槛。
@@ -277,6 +279,7 @@ impl UpstreamSet {
     fn pick_weighted(
         &self,
         items: &[Arc<Upstream>],
+        group: &str,
         exclude_ctx: Option<&str>,
     ) -> Option<Arc<Upstream>> {
         if items.is_empty() {
@@ -292,7 +295,8 @@ impl UpstreamSet {
             let sticky = {
                 let guard = self.current.lock().expect("bad current lock");
                 guard
-                    .as_ref()
+                    .get(group)
+                    .and_then(|id| id.as_ref())
                     .and_then(|id| items.iter().find(|u| u.id == *id).cloned())
             };
 
@@ -373,16 +377,19 @@ impl UpstreamSet {
         };
 
         // 4. 更新 current
-        *self.current.lock().expect("bad current lock") = Some(chosen.id.clone());
+        self.current
+            .lock()
+            .expect("bad current lock")
+            .insert(group.to_string(), Some(chosen.id.clone()));
         Some(chosen)
     }
 
     pub fn find_by_id(&self, id: &str) -> Option<Arc<Upstream>> {
-        self.items.iter().find(|u| u.id == id).cloned()
+        self.all_items.iter().find(|u| u.id == id).cloned()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Arc<Upstream>> + '_ {
-        self.items.iter()
+        self.all_items.iter()
     }
 }
 
@@ -749,7 +756,11 @@ mod tests {
 
     // ---------- Upstream::score ----------
     fn make_upstream(id: &str) -> Arc<Upstream> {
-        Upstream::new(id, "127.0.0.1:1080".parse().unwrap())
+        Upstream::new(
+            id,
+            "127.0.0.1:1080".parse().unwrap(),
+            vec!["default".to_string()],
+        )
     }
 
     /// 直接设置 QUIC 分数并标记为已更新（绕过 3:7 平滑混合）
@@ -801,7 +812,11 @@ mod tests {
 
     // ---------- UpstreamSet ----------
     fn upstream(id: &str) -> Arc<Upstream> {
-        Upstream::new(id, "127.0.0.1:1080".parse().unwrap())
+        Upstream::new(
+            id,
+            "127.0.0.1:1080".parse().unwrap(),
+            vec!["default".to_string()],
+        )
     }
 
     fn upstream_set(ids: &[&str], tolerance: u32) -> UpstreamSet {
@@ -812,21 +827,43 @@ mod tests {
     #[test]
     fn single_upstream_always_picked() {
         let set = upstream_set(&["a"], 0);
-        let picked = set.pick();
+        let picked = set.pick().unwrap();
         assert_eq!(picked.id, "a");
     }
 
     #[test]
-    fn pick_excluding_single_returns_none() {
+    fn pick_excluding_many_single_returns_none() {
         let set = upstream_set(&["a"], 0);
-        assert!(set.pick_excluding("a").is_none());
+        let mut excluded = HashSet::new();
+        excluded.insert("a".to_string());
+        assert!(
+            set.pick_excluding_many_from_group("default", &excluded)
+                .is_none()
+        );
     }
 
     #[test]
-    fn pick_excluding_removes_matching() {
+    fn pick_excluding_many_removes_matching() {
         let set = upstream_set(&["a", "b"], 0);
-        let picked = set.pick_excluding("a").unwrap();
+        let mut excluded = HashSet::new();
+        excluded.insert("a".to_string());
+        let picked = set
+            .pick_excluding_many_from_group("default", &excluded)
+            .unwrap();
         assert_eq!(picked.id, "b");
+    }
+
+    #[test]
+    fn pick_excluding_many_excludes_all() {
+        let set = upstream_set(&["a", "b", "c"], 0);
+        let mut excluded = HashSet::new();
+        excluded.insert("a".to_string());
+        excluded.insert("b".to_string());
+        excluded.insert("c".to_string());
+        assert!(
+            set.pick_excluding_many_from_group("default", &excluded)
+                .is_none()
+        );
     }
 
     #[test]
@@ -839,9 +876,9 @@ mod tests {
         // sticky to "a"
         {
             let mut cur = set.current.lock().unwrap();
-            *cur = Some("a".to_string());
+            cur.insert("default".to_string(), Some("a".to_string()));
         }
-        let picked = set.pick();
+        let picked = set.pick().unwrap();
         assert_eq!(picked.id, "a", "should stick because scores equal");
     }
 
@@ -852,7 +889,7 @@ mod tests {
         // sticky to "a"
         {
             let mut cur = set.current.lock().unwrap();
-            *cur = Some("a".to_string());
+            cur.insert("default".to_string(), Some("a".to_string()));
         }
         // "a" at 500
         for u in set.iter() {
@@ -862,7 +899,7 @@ mod tests {
         // "b" quic=700 => score=(500*3+700*7)/10=640, diff=140 > 100
         let up_b = set.find_by_id("b").unwrap();
         set_quic_uplink(&up_b, 700);
-        let picked = set.pick();
+        let picked = set.pick().unwrap();
         assert_eq!(picked.id, "b");
     }
 
@@ -884,5 +921,39 @@ mod tests {
         set_quic_uplink(&up, 800);
         let expected = (600 * 50 + 800 * 50) / 100; // 700
         assert_eq!(up.score(), expected);
+    }
+
+    fn upstream_with_groups(id: &str, groups: Vec<String>) -> Arc<Upstream> {
+        Upstream::new(id, "127.0.0.1:1080".parse().unwrap(), groups)
+    }
+
+    #[test]
+    fn pick_from_group_nonexistent_returns_none() {
+        let set = upstream_set(&["a", "b"], 0);
+        assert!(set.pick_from_group("nonexistent").is_none());
+    }
+
+    #[test]
+    fn pick_from_group_sticky_isolated() {
+        let items = vec![
+            upstream_with_groups("a", vec!["default".to_string(), "office".to_string()]),
+            upstream_with_groups("b", vec!["default".to_string()]),
+            upstream_with_groups("c", vec!["office".to_string()]),
+            upstream_with_groups("d", vec!["office".to_string()]),
+        ];
+        let set = UpstreamSet::new(items, 50, 70);
+
+        // sticky default -> a, office -> c
+        {
+            let mut cur = set.current.lock().unwrap();
+            cur.insert("default".to_string(), Some("a".to_string()));
+            cur.insert("office".to_string(), Some("c".to_string()));
+        }
+
+        let picked_default = set.pick_from_group("default").unwrap();
+        assert_eq!(picked_default.id, "a");
+
+        let picked_office = set.pick_from_group("office").unwrap();
+        assert_eq!(picked_office.id, "c");
     }
 }
