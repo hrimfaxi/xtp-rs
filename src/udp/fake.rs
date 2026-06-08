@@ -79,10 +79,7 @@ impl FakeUdpManager {
 
         sockets.insert(key, entry);
 
-        debug!(
-            "created fake UDP socket: spoofed_src={}, fwmark={}",
-            src_addr, fwmark
-        );
+        debug!(spoofed_src = %src_addr, fwmark = fwmark, "created fake UDP socket");
 
         Ok(socket)
     }
@@ -97,10 +94,10 @@ impl FakeUdpManager {
         let socket = self.get_or_create(src_addr, fwmark).await?;
 
         trace!(
-            "fake UDP send: spoofed_src={}, dst={}, payload_len={}",
-            src_addr,
-            dst_addr,
-            payload.len()
+            spoofed_src = %src_addr,
+            dst = %dst_addr,
+            payload_len = payload.len(),
+            "fake UDP send"
         );
 
         socket
@@ -121,8 +118,9 @@ impl FakeUdpManager {
 
             if !alive {
                 debug!(
-                    "fake UDP socket expired: spoofed_src={}, fwmark={}",
-                    key.src_addr, key.fwmark
+                    spoofed_src = %key.src_addr,
+                    fwmark = key.fwmark,
+                    "fake UDP socket expired"
                 );
             }
 

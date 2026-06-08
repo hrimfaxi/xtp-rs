@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
 
                     info!("SIGHUP received, reloading config...");
                     if let Err(e) = reload_config(Arc::clone(&state_for_sighup)).await {
-                        error!("reload failed: {:#}", e);
+                            error!(error = format!("{:#}", e), "reload failed");
                     }
                 }
             }
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
         let mut stream = match signal(SignalKind::user_defined1()) {
             Ok(s) => s,
             Err(e) => {
-                warn!("SIGUSR1 handler install failed: {}", e);
+                warn!(error = format!("{:#}", e), "SIGUSR1 handler install failed");
                 return;
             }
         };
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
                     let old = ProxyMode::from_u8(current.runtime.proxy_mode.load(Ordering::Relaxed));
                     let new = old.next();
                     current.runtime.proxy_mode.store(new.as_u8(), Ordering::Relaxed);
-                    info!("Proxy mode rotated: {} -> {}", old, new);
+                    info!(old = %old, new = %new, "Proxy mode rotated");
                 }
             }
         }
@@ -184,7 +184,10 @@ async fn reload_config(state: Arc<ArcSwap<AppState>>) -> Result<()> {
     // 注意：所有 listener 都需要 SO_REUSEADDR + SO_REUSEPORT，
     // 否则这里先启新 generation 时会因为旧 generation 还占着端口而 EADDRINUSE。
     if let Err(e) = new_arc.spawn_all_tasks().await {
-        error!("new generation spawn failed, rolling back: {:#}", e);
+        error!(
+            error = format!("{:#}", e),
+            "new generation spawn failed, rolling back"
+        );
         new_arc.shutdown_for_exit(Duration::from_secs(1)).await;
         return Err(e);
     }
@@ -196,14 +199,17 @@ async fn reload_config(state: Arc<ArcSwap<AppState>>) -> Result<()> {
     let old_arc = state.swap(new_arc.clone());
 
     let reset_mode = ProxyMode::from_u8(new_arc.runtime.proxy_mode.load(Ordering::Relaxed));
-    info!("Proxy mode reset to config value: {}", reset_mode);
+    info!(mode = %reset_mode, "Proxy mode reset to config value");
 
     // 4. 热更新 tracing filter。
     //
     // 提前构建好的 filter，swap 成功后直接应用
     if let Some(handle) = LOG_RELOAD_HANDLE.get() {
         if let Err(e) = handle.reload(new_filter) {
-            error!("failed to reload tracing filter: {}", e);
+            error!(
+                error = format!("{:#}", e),
+                "failed to reload tracing filter"
+            );
         } else {
             info!("tracing filter reloaded");
         }
@@ -216,6 +222,6 @@ async fn reload_config(state: Arc<ArcSwap<AppState>>) -> Result<()> {
         warn!("old generation shutdown timed out, some tasks aborted");
     }
 
-    info!("config reloaded from {}", path);
+    info!(path = %path, "config reloaded");
     Ok(())
 }

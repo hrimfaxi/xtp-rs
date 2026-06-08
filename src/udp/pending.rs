@@ -113,8 +113,11 @@ pub(crate) async fn forward_udp_payload(
         Ok(session) => session,
         Err(e) => {
             warn!(
-                "failed to get/create UDP session: kind={:?}, client={}, target={}, error={:#}",
-                key.kind, key.client_addr, key.target_addr, e
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                error = format!("{:#}", e),
+                "failed to get/create UDP session"
             );
             return;
         }
@@ -125,18 +128,21 @@ pub(crate) async fn forward_udp_payload(
     match session.send_payload(payload).await {
         Ok(sent) => {
             trace!(
-                "UDP packet forwarded: kind={:?}, client={}, target={}, payload_len={}, sent={}",
-                key.kind,
-                key.client_addr,
-                key.target_addr,
-                payload.len(),
-                sent
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                payload_len = payload.len(),
+                sent = sent,
+                "UDP packet forwarded"
             );
         }
         Err(e) => {
             warn!(
-                "failed to forward UDP packet: kind={:?}, client={}, target={}, error={:#}",
-                key.kind, key.client_addr, key.target_addr, e
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                error = format!("{:#}", e),
+                "failed to forward UDP packet"
             );
         }
     }
@@ -150,18 +156,21 @@ pub(crate) async fn forward_udp_payload_to_session(session: Arc<UdpSession>, pay
     match session.send_payload(payload).await {
         Ok(sent) => {
             trace!(
-                "UDP packet forwarded (session): kind={:?}, client={}, target={}, payload_len={}, sent={}",
-                key.kind,
-                key.client_addr,
-                key.target_addr,
-                payload.len(),
-                sent
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                payload_len = payload.len(),
+                sent = sent,
+                "UDP packet forwarded (session)"
             );
         }
         Err(e) => {
             warn!(
-                "failed to forward UDP packet (session): kind={:?}, client={}, target={}, error={:#}",
-                key.kind, key.client_addr, key.target_addr, e
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                error = format!("{:#}", e),
+                "failed to forward UDP packet (session)"
             );
         }
     }
@@ -187,11 +196,11 @@ pub(crate) async fn handle_udp_client_payload(
         pending_sniff.remove(&key);
 
         trace!(
-            "UDP existing session hit, skip sniff: kind={:?}, client={}, target={}, payload_len={}",
-            key.kind,
-            key.client_addr,
-            key.target_addr,
-            payload.len()
+            kind = ?key.kind,
+            client = %key.client_addr,
+            target = %key.target_addr,
+            payload_len = payload.len(),
+            "UDP existing session hit, skip sniff"
         );
 
         forward_udp_payload_to_session(session, payload).await;
@@ -223,8 +232,10 @@ pub(crate) async fn handle_pending_udp_sniff(
 
     if pending.expired() {
         debug!(
-            "UDP sniff pending expired: kind={:?}, client={}, target={}",
-            key.kind, key.client_addr, key.target_addr
+            kind = ?key.kind,
+            client = %key.client_addr,
+            target = %key.target_addr,
+            "UDP sniff pending expired"
         );
 
         flush_pending_udp_sniff(state.clone(), pending).await;
@@ -234,8 +245,10 @@ pub(crate) async fn handle_pending_udp_sniff(
 
     if !pending.push_datagram(payload) {
         debug!(
-            "UDP sniff pending too large: kind={:?}, client={}, target={}",
-            key.kind, key.client_addr, key.target_addr
+            kind = ?key.kind,
+            client = %key.client_addr,
+            target = %key.target_addr,
+            "UDP sniff pending too large"
         );
 
         flush_pending_udp_sniff(state.clone(), pending).await;
@@ -246,12 +259,12 @@ pub(crate) async fn handle_pending_udp_sniff(
     match pending.sniffer.feed(payload) {
         UdpSniffOutcome::Matched { protocol, host } => {
             debug!(
-                "UDP sniff success after reassembly: protocol={}, kind={:?}, client={}, target={}, host={}",
-                udp_sniff_protocol_name(protocol),
-                key.kind,
-                key.client_addr,
-                key.target_addr,
-                host
+                protocol = udp_sniff_protocol_name(protocol),
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                host = %host,
+                "UDP sniff success after reassembly"
             );
 
             pending.spec.sniffed_host = Some(host);
@@ -259,12 +272,12 @@ pub(crate) async fn handle_pending_udp_sniff(
         }
         UdpSniffOutcome::NeedMore { protocol } => {
             debug!(
-                "UDP sniff still need more: protocol={}, kind={:?}, client={}, target={}, payload_len={}",
-                udp_sniff_protocol_name(protocol),
-                key.kind,
-                key.client_addr,
-                key.target_addr,
-                payload.len()
+                protocol = udp_sniff_protocol_name(protocol),
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                payload_len = payload.len(),
+                "UDP sniff still need more",
             );
 
             pending_sniff.insert(key, pending);
@@ -272,20 +285,22 @@ pub(crate) async fn handle_pending_udp_sniff(
         }
         UdpSniffOutcome::NotMatched => {
             debug!(
-                "UDP sniff pending not matched: kind={:?}, client={}, target={}",
-                key.kind, key.client_addr, key.target_addr
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                "UDP sniff pending not matched"
             );
 
             flush_pending_udp_sniff(state, pending).await;
         }
         UdpSniffOutcome::Failed { protocol, error } => {
             debug!(
-                "UDP sniff pending failed: protocol={}, reason={}, kind={:?}, client={}, target={}",
-                udp_sniff_protocol_name(protocol),
-                udp_sniff_error_reason(error),
-                key.kind,
-                key.client_addr,
-                key.target_addr
+                protocol = udp_sniff_protocol_name(protocol),
+                reason = udp_sniff_error_reason(error),
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                "UDP sniff pending failed"
             );
 
             flush_pending_udp_sniff(state, pending).await;
@@ -322,13 +337,13 @@ pub(crate) async fn handle_new_udp_sniff(
                 let mut spec = spec;
 
                 debug!(
-                    "UDP sniff success: sniffer={}, protocol={}, kind={:?}, client={}, target={}, host={}",
-                    sniffer.name(),
-                    udp_sniff_protocol_name(protocol),
-                    key.kind,
-                    key.client_addr,
-                    key.target_addr,
-                    host
+                    sniffer = sniffer.name(),
+                    protocol = udp_sniff_protocol_name(protocol),
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    host = %host,
+                    "UDP sniff success"
                 );
 
                 spec.sniffed_host = Some(host);
@@ -337,13 +352,13 @@ pub(crate) async fn handle_new_udp_sniff(
             }
             UdpSniffOutcome::NeedMore { protocol } => {
                 debug!(
-                    "UDP sniff need more, pending created: sniffer={}, protocol={}, kind={:?}, client={}, target={}, payload_len={}",
-                    sniffer.name(),
-                    udp_sniff_protocol_name(protocol),
-                    key.kind,
-                    key.client_addr,
-                    key.target_addr,
-                    payload.len()
+                    sniffer = sniffer.name(),
+                    protocol = udp_sniff_protocol_name(protocol),
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    payload_len = payload.len(),
+                    "UDP sniff need more, pending created"
                 );
 
                 let pending = PendingUdpSniff::new(spec, sniff_session, payload);
@@ -353,23 +368,23 @@ pub(crate) async fn handle_new_udp_sniff(
             }
             UdpSniffOutcome::NotMatched => {
                 debug!(
-                    "UDP sniff not matched: sniffer={}, kind={:?}, client={}, target={}",
-                    sniffer.name(),
-                    key.kind,
-                    key.client_addr,
-                    key.target_addr
+                    sniffer = sniffer.name(),
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    "UDP sniff not matched"
                 );
                 continue;
             }
             UdpSniffOutcome::Failed { protocol, error } => {
                 debug!(
-                    "UDP sniff failed: sniffer={}, protocol={}, reason={}, kind={:?}, client={}, target={}",
-                    sniffer.name(),
-                    udp_sniff_protocol_name(protocol),
-                    udp_sniff_error_reason(error),
-                    key.kind,
-                    key.client_addr,
-                    key.target_addr
+                    sniffer = sniffer.name(),
+                    protocol = udp_sniff_protocol_name(protocol),
+                    reason = udp_sniff_error_reason(error),
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    "UDP sniff failed"
                 );
                 continue;
             }
@@ -400,12 +415,12 @@ pub(crate) async fn reap_pending_udp_sniff(
     for key in expired_keys {
         if let Some(pending) = pending_sniff.remove(&key) {
             debug!(
-                "UDP sniff pending expired by reap: kind={:?}, client={}, target={}, cached_datagrams={}, cached_bytes={}",
-                key.kind,
-                key.client_addr,
-                key.target_addr,
-                pending.datagram_count(),
-                pending.cached_bytes()
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                cached_datagrams = pending.datagram_count(),
+                cached_bytes = pending.cached_bytes(),
+                "UDP sniff pending expired by reap"
             );
 
             flush_pending_udp_sniff(state.clone(), pending).await;
@@ -424,13 +439,13 @@ pub(crate) async fn reap_pending_udp_sniff(
 
         if let Some(pending) = pending_sniff.remove(&oldest_key) {
             warn!(
-                "UDP sniff pending overflow, dropping oldest: kind={:?}, client={}, target={}, cached_datagrams={}, cached_bytes={}, pending_len={}",
-                oldest_key.kind,
-                oldest_key.client_addr,
-                oldest_key.target_addr,
-                pending.datagram_count(),
-                pending.cached_bytes(),
-                pending_sniff.len()
+                kind = ?oldest_key.kind,
+                client = %oldest_key.client_addr,
+                target = %oldest_key.target_addr,
+                cached_datagrams = pending.datagram_count(),
+                cached_bytes = pending.cached_bytes(),
+                pending_len = pending_sniff.len(),
+                "UDP sniff pending overflow, dropping oldest"
             );
 
             drop(pending);
@@ -453,13 +468,13 @@ pub(crate) fn enforce_pending_udp_sniff_capacity(
 
         if let Some(pending) = pending_sniff.remove(&oldest_key) {
             warn!(
-                "UDP sniff pending overflow, dropping oldest immediately: kind={:?}, client={}, target={}, cached_datagrams={}, cached_bytes={}, pending_len={}",
-                oldest_key.kind,
-                oldest_key.client_addr,
-                oldest_key.target_addr,
-                pending.datagram_count(),
-                pending.cached_bytes(),
-                pending_sniff.len()
+                kind = ?oldest_key.kind,
+                client = %oldest_key.client_addr,
+                target = %oldest_key.target_addr,
+                cached_datagrams = pending.datagram_count(),
+                cached_bytes = pending.cached_bytes(),
+                pending_len = pending_sniff.len(),
+                "UDP sniff pending overflow, dropping oldest immediately"
             );
 
             drop(pending);

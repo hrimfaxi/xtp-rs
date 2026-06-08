@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::util::{enable_orig_dst_v4, enable_orig_dst_v6, set_socket_reuse, unspecified_addr_for};
 
@@ -145,6 +145,37 @@ impl SocketFactory {
             .bind(&addr.into())
             .with_context(|| format!("bind port-forward UDP to {addr}"))?;
         Ok(Arc::new(UdpSocket::from_std(socket.into())?))
+    }
+
+    /// 创建带 fwmark 的异步 TCP 连接
+    pub async fn connect_tcp_stream(&self, addr: SocketAddr, fwmark: u32) -> Result<TcpStream> {
+        let socket = self
+            .tcp_socket(addr)
+            .with_context(|| format!("failed to create TCP socket for {addr}"))?;
+        self.apply_socket_options(&socket, addr, false, false, None, Some(fwmark))
+            .with_context(|| format!("failed to apply socket options for {addr}"))?;
+        socket
+            .set_nonblocking(true)
+            .with_context(|| format!("failed to set nonblocking for {addr}"))?;
+        match socket.connect(&addr.into()) {
+            Ok(()) => {}
+            Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) => return Err(e).with_context(|| format!("tcp connect to {addr} failed")),
+        }
+        let std_stream: std::net::TcpStream = socket.into();
+        let stream = TcpStream::from_std(std_stream)
+            .with_context(|| format!("failed to convert to tokio TcpStream for {addr}"))?;
+        stream
+            .writable()
+            .await
+            .with_context(|| format!("tcp connect to {addr}: waiting for writable timed out"))?;
+        if let Some(e) = stream
+            .take_error()
+            .with_context(|| format!("failed to query SO_ERROR for {addr}"))?
+        {
+            return Err(e).with_context(|| format!("tcp connect to {addr} failed after writable"));
+        }
+        Ok(stream)
     }
 }
 

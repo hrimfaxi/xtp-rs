@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::trace;
 
+use crate::socket_factory::SocketFactory;
 use crate::util::hex_encode;
 
 #[derive(Debug)]
@@ -205,32 +205,11 @@ pub async fn socks5_connect(
     fwmark: u32,
     creds: Option<(&str, &str)>,
 ) -> Result<TcpStream> {
-    let domain = if socks5_addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .context("failed to create socket for SOCKS5 connect")?;
-
-    socket.set_mark(fwmark)?;
-    socket.set_nonblocking(true)?;
-
-    match socket.connect(&socks5_addr.into()) {
-        Ok(_) => {}
-        Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        Err(e) => return Err(e).context("SOCKS5 connect failed"),
-    }
-
-    let std_stream: std::net::TcpStream = socket.into();
-    let mut stream = TcpStream::from_std(std_stream)?;
-
-    stream.writable().await?;
-
-    if let Some(e) = stream.take_error()? {
-        return Err(e).context("SOCKS5 connect handshake error");
-    }
+    trace!(proxy = %socks5_addr, "SOCKS5 TCP connect");
+    let mut stream = SocketFactory::new()
+        .connect_tcp_stream(socks5_addr, fwmark)
+        .await
+        .with_context(|| format!("SOCKS5 TCP connect to proxy {socks5_addr} failed"))?;
 
     socks5_auth(&mut stream, creds).await?;
 
@@ -241,13 +220,13 @@ pub async fn socks5_connect(
             req.push(0x01);
             req.extend_from_slice(&v4.ip().octets());
             req.extend_from_slice(&v4.port().to_be_bytes());
-            trace!("SOCKS5 connect by IPv4: {}", SocketAddr::V4(v4));
+            trace!(addr = %SocketAddr::V4(v4), "SOCKS5 connect by IPv4");
         }
         Socks5Target::Ip(SocketAddr::V6(v6)) => {
             req.push(0x04);
             req.extend_from_slice(&v6.ip().octets());
             req.extend_from_slice(&v6.port().to_be_bytes());
-            trace!("SOCKS5 connect by IPv6: {}", SocketAddr::V6(v6));
+            trace!(addr = %SocketAddr::V6(v6), "SOCKS5 connect by IPv6");
         }
         Socks5Target::Domain(host, port) => {
             let host_bytes = host.as_bytes();
@@ -259,7 +238,7 @@ pub async fn socks5_connect(
             req.push(host_bytes.len() as u8);
             req.extend_from_slice(host_bytes);
             req.extend_from_slice(&port.to_be_bytes());
-            trace!("SOCKS5 connect by domain: {}:{}", host, port);
+            trace!(host = %host, port = port, "SOCKS5 connect by domain");
         }
     }
 
@@ -314,32 +293,13 @@ pub async fn socks5_udp_associate_for_client(
     fwmark: u32,
     creds: Option<(&str, &str)>,
 ) -> Result<Socks5UdpAssoc> {
-    let domain = if socks5_addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let tcp_sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .context("failed to create TCP socket for UDP ASSOCIATE")?;
-
-    tcp_sock.set_mark(fwmark)?;
-    tcp_sock.set_nonblocking(true)?;
-
-    match tcp_sock.connect(&socks5_addr.into()) {
-        Ok(_) => {}
-        Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        Err(e) => return Err(e).context("SOCKS5 UDP ASSOCIATE connect failed"),
-    }
-
-    let std_stream: std::net::TcpStream = tcp_sock.into();
-    let mut control = TcpStream::from_std(std_stream)?;
-
-    control.writable().await?;
-
-    if let Some(e) = control.take_error()? {
-        return Err(e).context("SOCKS5 UDP ASSOCIATE handshake error");
-    }
+    trace!(proxy = %socks5_addr, "SOCKS5 UDP ASSOCIATE control connect");
+    let mut control = SocketFactory::new()
+        .connect_tcp_stream(socks5_addr, fwmark)
+        .await
+        .with_context(|| {
+            format!("SOCKS5 UDP ASSOCIATE control connect to proxy {socks5_addr} failed")
+        })?;
 
     socks5_auth(&mut control, creds).await?;
 
@@ -353,7 +313,7 @@ pub async fn socks5_udp_associate_for_client(
     };
 
     if tracing::enabled!(tracing::Level::TRACE) {
-        trace!("SOCKS5 UDP ASSOCIATE req hex = {}", hex_encode(&req));
+        trace!(hex = hex_encode(&req), "SOCKS5 UDP ASSOCIATE req");
     }
     control
         .write_all(&req)
@@ -386,7 +346,7 @@ pub async fn socks5_udp_associate_for_client(
             let mut full = Vec::with_capacity(head.len() + body.len());
             full.extend_from_slice(&head);
             full.extend_from_slice(body);
-            trace!("SOCKS5 UDP ASSOCIATE resp hex = {}", hex_encode(&full));
+            trace!(hex = hex_encode(&full), "SOCKS5 UDP ASSOCIATE response");
         }
     };
 
@@ -444,30 +404,13 @@ pub async fn socks5_udp_associate_for_client(
         relay_addr
     };
 
-    let udp_domain = if relay_addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let udp_sock = Socket::new(udp_domain, Type::DGRAM, Some(Protocol::UDP))
-        .context("failed to create UDP socket for ASSOCIATE")?;
-
-    udp_sock.set_mark(fwmark)?;
-    udp_sock.set_nonblocking(true)?;
-
-    if relay_addr.is_ipv4() {
-        udp_sock.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into())?;
-    } else {
-        udp_sock.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into())?;
-    }
-
-    udp_sock
-        .connect(&relay_addr.into())
-        .with_context(|| format!("failed to connect to SOCKS5 relay {relay_addr}"))?;
-
-    let std_udp: std::net::UdpSocket = udp_sock.into();
-    let udp_socket = Arc::new(UdpSocket::from_std(std_udp)?);
+    let udp_socket = SocketFactory::new()
+        .connect_direct_udp(relay_addr, fwmark)
+        .with_context(|| {
+            format!(
+                "SOCKS5 UDP ASSOCIATE: failed to create/connect UDP relay socket to {relay_addr}"
+            )
+        })?;
 
     Ok(Socks5UdpAssoc {
         _control: control,

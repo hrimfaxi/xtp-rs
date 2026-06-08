@@ -70,8 +70,10 @@ impl UdpRuntime {
                     drop(sessions);
 
                     debug!(
-                        "UDP session is being created, waiting: kind={:?}, client={}, target={}",
-                        key.kind, key.client_addr, key.target_addr
+                        kind = ?key.kind,
+                        client = %key.client_addr,
+                        target = %key.target_addr,
+                        "UDP session is being created, waiting"
                     );
 
                     notify.notified().await;
@@ -118,8 +120,10 @@ impl UdpRuntime {
                 creating_notify.notify_waiters();
 
                 info!(
-                    "created UDP session: kind={:?}, client={}, target={}",
-                    key.kind, key.client_addr, key.target_addr
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    "created UDP session"
                 );
 
                 Ok(session)
@@ -182,8 +186,10 @@ impl UdpRuntime {
                 expired_sessions.push(session);
 
                 debug!(
-                    "UDP session expired and cancelled: kind={:?}, client={}, target={}",
-                    key.kind, key.client_addr, key.target_addr
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    "UDP session expired and cancelled"
                 );
             }
         }
@@ -239,13 +245,10 @@ impl UdpRuntime {
             match tokio::time::timeout_at(deadline, &mut h).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    warn!("UDP session recv task exited with JoinError: {}", e);
+                    warn!(error = format!("{:#}", e), "UDP session recv task exited");
                 }
                 Err(_) => {
-                    warn!(
-                        "UDP session recv task did not exit within {:?}, aborting",
-                        timeout
-                    );
+                    warn!(?timeout, "UDP session recv task did not exit, aborting");
                     h.abort();
                     let _ = h.await;
                     ok = false;
@@ -280,37 +283,37 @@ impl UdpSession {
                 {
                     Ok(sent) => {
                         trace!(
-                            "UDP response sent: direction={}, kind={:?}, spoofed_src={}, client={}, payload_len={}, sent={}",
-                            direction,
-                            key.kind,
-                            remote_src,
-                            key.client_addr,
-                            payload.len(),
-                            sent
+                            direction = direction,
+                            kind = ?key.kind,
+                            spoofed_src = %remote_src,
+                            client = %key.client_addr,
+                            payload_len = payload.len(),
+                            sent = sent,
+                            "UDP response sent"
                         );
                     }
                     Err(e) if is_anyhow_emsgsize(&e) => {
                         warn!(
-                            "UDP datagram dropped due to EMSGSIZE: direction={}, kind={:?}, spoofed_src={}, client={}, payload_len={}, relay={:?}, error={:#}",
-                            direction,
-                            key.kind,
-                            remote_src,
-                            key.client_addr,
-                            payload.len(),
-                            relay_addr,
-                            e
+                            direction = direction,
+                            kind = ?key.kind,
+                            spoofed_src = %remote_src,
+                            client = %key.client_addr,
+                            payload_len = payload.len(),
+                            relay = ?relay_addr,
+                            error = format!("{:#}", e),
+                            "UDP datagram dropped due to EMSGSIZE"
                         );
                     }
                     Err(e) => {
                         warn!(
-                            "failed to send UDP response: direction={}, kind={:?}, spoofed_src={}, client={}, payload_len={}, relay={:?}, error={:#}",
-                            direction,
-                            key.kind,
-                            remote_src,
-                            key.client_addr,
-                            payload.len(),
-                            relay_addr,
-                            e
+                            direction = direction,
+                            kind = ?key.kind,
+                            spoofed_src = %remote_src,
+                            client = %key.client_addr,
+                            payload_len = payload.len(),
+                            relay = ?relay_addr,
+                            error = format!("{:#}", e),
+                            "failed to send UDP response",
                         );
                     }
                 }
@@ -319,37 +322,37 @@ impl UdpSession {
                 match listen_sock.send_to(payload, key.client_addr).await {
                     Ok(sent) => {
                         trace!(
-                            "UDP response sent: direction={}, kind={:?}, remote_src={}, client={}, payload_len={}, sent={}",
-                            direction,
-                            key.kind,
-                            remote_src,
-                            key.client_addr,
-                            payload.len(),
-                            sent
+                            direction = direction,
+                            kind = ?key.kind,
+                            remote_src = %remote_src,
+                            client = %key.client_addr,
+                            payload_len = payload.len(),
+                            sent = sent,
+                            "UDP response sent"
                         );
                     }
                     Err(e) if is_io_emsgsize(&e) => {
                         warn!(
-                            "UDP datagram dropped due to EMSGSIZE: direction={}, kind={:?}, remote_src={}, client={}, payload_len={}, relay={:?}, error={}",
-                            direction,
-                            key.kind,
-                            remote_src,
-                            key.client_addr,
-                            payload.len(),
-                            relay_addr,
-                            e
+                            direction = direction,
+                            kind = ?key.kind,
+                            remote_src = %remote_src,
+                            client = %key.client_addr,
+                            payload_len = payload.len(),
+                            relay = ?relay_addr,
+                            error = format!("{:#}", e),
+                            "UDP datagram dropped due to EMSGSIZE"
                         );
                     }
                     Err(e) => {
                         warn!(
-                            "failed to send UDP response: direction={}, kind={:?}, remote_src={}, client={}, payload_len={}, relay={:?}, error={:#}",
-                            direction,
-                            key.kind,
-                            remote_src,
-                            key.client_addr,
-                            payload.len(),
-                            relay_addr,
-                            e
+                            direction = direction,
+                            kind = ?key.kind,
+                            remote_src = %remote_src,
+                            client = %key.client_addr,
+                            payload_len = payload.len(),
+                            relay = ?relay_addr,
+                            error = format!("{:#}", e),
+                            "failed to send UDP response"
                         );
                     }
                 }
@@ -379,11 +382,13 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
                         anyhow::anyhow!("no upstream available for group '{}'", group)
                     })?;
                 debug!(
-                    "selected upstream {} at {} (score={:.0}) for UDP {:?}",
-                    up.id,
-                    up.addr,
-                    up.score(),
-                    key
+                    upstream_id = %up.id,
+                    upstream_addr = %up.addr,
+                    score = up.score(),
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    "selected upstream for UDP"
                 );
 
                 let assoc = socks5_udp_associate_for_client(
@@ -407,11 +412,11 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
                 .or_else(|| state.upstreams.pick())
                 .ok_or_else(|| anyhow::anyhow!("no upstream available for group '{}'", group))?;
             debug!(
-                "selected upstream {} at {} (score={:.0}) for UDP {:?}",
-                up.id,
-                up.addr,
-                up.score(),
-                key
+                upstream_id = %up.id,
+                upstream_addr = %up.addr,
+                score = up.score(),
+                key = ?key,
+                "selected upstream for UDP"
             );
 
             let assoc = socks5_udp_associate_for_client(
@@ -440,7 +445,7 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
 
         tokio::spawn(async move {
             if let Err(e) = run_udp_session_recv_loop(session, state, ready_tx).await {
-                warn!("UDP session recv loop exited with error: {:#}", e);
+                warn!(error = format!("{:#}", e), "UDP session recv loop exited");
             }
         })
     };
@@ -465,8 +470,10 @@ async fn run_udp_session_recv_loop(
     let key = session.key();
 
     debug!(
-        "UDP session recv loop starting: kind={:?}, client={}, target={}",
-        key.kind, key.client_addr, key.target_addr
+        kind = ?key.kind,
+        client = %key.client_addr,
+        target = %key.target_addr,
+        "UDP session recv loop starting"
     );
 
     match &session.outbound {
@@ -502,10 +509,10 @@ async fn run_direct_udp_recv_loop(
             biased;
             _ = session.cancel.cancelled() => {
                 debug!(
-                    "direct UDP recv loop cancelled: kind={:?}, client={}, target={}",
-                    key.kind,
-                    key.client_addr,
-                    key.target_addr
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    "direct UDP recv loop cancelled"
                 );
                 return Ok(());
             }
@@ -556,10 +563,10 @@ async fn run_socks5_udp_recv_loop(
             biased;
             _ = session.cancel.cancelled() => {
                 debug!(
-                    "SOCKS5 UDP recv loop cancelled: kind={:?}, client={}, target={}",
-                    key.kind,
-                    key.client_addr,
-                    key.target_addr
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    "SOCKS5 UDP recv loop cancelled"
                 );
                 return Ok(());
             }
@@ -579,14 +586,14 @@ async fn run_socks5_udp_recv_loop(
 
                 if tracing::enabled!(tracing::Level::TRACE) {
                     trace!(
-                        "SOCKS5 UDP raw recv: kind={:?}, client={}, target={}, relay={}, local={:?}, packet_len={}, head={}",
-                        key.kind,
-                        key.client_addr,
-                        key.target_addr,
-                        relay_addr,
-                        relay_local,
-                        n,
-                        hex_encode(&buf[..n.min(80)])
+                        kind = ?key.kind,
+                        client = %key.client_addr,
+                        target = %key.target_addr,
+                        relay = %relay_addr,
+                        local = ?relay_local,
+                        packet_len = n,
+                        head = %hex_encode(&buf[..n.min(80)]),
+                        "SOCKS5 UDP raw recv"
                     );
                 }
 
@@ -594,13 +601,13 @@ async fn run_socks5_udp_recv_loop(
                     Ok(v) => v,
                     Err(e) => {
                         warn!(
-                            "invalid SOCKS5 UDP packet: kind={:?}, client={}, target={}, relay={}, packet_len={}, error={:#}",
-                            key.kind,
-                            key.client_addr,
-                            key.target_addr,
-                            relay_addr,
-                            n,
-                            e
+                            kind = ?key.kind,
+                            client = %key.client_addr,
+                            target = %key.target_addr,
+                            relay = %relay_addr,
+                            packet_len = n,
+                            error = format!("{:#}", e),
+                            "invalid SOCKS5 UDP packet"
                         );
                         continue;
                     }
@@ -680,7 +687,7 @@ pub async fn run_udp_loop(
                 match res {
                     Ok(packet) => packet,
                     Err(e) => {
-                        warn!("failed to receive TPROXY UDP packet: {:#}", e);
+                        warn!(error = format!("{:#}", e), "failed to receive TPROXY UDP packet");
                         continue;
                     }
                 }
@@ -734,7 +741,11 @@ pub async fn run_udp_port_forward(
         let (n, client_addr) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                info!("port-forward UDP {} -> {} shutting down", listen_addr, remote);
+                info!(
+                    listen_addr = %listen_addr,
+                    remote = %remote,
+                    "port-forward UDP shutting down"
+                );
                 break;
             }
             res = listen_sock.recv_from(&mut buf) => {
@@ -762,9 +773,9 @@ pub async fn run_udp_port_forward(
             biased;
             _ = cancel.cancelled() => {
                 info!(
-                    "port-forward UDP {} -> {} shutting down during packet handling",
-                    listen_addr,
-                    remote
+                    listen_addr = %listen_addr,
+                    remote = %remote,
+                    "port-forward UDP shutting down during packet handling"
                 );
                 break;
             }
@@ -786,8 +797,13 @@ fn connected_udp_recv_result(
         Ok(n) => Ok(Some(n)),
         Err(e) if is_io_emsgsize(&e) => {
             warn!(
-                "UDP recv got EMSGSIZE, ignored: direction={}, kind={:?}, client={}, target={}, relay={:?}, error={}",
-                direction, key.kind, key.client_addr, key.target_addr, relay_addr, e
+                direction = %direction,
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                relay = ?relay_addr,
+                error = format!("{:#}", e),
+                "UDP recv got EMSGSIZE, ignored"
             );
 
             Ok(None)

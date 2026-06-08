@@ -201,21 +201,30 @@ fn geosite_contains(index: &GeositeIndex, tag: &str, domain: &str) -> bool {
 }
 
 impl AppState {
-    pub fn need_domain_sniff(&self) -> bool {
+    /// geosite 是否需要域名 sniff
+    pub fn need_geosite_sniff(&self) -> bool {
         #[cfg(feature = "geosite")]
+        if self.geosite.is_some()
+            && (!self.config.proxy_geosite_tags.is_empty()
+                || !self.config.direct_geosite_tags.is_empty())
+            && matches!(
+                ProxyMode::from_u8(self.runtime.proxy_mode.load(Ordering::Relaxed)),
+                ProxyMode::Smart,
+            )
         {
-            self.geosite.is_some()
-                && (!self.config.proxy_geosite_tags.is_empty()
-                    || !self.config.direct_geosite_tags.is_empty())
-                && matches!(
-                    ProxyMode::from_u8(self.runtime.proxy_mode.load(Ordering::Relaxed)),
-                    ProxyMode::Smart
-                )
+            return true;
         }
-        #[cfg(not(feature = "geosite"))]
-        {
-            false
-        }
+        false
+    }
+
+    /// client_domain_routes 是否需要域名 sniff（只在代理路径上需要）
+    pub fn need_upstream_domain_sniff(&self, client_ip: IpAddr) -> bool {
+        !self.config.client_domain_routes.is_empty()
+            && self
+                .runtime
+                .client_domain_routes
+                .lookup(client_ip)
+                .is_some()
     }
 
     /// 判断目标 IP 是否应直连。
@@ -369,7 +378,7 @@ impl AppState {
                     .await
                     .with_context(|| format!("failed to read MMDB file {}", path))?;
                 let reader = Reader::from_source(data).context("invalid MMDB data")?;
-                info!("MMDB loaded from {}", path);
+                info!(path = %path, "MMDB loaded");
                 Some(Arc::new(reader))
             }
         };
@@ -635,7 +644,10 @@ impl AppState {
                 let state = Arc::clone(self);
                 self.udp_listeners.spawn(|cancel| async move {
                     if let Err(e) = run_udp_loop(state, sock, cancel).await {
-                        error!("IPv4 UDP loop exited with error: {:#}", e);
+                        error!(
+                            error = format!("{:#}", e),
+                            "IPv4 UDP loop exited with error"
+                        );
                     }
                 });
             }
@@ -645,7 +657,10 @@ impl AppState {
                 let state = Arc::clone(self);
                 self.udp_listeners.spawn(|cancel| async move {
                     if let Err(e) = run_udp_loop(state, sock, cancel).await {
-                        error!("IPv6 UDP loop exited with error: {:#}", e);
+                        error!(
+                            error = format!("{:#}", e),
+                            "IPv6 UDP loop exited with error"
+                        );
                     }
                 });
             }
@@ -747,7 +762,7 @@ impl AppState {
                     self.port_forwards.spawn(|cancel| async move {
                         if let Err(e) = run_tcp_port_forward(listener, remote, state, cancel).await
                         {
-                            error!("port-forward TCP {name} error: {:#}", e);
+                            error!(name = %name, error = format!("{:#}", e), "port-forward TCP error");
                         }
                     });
                 }
@@ -762,7 +777,7 @@ impl AppState {
                         if let Err(e) =
                             run_udp_port_forward(socket, bind, remote, state, cancel).await
                         {
-                            error!("port-forward UDP {name} error: {:#}", e);
+                            error!(name = %name, error = format!("{:#}", e), "port-forward UDP error");
                         }
                     });
                 }
@@ -782,14 +797,14 @@ impl AppState {
                         if let Err(e) =
                             run_tcp_port_forward(tcp_listener, remote, state_tcp, cancel).await
                         {
-                            error!("port-forward TCP(both) {name_tcp} error: {:#}", e);
+                            error!(name = %name_tcp, error = format!("{:#}", e), "port-forward TCP(both) error");
                         }
                     });
                     self.port_forwards.spawn(|cancel| async move {
                         if let Err(e) =
                             run_udp_port_forward(udp_socket, bind, remote, state_udp, cancel).await
                         {
-                            error!("port-forward UDP(both) {name_udp} error: {:#}", e);
+                            error!(name = %name_udp, error = format!("{:#}", e), "port-forward UDP(both) error");
                         }
                     });
                 }

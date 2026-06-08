@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -11,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::sniff::{SniffConfig, sniff_domain};
+use crate::socket_factory::SocketFactory;
 use crate::socks5::{Socks5Target, socks5_connect};
 use crate::state::AppState;
 use crate::upstream::Upstream;
@@ -101,15 +101,15 @@ pub async fn connect_tcp_upstream(
 ) -> Result<TcpStream> {
     match target {
         TcpUpstreamTarget::Direct(addr) => {
-            debug!("direct connect to {}", addr);
+            debug!(addr = %addr, "direct connect");
             direct_connect(*addr, fwmark).await
         }
         TcpUpstreamTarget::Socks5Ip(addr) => {
-            debug!("proxy connect by ip: {}", addr);
+            debug!(addr = %addr, "proxy connect by ip");
             socks5_connect(Socks5Target::Ip(*addr), socks5_addr, fwmark, creds).await
         }
         TcpUpstreamTarget::Socks5Domain { host, port } => {
-            debug!("proxy connect by hostname: host={}, port={}", host, port);
+            debug!(host = %host, port = port, "proxy connect by hostname");
             socks5_connect(
                 Socks5Target::Domain(host.as_str(), *port),
                 socks5_addr,
@@ -122,34 +122,11 @@ pub async fn connect_tcp_upstream(
 }
 
 pub async fn direct_connect(orig_dst: SocketAddr, fwmark: u32) -> Result<TcpStream> {
-    let domain = if orig_dst.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .context("failed to create socket for direct connect")?;
-
-    socket.set_mark(fwmark)?;
-    socket.set_nonblocking(true)?;
-
-    match socket.connect(&orig_dst.into()) {
-        Ok(_) => {}
-        Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        Err(e) => return Err(e).context("direct connect failed"),
-    }
-
-    let std_stream: std::net::TcpStream = socket.into();
-    let stream = TcpStream::from_std(std_stream)?;
-
-    stream.writable().await?;
-
-    if let Some(e) = stream.take_error()? {
-        return Err(e).context("direct connect final handshake error");
-    }
-
-    Ok(stream)
+    debug!(dst = %orig_dst, "direct connect");
+    SocketFactory::new()
+        .connect_tcp_stream(orig_dst, fwmark)
+        .await
+        .with_context(|| format!("direct connect to {orig_dst} failed"))
 }
 
 pub async fn handle_tcp_connection(
@@ -162,51 +139,93 @@ pub async fn handle_tcp_connection(
         tcp_peek_buffer_size: state.config.tcp_peek_buffer_size,
     };
 
-    let domain: Option<String> = if state.need_domain_sniff() {
-        sniff_domain(&client, orig_dst, &state.sniffers, &sniff_cfg).await
+    // 1. 先基于 IP 判断直连（不 sniff）
+    let direct_by_ip = state.should_direct(orig_dst.ip(), None);
+
+    // 2. 判断是否需要 sniff 域名
+    let need_sniff_for_geosite = state.need_geosite_sniff();
+    let need_sniff_for_upstream = state.need_upstream_domain_sniff(client_addr.ip());
+
+    // 只有以下情况才 sniff：
+    // - geosite 需要域名辅助决策（无论直连还是代理）
+    // - 或：IP 判断为代理，且 client_domain_routes 需要域名选 upstream
+    let domain: Option<String> =
+        if need_sniff_for_geosite || (!direct_by_ip && need_sniff_for_upstream) {
+            sniff_domain(&client, orig_dst, &state.sniffers, &sniff_cfg).await
+        } else {
+            None
+        };
+
+    // 3. 最终直连判断（使用域名，如果有 geosite）
+    let direct = if need_sniff_for_geosite {
+        state.should_direct(orig_dst.ip(), domain.as_deref())
     } else {
-        None
+        direct_by_ip
     };
 
-    // 分流判断
-    let direct = state.should_direct(orig_dst.ip(), domain.as_deref());
     let target = decide_tcp_upstream_target(orig_dst, direct, domain.as_deref());
 
-    // 分流：直连不碰 upstream，不评分
+    // 4. 代理路径上选 upstream 分组
     let (mut upstream, up) = match target {
         TcpUpstreamTarget::Direct(target) => {
             let s = direct_connect(target, state.config.fwmark).await?;
             (s, None)
         }
         _ => {
+            trace!(
+                client = %client_addr,
+                orig_dst = %orig_dst,
+                domain = ?domain,
+                "tcp upstream select"
+            );
+
             let group = if let Some(ref domain_str) = domain {
-                state
+                let domain_group = state
                     .runtime
                     .client_domain_routes
                     .lookup(client_addr.ip())
-                    .and_then(|t| t.lookup(domain_str))
-                    .or_else(|| {
-                        state
-                            .runtime
-                            .client_routes
-                            .lookup(client_addr.ip())
-                            .map(|s| s.as_str())
-                    })
+                    .and_then(|t| t.lookup(domain_str));
+                trace!(
+                    client_ip = %client_addr.ip(),
+                    domain = %domain_str,
+                    domain_result = %domain_group.unwrap_or("None"),
+                    "tcp client_domain_routes lookup"
+                );
+
+                let ip_group = state.runtime.client_routes.lookup(client_addr.ip());
+                trace!(
+                    client_ip = %client_addr.ip(),
+                    ip_result = %ip_group.map(|s| s.as_str()).unwrap_or("None"),
+                    "tcp client_routes lookup"
+                );
+
+                domain_group
+                    .or_else(|| ip_group.map(|s| s.as_str()))
                     .unwrap_or("default")
             } else {
-                state
-                    .runtime
-                    .client_routes
-                    .lookup(client_addr.ip())
-                    .map_or("default", |s| s.as_str())
+                let ip_group = state.runtime.client_routes.lookup(client_addr.ip());
+                trace!(
+                    client_ip = %client_addr.ip(),
+                    ip_result = %ip_group.map(|s| s.as_str()).unwrap_or("None"),
+                    "tcp client_routes lookup (no domain)"
+                );
+
+                ip_group.map_or("default", |s| s.as_str())
             };
+
+            trace!(
+                client = %client_addr,
+                group = %group,
+                "tcp selected group"
+            );
+
             let (s, up) = try_connect_socks5_group(&target, &state, group).await?;
             debug!(
-                "selected upstream {} at {} (score={:.0}) for {}",
-                up.id,
-                up.addr,
-                up.score(),
-                orig_dst
+                upstream_id = %up.id,
+                upstream_addr = %up.addr,
+                score = up.score(),
+                target = %orig_dst,
+                "selected upstream"
             );
             (s, Some(up))
         }
@@ -223,21 +242,21 @@ pub async fn handle_tcp_connection(
             // 只有 SOCKS5 路径才更新分数
             if let Some(ref up) = up {
                 info!(
-                    "TCP finished: orig_dst={}, upstream={}, score={:.0}, sent={}, recv={}, duration_ms={}",
-                    orig_dst,
-                    up.id,
-                    up.score(),
-                    sent,
-                    recv,
-                    duration.as_millis(),
+                    target = %orig_dst,
+                    upstream_id = %up.id,
+                    score = up.score(),
+                    sent = sent,
+                    recv = recv,
+                    duration_ms = duration.as_millis(),
+                    "TCP finished"
                 );
             } else {
                 info!(
-                    "TCP direct finished: orig_dst={}, duration_ms={}, sent={}, recv={}",
-                    orig_dst,
-                    duration.as_millis(),
-                    sent,
-                    recv,
+                    target = %orig_dst,
+                    duration_ms = duration.as_millis(),
+                    sent = sent,
+                    recv = recv,
+                    "TCP direct finished"
                 );
             }
             Ok(())
@@ -245,16 +264,17 @@ pub async fn handle_tcp_connection(
         Err(e) => {
             if let Some(ref up) = up {
                 error!(
-                    "TCP relay error: orig_dst={}, upstream={}, score={:.0}, error={:#}",
-                    orig_dst,
-                    up.id,
-                    up.score(),
-                    e
+                    target = %orig_dst,
+                    upstream_id = %up.id,
+                    score = up.score(),
+                    error = format!("{:#}", e),
+                    "TCP relay error"
                 );
             } else {
                 error!(
-                    "TCP direct relay error: orig_dst={}, error={:#}",
-                    orig_dst, e
+                    target = %orig_dst,
+                    error = format!("{:#}", e),
+                    "TCP direct relay error"
                 );
             }
             Err(e)
@@ -280,7 +300,11 @@ pub async fn run_tcp_port_forward(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                info!("port-forward TCP {} -> {} shutting down", listen_addr, remote);
+                info!(
+                    listen_addr = %listen_addr,
+                    remote = %remote,
+                    "port-forward TCP shutting down"
+                );
                 break;
             }
             res = listener.accept() => {
@@ -291,25 +315,29 @@ pub async fn run_tcp_port_forward(
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            debug!("port-forward TCP {} -> {} handler cancelled", peer_addr, remote);
+                            debug!(peer = %peer_addr, remote = %remote, "port-forward TCP handler cancelled");
                         }
                         _ = async {
                             let state = state_for_task;
-                            info!("port-forward TCP: {} -> {} via SOCKS5", peer_addr, remote);
+                            debug!(peer = %peer_addr, remote = %remote, "port-forward TCP via SOCKS5");
 
                             let target = TcpUpstreamTarget::Socks5Ip(remote);
                             let (mut upstream, up) = match try_connect_socks5_group(&target, &state, "default").await {
                                 Ok((s, up)) => {
                                     debug!(
-                                        "selected upstream {} at {} (score={:.0}) for port-forward {}",
-                                        up.id, up.addr, up.score(), remote
+                                        upstream_id = %up.id,
+                                        upstream_addr = %up.addr,
+                                        score = up.score(),
+                                        remote = %remote,
+                                        "selected upstream for port-forward"
                                     );
                                     (s, up)
                                 }
                                 Err(e) => {
                                     error!(
-                                        "port-forward upstream connect failed: remote={}, error={:#}",
-                                        remote, e
+                                        remote = %remote,
+                                        error = format!("{:#}", e),
+                                        "port-forward upstream connect failed"
                                     );
                                     return;
                                 }
@@ -327,14 +355,23 @@ pub async fn run_tcp_port_forward(
                             match splice_result {
                                 Ok((sent, recv)) => {
                                     info!(
-                                        "TCP port-forward finished: remote={}, peer={}, upstream={}, score={:.0}, sent={}, recv={}, duration_ms={}",
-                                        remote, peer_addr, up.id, up.score(), sent, recv, duration.as_millis(),
+                                        remote = %remote,
+                                        peer = %peer_addr,
+                                        upstream_id = %up.id,
+                                        score = up.score(),
+                                        sent = sent,
+                                        recv = recv,
+                                        duration_ms = duration.as_millis(),
+                                        "TCP port-forward finished"
                                     );
                                 }
                                 Err(e) => {
                                     error!(
-                                        "port-forward TCP relay error: remote={}, upstream={}, score={:.0}, error={:#}",
-                                        remote, up.id, up.score(), e
+                                        remote = %remote,
+                                        upstream_id = %up.id,
+                                        score = up.score(),
+                                        error = format!("{:#}", e),
+                                        "port-forward TCP relay error"
                                     );
                                 }
                             }
@@ -369,28 +406,28 @@ pub async fn tcp_accept_loop(
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
-                                    debug!("TCP handler {} cancelled", peer_addr);
+                                    debug!(peer = %peer_addr, "TCP handler cancelled");
                                 }
                                 _ = async {
                                     let state = state_for_task;
                                     let orig_dst = match stream.local_addr() {
                                         Ok(addr) => addr,
                                         Err(e) => {
-                                            error!("failed to get local_addr: {:#}", e);
+                                            error!(error = format!("{:#}", e), "failed to get local_addr");
                                             return;
                                         }
                                     };
 
-                                    info!("TCP connection: {} -> {}", peer_addr, orig_dst);
+                                    info!(peer = %peer_addr, orig_dst = %orig_dst, "TCP connection");
                                     if let Err(e) = handle_tcp_connection(stream, peer_addr, orig_dst, state).await {
-                                        error!("tcp {} handling error: {:#}", peer_addr, e);
+                                            error!(peer = %peer_addr, error = format!("{:#}", e), "tcp handling error");
                                     }
                                 } => {}
                             }
                         });
                     }
                     Err(e) => {
-                        error!("failed to accept TCP connection: {:#}", e);
+                        error!(error = format!("{:#}", e), "failed to accept TCP connection");
                     }
                 }
             }

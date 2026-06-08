@@ -123,15 +123,17 @@ impl Upstream {
                 // 50/50，历史与新数据同等权重
                 let blended = (old * 5 + raw * 5) / 10;
                 let speed_mibps = delta_bytes as f64 / 1024.0 / 1024.0 / delta_secs as f64;
+                let speed_str = format!("{:.2}", speed_mibps);
 
                 self.tcp_score.store(blended, Ordering::Relaxed);
+                let delta_mb = format!("{:.2}", delta_bytes as f64 / 1024.0 / 1024.0);
                 debug!(
-                    "upstream aggregate score: id={}, alive={}, delta_mb={:.2}, speed={:.2}MiB/s, score={}",
-                    self.id,
-                    alive,
-                    delta_bytes as f64 / 1024.0 / 1024.0,
-                    speed_mibps,
-                    blended,
+                    id = %self.id,
+                    alive = alive,
+                    delta_mb = %delta_mb,
+                    speed_mibps = %speed_str,
+                    score = blended,
+                    "upstream aggregate score"
                 );
             }
         }
@@ -282,8 +284,27 @@ impl UpstreamSet {
         group: &str,
         exclude_ctx: Option<&str>,
     ) -> Option<Arc<Upstream>> {
-        if items.is_empty() {
-            return None;
+        match items.len() {
+            0 => {
+                debug!(
+                    group = %group,
+                    exclude_ctx = ?exclude_ctx,
+                    "pick: no upstream available"
+                );
+                return None;
+            }
+            1 => {
+                let up = &items[0];
+                debug!(
+                    group = %group,
+                    exclude_ctx = ?exclude_ctx,
+                    upstream_id = %up.id,
+                    score = up.score(),
+                    "pick: single upstream"
+                );
+                return Some(Arc::clone(up));
+            }
+            _ => {}
         }
 
         // 1. 候选里的最高分
@@ -304,14 +325,26 @@ impl UpstreamSet {
                 let cur_score = cur.score();
                 if best.id != cur.id && best_score > cur_score + self.tolerance {
                     debug!(
-                        "pick: switch upstream {} (score={}) -> {} (score={}), tolerance={}",
-                        cur.id, cur_score, best.id, best_score, self.tolerance
+                        group = %group,
+                        exclude_ctx = ?exclude_ctx,
+                        from_upstream_id = %cur.id,
+                        from_score = cur_score,
+                        to_upstream_id = %best.id,
+                        to_score = best_score,
+                        tolerance = self.tolerance,
+                        "pick: switch upstream"
                     );
                     // 继续往下走，重新选
                 } else {
                     debug!(
-                        "pick: sticky upstream={}, score={}, best={} (score={}), tolerance={}",
-                        cur.id, cur_score, best.id, best_score, self.tolerance
+                        group = %group,
+                        exclude_ctx = ?exclude_ctx,
+                        upstream_id = %cur.id,
+                        score = cur_score,
+                        best_upstream_id = %best.id,
+                        best_score = best_score,
+                        tolerance = self.tolerance,
+                        "pick: keep sticky upstream"
                     );
                     return Some(Arc::clone(cur));
                 }
@@ -319,60 +352,75 @@ impl UpstreamSet {
         }
 
         // 3. 重新选：平方加权随机
-        let mut score_details = Vec::with_capacity(items.len());
+        let mut candidate_scores = Vec::with_capacity(items.len());
         let weights: Vec<u64> = items
             .iter()
             .map(|u| {
                 let s = u.score();
-                score_details.push(format!("{}={}", u.id, s));
+                candidate_scores.push((u.id.clone(), s));
                 (s as u64) * (s as u64) // 平方加权：高分优势放大
             })
             .collect();
-        let total: u64 = weights.iter().sum();
 
-        if let Some(id) = exclude_ctx {
-            debug!(
-                "pick: {} upstreams, total_weight={}, [{}], excluding={}",
-                items.len(),
-                total,
-                score_details.join(", "),
-                id,
-            );
-        } else {
-            debug!(
-                "pick: {} upstreams, total_weight={}, [{}]",
-                items.len(),
-                total,
-                score_details.join(", "),
-            );
-        }
+        let total_weight: u64 = weights.iter().sum();
 
-        let chosen = if total == 0 {
+        debug!(
+            group = %group,
+            exclude_ctx = ?exclude_ctx,
+            upstream_count = items.len(),
+            best_upstream_id = %best.id,
+            best_score = best_score,
+            total_weight = total_weight,
+            candidate_scores = ?candidate_scores,
+            "pick: candidate set"
+        );
+
+        let chosen = if total_weight == 0 {
             let idx = fastrand::usize(..items.len());
-            debug!("pick: total=0, random pick upstream={}", items[idx].id);
-            Arc::clone(&items[idx])
+            let chosen = Arc::clone(&items[idx]);
+            debug!(
+                group = %group,
+                exclude_ctx = ?exclude_ctx,
+                upstream_id = %chosen.id,
+                score = chosen.score(),
+                index = idx,
+                "pick: random pick upstream"
+            );
+            chosen
         } else {
-            let mut r = fastrand::u64(..total);
+            let mut r = fastrand::u64(..total_weight);
             let pick_r = r;
             let mut picked = None;
+
             for (i, w) in weights.iter().enumerate() {
                 if r < *w {
+                    let chosen = Arc::clone(&items[i]);
                     debug!(
-                        "pick: weighted pick upstream={}, raw_score={}, weight={}, r={}/{}",
-                        items[i].id,
-                        items[i].score(),
-                        w,
-                        pick_r,
-                        total
+                        group = %group,
+                        exclude_ctx = ?exclude_ctx,
+                        upstream_id = %chosen.id,
+                        score = chosen.score(),
+                        weight = *w,
+                        rand = pick_r,
+                        total_weight = total_weight,
+                        "pick: weighted pick upstream"
                     );
-                    picked = Some(Arc::clone(&items[i]));
+                    picked = Some(chosen);
                     break;
                 }
-                r -= w;
+                r -= *w;
             }
+
             picked.unwrap_or_else(|| {
-                debug!("pick: fallback to first upstream={}", items[0].id);
-                Arc::clone(&items[0])
+                let chosen = Arc::clone(&items[0]);
+                debug!(
+                    group = %group,
+                    exclude_ctx = ?exclude_ctx,
+                    upstream_id = %chosen.id,
+                    score = chosen.score(),
+                    "pick: fallback to first upstream"
+                );
+                chosen
             })
         };
 
@@ -381,6 +429,7 @@ impl UpstreamSet {
             .lock()
             .expect("bad current lock")
             .insert(group.to_string(), Some(chosen.id.clone()));
+
         Some(chosen)
     }
 
@@ -447,20 +496,20 @@ pub async fn run_upstream_stats_listener(
     let sock = match UnixDatagram::bind(PATH) {
         Ok(s) => s,
         Err(e) => {
-            error!("stats listener bind failed at {}: {}", PATH, e);
+            error!(path = %PATH, error = format!("{:#}", e), "stats listener bind failed");
             return;
         }
     };
 
     #[cfg(target_os = "linux")]
     if let Err(e) = std::fs::set_permissions(PATH, std::fs::Permissions::from_mode(0o777)) {
-        error!("stats listener chmod failed: {}", e);
+        error!(error = format!("{:#}", e), "stats listener chmod failed");
         // chmod 失败但 socket 已创建，清理掉避免残留
         let _ = tokio::fs::remove_file(PATH).await;
         return;
     }
 
-    info!("upstream stats listener bound to {}", PATH);
+    info!(path = %PATH, "upstream stats listener bound");
 
     let mut buf = vec![0u8; 2048];
 
@@ -477,20 +526,20 @@ pub async fn run_upstream_stats_listener(
                        let rep: ShadowQuicReport = match serde_json::from_slice(&buf[..n]) {
                            Ok(r) => r,
                            Err(e) => {
-                               trace!("upstream stats JSON parse failed: {}", e);
+                                error!(error = format!("{:#}", e), "upstream stats JSON parse failed");
                                continue;
                            }
                        };
 
-                       trace!(
-                           "upstream stats: id={} peer={}, rtt={}ms loss={:.2}% mtu={} link={:?}",
-                           rep.upstream_id,
-                           rep.peer,
-                           rep.rtt_ms,
-                           rep.loss_rate * 100.0,
-                           rep.mtu,
-                           rep.link,
-                       );
+                        debug!(
+                            upstream_id = %rep.upstream_id,
+                            peer = %rep.peer,
+                            rtt_ms = rep.rtt_ms,
+                            loss_percent = rep.loss_rate * 100.0,
+                            mtu = rep.mtu,
+                            link = %rep.link.as_deref().unwrap_or("none"),
+                            "upstream stats report"
+                        );
 
                        let state = state_swap.load();
 
@@ -508,7 +557,9 @@ pub async fn run_upstream_stats_listener(
                         }
                    }
                    Err(e) => {
-                       error!("stats recv error: {}", e);
+                        error!(
+                            path = %PATH, error = format!("{:#}", e), "stats recv error"
+                        );
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => {
@@ -605,7 +656,7 @@ async fn check_upstream_health(
 
 pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationToken) {
     let interval_secs = state.config.health_check_interval_secs;
-    info!("health check task started, interval={}s", interval_secs);
+    info!(interval_secs = interval_secs, "health check task started");
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -651,33 +702,40 @@ pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationTok
                 let failures = up.health_failures.swap(0, Ordering::Relaxed);
                 if failures > 0 {
                     debug!(
-                        "upstream {} health check ok (recovered from {} failures)",
-                        up.id, failures
+                        id = %up.id,
+                        failures = failures,
+                        "upstream health check ok (recovered)"
                     );
                 } else {
-                    debug!("upstream {} health check ok", up.id);
+                    debug!(id = %up.id, "upstream health check ok");
                 }
                 if failures >= fail_threshold {
                     up.tcp_score.store(300, Ordering::Relaxed);
-                    info!("upstream {} health recovered, score reset to 300", up.id);
+                    info!(id = %up.id, "upstream health recovered, score reset to 300");
                 }
             } else {
                 let f = up.health_failures.fetch_add(1, Ordering::Relaxed) + 1;
                 if f == fail_threshold {
                     up.penalize();
                     warn!(
-                        "upstream {} health check dead, penalized ({}/{})",
-                        up.id, f, fail_threshold
+                        id = %up.id,
+                        failures = f,
+                        threshold = fail_threshold,
+                        "upstream health check dead, penalized"
                     );
                 } else if f > fail_threshold {
                     debug!(
-                        "upstream {} health check still dead ({}/{})",
-                        up.id, f, fail_threshold
+                        id = %up.id,
+                        failures = f,
+                        threshold = fail_threshold,
+                        "upstream health check still dead"
                     );
                 } else {
                     debug!(
-                        "upstream {} health check failed ({}/{})",
-                        up.id, f, fail_threshold
+                        id = %up.id,
+                        failures = f,
+                        threshold = fail_threshold,
+                        "upstream health check failed"
                     );
                 }
             }

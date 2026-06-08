@@ -25,11 +25,8 @@ pub fn now_secs() -> u64 {
 }
 
 pub fn hex_encode(data: &[u8]) -> String {
-    let mut s = String::new();
-    for (i, b) in data.iter().enumerate() {
-        if i > 0 {
-            s.push(' ');
-        }
+    let mut s = String::with_capacity(data.len() * 2);
+    for b in data.iter() {
         use std::fmt::Write;
         let _ = write!(&mut s, "{:02x}", b);
     }
@@ -90,10 +87,10 @@ pub fn warn_if_splice_with_forwarding(splice_enabled: bool) {
     let v6 = read_proc("ipv6/conf/all/forwarding");
     if v4 || v6 {
         warn!(
-            "splice=1 but ip_forward detected (ipv4={}, ipv6={}). \
-             splice() may underperform on forwarding paths due to skb linearization. \
-             Please see https://github.com/XTLS/Xray-core/discussions/59",
-            v4, v6
+            ipv4 = v4,
+            ipv6 = v6,
+            "splice=1 but ip_forward detected; splice() may underperform on forwarding paths due to skb linearization. \
+            Please see https://github.com/XTLS/Xray-core/discussions/59"
         );
     }
 }
@@ -324,7 +321,7 @@ impl TaskGuard {
                     // 正常退出
                 }
                 Ok(Err(e)) => {
-                    warn!("task exited with JoinError: {}", e);
+                    warn!(error = format!("{:#}", e), "task exited with JoinError");
                 }
                 Err(_) => {
                     handle.abort();

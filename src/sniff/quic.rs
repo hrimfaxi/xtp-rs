@@ -212,8 +212,8 @@ fn quic_build_nonce(iv: &[u8; 12], packet_number: u64) -> [u8; 12] {
 fn quic_parse_tls_client_hello_from_crypto(crypto: &[u8]) -> Result<String, UdpSniffError> {
     if crypto.len() < 4 {
         trace!(
-            "QUIC crypto insufficient: contiguous_len={}, need handshake header",
-            crypto.len()
+            contiguous_len = crypto.len(),
+            "QUIC crypto insufficient: need handshake header"
         );
         return Err(UdpSniffError::InsufficientPrefix);
     }
@@ -223,9 +223,9 @@ fn quic_parse_tls_client_hello_from_crypto(crypto: &[u8]) -> Result<String, UdpS
     let hs_len = be_u24(&crypto[1..4]).map_err(|_| UdpSniffError::ParseError)?;
     let total = 4usize.checked_add(hs_len).ok_or(UdpSniffError::TooLarge)?;
     trace!(
-        "QUIC crypto ClientHello progress: contiguous_len={}, needed_total={}",
-        crypto.len(),
-        total
+        contiguous_len = crypto.len(),
+        needed_total = total,
+        "QUIC crypto ClientHello progress"
     );
     if total > QUIC_CRYPTO_REASSEMBLY_CAP {
         return Err(UdpSniffError::TooLarge);

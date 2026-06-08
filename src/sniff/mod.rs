@@ -106,27 +106,27 @@ pub fn should_retry_sniff(
 ) -> bool {
     if attempt >= max_retries {
         debug!(
-            "{} sniff stop: reason=max_retries_exceeded, dst={}, attempts={}, peek_len={}",
-            engine_name,
-            orig_dst,
-            attempt + 1,
-            cur_len
+            engine = engine_name,
+            dst = %orig_dst,
+            attempts = attempt + 1,
+            peek_len = cur_len,
+            "sniff stop: max_retries_exceeded"
         );
         return false;
     }
 
     if cur_len == 0 {
-        debug!(
-            "{} sniff stop: reason=peek_empty, dst={}",
-            engine_name, orig_dst
-        );
+        debug!(engine = engine_name, dst = %orig_dst, "sniff stop: peek_empty");
         return false;
     }
 
     if cur_len <= last_peek_len {
         debug!(
-            "{} sniff stop: reason=no_progress, dst={}, attempt={}, peek_len={}",
-            engine_name, orig_dst, attempt, cur_len
+            engine = engine_name,
+            dst = %orig_dst,
+            attempt = attempt,
+            peek_len = cur_len,
+            "sniff stop: no_progress"
         );
         return false;
     }
@@ -156,11 +156,11 @@ pub async fn sniff_with_engine(
                 Ok(buf) => buf,
                 Err(e) => {
                     debug!(
-                        "{} sniff failed: reason=peek_failed, dst={}, attempt={}, error={:#}",
-                        engine.name(),
-                        orig_dst,
-                        attempt,
-                        e
+                        engine = engine.name(),
+                        dst = %orig_dst,
+                        attempt = attempt,
+                        error = format!("{:#}", e),
+                        "sniff failed: peek_failed"
                     );
                     return None;
                 }
@@ -171,22 +171,22 @@ pub async fn sniff_with_engine(
             match engine.classify(&buf, max_len) {
                 SniffAttempt::Matched(host) => {
                     debug!(
-                        "{} sniff success: dst={}, host={}, attempt={}, peek_len={}",
-                        engine.name(),
-                        orig_dst,
-                        host,
-                        attempt,
-                        cur_len
+                        engine = engine.name(),
+                        dst = %orig_dst,
+                        host = %host,
+                        attempt = attempt,
+                        peek_len = cur_len,
+                        "sniff success"
                     );
                     return Some(host);
                 }
                 SniffAttempt::NeedMore => {
                     debug!(
-                        "{} sniff retryable failure: reason=insufficient_prefix, dst={}, attempt={}, peek_len={}",
-                        engine.name(),
-                        orig_dst,
-                        attempt,
-                        cur_len
+                        engine = engine.name(),
+                        dst = %orig_dst,
+                        attempt = attempt,
+                        peek_len = cur_len,
+                        "sniff retryable failure: insufficient_prefix"
                     );
 
                     if !should_retry_sniff(
@@ -205,11 +205,11 @@ pub async fn sniff_with_engine(
                     let next_len = (peek_len.saturating_mul(2)).min(max_len);
                     if next_len <= peek_len {
                         debug!(
-                            "{} sniff stop: reason=max_peek_reached, dst={}, attempt={}, peek_len={}",
-                            engine.name(),
-                            orig_dst,
-                            attempt,
-                            cur_len
+                            engine = engine.name(),
+                            dst = %orig_dst,
+                            attempt = attempt,
+                            peek_len = cur_len,
+                            "sniff stop: max_peek_reached"
                         );
                         return None;
                     }
@@ -223,21 +223,21 @@ pub async fn sniff_with_engine(
                         }
                         Ok(None) => {
                             debug!(
-                                "{} sniff stop: reason=no_more_peek_growth, dst={}, attempt={}, peek_len={}",
-                                engine.name(),
-                                orig_dst,
-                                attempt,
-                                cur_len
+                                engine = engine.name(),
+                                dst = %orig_dst,
+                                attempt = attempt,
+                                peek_len = cur_len,
+                                "sniff stop: no_more_peek_growth"
                             );
                             return None;
                         }
                         Err(e) => {
                             debug!(
-                                "{} sniff stop: reason=wait_more_failed, dst={}, attempt={}, error={:#}",
-                                engine.name(),
-                                orig_dst,
-                                attempt,
-                                e
+                                engine = engine.name(),
+                                dst = %orig_dst,
+                                attempt = attempt,
+                                error = format!("{:#}", e),
+                                "sniff stop: wait_more_failed"
                             );
                             return None;
                         }
@@ -245,12 +245,12 @@ pub async fn sniff_with_engine(
                 }
                 SniffAttempt::Abort(err) => {
                     debug!(
-                        "{} sniff failed: reason={}, dst={}, attempt={}, peek_len={}",
-                        engine.name(),
-                        engine.map_error_reason(err),
-                        orig_dst,
-                        attempt,
-                        cur_len
+                        engine = engine.name(),
+                        reason = engine.map_error_reason(err),
+                        dst = %orig_dst,
+                        attempt = attempt,
+                        peek_len = cur_len,
+                        "sniff failed",
                     );
                     return None;
                 }
@@ -262,10 +262,10 @@ pub async fn sniff_with_engine(
         Ok(v) => v,
         Err(_) => {
             debug!(
-                "{} sniff failed: reason=timeout, dst={}, timeout_ms={}",
-                engine.name(),
-                orig_dst,
-                timeout.as_millis()
+                engine = engine.name(),
+                dst = %orig_dst,
+                timeout_ms = timeout.as_millis(),
+                "sniff failed: timeout"
             );
             None
         }

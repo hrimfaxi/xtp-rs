@@ -117,23 +117,23 @@ impl UdpSession {
         match &self.outbound {
             UdpOutbound::Direct { socket } => {
                 trace!(
-                    "UDP direct send: kind={:?}, client={}, target={}, payload_len={}",
-                    key.kind,
-                    key.client_addr,
-                    key.target_addr,
-                    payload.len()
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    payload_len = payload.len(),
+                    "UDP direct send"
                 );
 
                 match socket.send(payload).await {
                     Ok(sent) => Ok(sent),
                     Err(e) if is_io_emsgsize(&e) => {
                         warn!(
-                            "UDP datagram dropped due to EMSGSIZE: direction=client_to_direct, kind={:?}, client={}, target={}, payload_len={}, error={}",
-                            key.kind,
-                            key.client_addr,
-                            key.target_addr,
-                            payload.len(),
-                            e
+                            kind = ?key.kind,
+                            client = %key.client_addr,
+                            target = %key.target_addr,
+                            payload_len = payload.len(),
+                            error = format!("{:#}", e),
+                            "UDP datagram dropped due to EMSGSIZE"
                         );
                         Ok(0)
                     }
@@ -159,36 +159,40 @@ impl UdpSession {
                     Ok(pkt) => pkt,
                     Err(e) => {
                         warn!(
-                            "UDP SOCKS5 packet build failed: kind={:?}, client={}, target={}, sniffed_host={:?}, error={:#}",
-                            key.kind, key.client_addr, key.target_addr, self.spec.sniffed_host, e
+                            kind = ?key.kind,
+                            client = %key.client_addr,
+                            target = %key.target_addr,
+                            sniffed_host = ?self.spec.sniffed_host,
+                            error = format!("{:#}", e),
+                            "UDP SOCKS5 packet build failed"
                         );
                         return Ok(0);
                     }
                 };
 
                 trace!(
-                    "UDP SOCKS5 send: kind={:?}, client={}, original_target={}, socks_target={}, payload_len={}, pkt_len={}, relay={}",
-                    key.kind,
-                    key.client_addr,
-                    key.target_addr,
-                    socks_target_log,
-                    payload.len(),
-                    pkt.len(),
-                    assoc.relay_addr
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    socks_target = %socks_target_log,
+                    payload_len = payload.len(),
+                    pkt_len = pkt.len(),
+                    relay = %assoc.relay_addr,
+                    "UDP SOCKS5 send"
                 );
 
                 match assoc.udp_socket.send(&pkt).await {
                     Ok(sent) => Ok(sent),
                     Err(e) if is_io_emsgsize(&e) => {
                         warn!(
-                            "UDP datagram dropped due to EMSGSIZE: direction=client_to_socks5, kind={:?}, client={}, target={}, payload_len={}, socks_pkt_len={}, relay={}, error={}",
-                            key.kind,
-                            key.client_addr,
-                            key.target_addr,
-                            payload.len(),
-                            pkt.len(),
-                            assoc.relay_addr,
-                            e
+                            kind = ?key.kind,
+                            client = %key.client_addr,
+                            target = %key.target_addr,
+                            payload_len = payload.len(),
+                            pkt_len = pkt.len(),
+                            relay = %assoc.relay_addr,
+                            error = format!("{:#}", e),
+                            "UDP datagram dropped due to EMSGSIZE: direction=client_to_socks5"
                         );
                         Ok(0)
                     }
