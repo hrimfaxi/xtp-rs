@@ -241,7 +241,7 @@ pub async fn handle_tcp_connection(
         Ok((sent, recv)) => {
             // 只有 SOCKS5 路径才更新分数
             if let Some(ref up) = up {
-                info!(
+                debug!(
                     target = %orig_dst,
                     upstream_id = %up.id,
                     score = up.score(),
@@ -251,7 +251,7 @@ pub async fn handle_tcp_connection(
                     "TCP finished"
                 );
             } else {
-                info!(
+                debug!(
                     target = %orig_dst,
                     duration_ms = duration.as_millis(),
                     sent = sent,
@@ -418,7 +418,7 @@ pub async fn tcp_accept_loop(
                                         }
                                     };
 
-                                    info!(peer = %peer_addr, orig_dst = %orig_dst, "TCP connection");
+                                    debug!(peer = %peer_addr, orig_dst = %orig_dst, "TCP connection");
                                     if let Err(e) = handle_tcp_connection(stream, peer_addr, orig_dst, state).await {
                                             error!(peer = %peer_addr, error = format!("{:#}", e), "tcp handling error");
                                     }

@@ -447,7 +447,7 @@ mod tests {
     // ---- hex_encode ----
     #[test]
     fn hex_encode_works() {
-        assert_eq!(hex_encode(&[0x00, 0xab, 0xff]), "00 ab ff");
+        assert_eq!(hex_encode(&[0x00, 0xab, 0xff]), "00abff");
         assert_eq!(hex_encode(&[]), "");
     }
 

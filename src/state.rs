@@ -531,8 +531,8 @@ impl AppState {
                 let mut exact = HashMap::new();
                 let mut suffixes = Vec::new();
                 for (domain_key, group) in domain_map {
-                    if domain_key.starts_with('.') {
-                        let suffix_norm = canonical_domain(&domain_key[1..]);
+                    if let Some(stripped) = domain_key.strip_prefix('.') {
+                        let suffix_norm = canonical_domain(stripped);
                         if suffix_norm.is_empty() {
                             bail!(
                                 "empty suffix domain pattern '{}' in client_domain_routes for IP '{}'",
@@ -554,7 +554,7 @@ impl AppState {
                     }
                 }
                 // 按后缀长度降序，保证最长匹配优先
-                suffixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                suffixes.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
                 routes.insert(net, DomainRouteTable { exact, suffixes });
             }
             routes.finalize();

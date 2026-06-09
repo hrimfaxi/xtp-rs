@@ -119,7 +119,7 @@ impl UdpRuntime {
                 sessions.insert(key, UdpSessionEntry::Ready(session.clone()));
                 creating_notify.notify_waiters();
 
-                info!(
+                debug!(
                     kind = ?key.kind,
                     client = %key.client_addr,
                     target = %key.target_addr,

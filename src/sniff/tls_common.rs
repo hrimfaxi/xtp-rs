@@ -28,6 +28,10 @@ pub fn be_u24(b: &[u8]) -> Result<usize, TlsSniffError> {
     Ok(((b[0] as usize) << 16) | ((b[1] as usize) << 8) | (b[2] as usize))
 }
 
+fn is_filtered_ech_outer_name(host: &str) -> bool {
+    host == "cloudflare-ech.com"
+}
+
 pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffError> {
     if body.len() < 2 + 32 + 1 {
         return Err(TlsSniffError::ParseError);
@@ -140,8 +144,10 @@ pub fn parse_sni_from_client_hello_body(body: &[u8]) -> Result<String, TlsSniffE
         return Err(TlsSniffError::ParseError);
     }
 
-    // 只要有明文 SNI，就直接使用（即使同时有 ECH，也认为是 GREASE 填充）
-    if let Some(host) = found_sni {
+    // 明文 SNI 默认直接使用；若命中已知 ECH cover/outer name，则忽略它，后续按无可用 SNI 处理。
+    if let Some(host) = found_sni
+        && !is_filtered_ech_outer_name(&host)
+    {
         return Ok(host);
     }
 

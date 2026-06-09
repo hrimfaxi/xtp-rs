@@ -122,8 +122,8 @@ impl Upstream {
                 let old = self.tcp_score.load(Ordering::Relaxed);
                 // 50/50，历史与新数据同等权重
                 let blended = (old * 5 + raw * 5) / 10;
-                let speed_mibps = delta_bytes as f64 / 1024.0 / 1024.0 / delta_secs as f64;
-                let speed_str = format!("{:.2}", speed_mibps);
+                let speed_mbps = 8.0 * delta_bytes as f64 / 1_000_000.0 / delta_secs as f64;
+                let speed_str = format!("{:.2}", speed_mbps);
 
                 self.tcp_score.store(blended, Ordering::Relaxed);
                 let delta_mb = format!("{:.2}", delta_bytes as f64 / 1024.0 / 1024.0);
@@ -131,7 +131,7 @@ impl Upstream {
                     id = %self.id,
                     alive = alive,
                     delta_mb = %delta_mb,
-                    speed_mibps = %speed_str,
+                    speed_mbps = %speed_str,
                     score = blended,
                     "upstream aggregate score"
                 );
@@ -531,11 +531,13 @@ pub async fn run_upstream_stats_listener(
                            }
                        };
 
+                        let loss_percent_cents = (rep.loss_rate * 100.0).round() as i32;
+
                         debug!(
                             upstream_id = %rep.upstream_id,
                             peer = %rep.peer,
                             rtt_ms = rep.rtt_ms,
-                            loss_percent = rep.loss_rate * 100.0,
+                            loss_percent = loss_percent_cents,
                             mtu = rep.mtu,
                             link = %rep.link.as_deref().unwrap_or("none"),
                             "upstream stats report"
