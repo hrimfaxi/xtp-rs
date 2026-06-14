@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, oneshot};
+use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
@@ -24,9 +25,17 @@ use crate::socket_factory::create_direct_udp_socket;
 use crate::socks5::socks5_udp_associate_for_client;
 use crate::state::AppState;
 use crate::udp::fake::FakeUdpManager;
-use crate::udp::pending::{PendingUdpSniff, handle_udp_client_payload, reap_pending_udp_sniff};
+use crate::udp::pending::{PendingSniffMap, handle_udp_client_payload, reap_pending_udp_sniff};
 use crate::udp::tproxy::TProxyUdpSocket;
-use crate::util::{hex_encode, is_anyhow_emsgsize, is_io_emsgsize, new_aligned_udp_buf, now_secs};
+use crate::util::{
+    hex_encode, is_anyhow_emsgsize, is_io_emsgsize, new_udp_buf, now_secs, reset_udp_buf,
+};
+
+// 每个 UdpSessionKey 的串行锁：空 Mutex 只用于互斥，不存数据。
+type UdpKeyLock = Arc<tokio::sync::Mutex<()>>;
+
+// 当前 UDP loop 的 key_lock 表。
+type UdpKeyLocks = Arc<tokio::sync::Mutex<HashMap<UdpSessionKey, UdpKeyLock>>>;
 
 pub struct UdpRuntime {
     sessions: Mutex<HashMap<UdpSessionKey, UdpSessionEntry>>,
@@ -67,6 +76,7 @@ impl UdpRuntime {
                 }
                 Some(UdpSessionEntry::Creating(notify)) => {
                     let notify = notify.clone();
+                    let notified = notify.notified();
                     drop(sessions);
 
                     debug!(
@@ -76,7 +86,7 @@ impl UdpRuntime {
                         "UDP session is being created, waiting"
                     );
 
-                    notify.notified().await;
+                    notified.await;
                     continue;
                 }
                 None => {
@@ -116,6 +126,11 @@ impl UdpRuntime {
 
         match created {
             Ok(session) => {
+                if session.cancel.is_cancelled() {
+                    sessions.remove(&key);
+                    creating_notify.notify_waiters();
+                    return Err(anyhow!("UDP session recv loop exited before registration"));
+                }
                 sessions.insert(key, UdpSessionEntry::Ready(session.clone()));
                 creating_notify.notify_waiters();
 
@@ -391,12 +406,16 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
                     "selected upstream for UDP"
                 );
 
-                let assoc = socks5_udp_associate_for_client(
-                    up.addr,
-                    state.config.fwmark,
-                    state.socks5_credentials(),
+                let assoc = tokio::time::timeout(
+                    std::time::Duration::from_secs(state.config.connect_timeout_secs),
+                    socks5_udp_associate_for_client(
+                        up.addr,
+                        state.config.fwmark,
+                        state.socks5_credentials(),
+                    ),
                 )
-                .await?;
+                .await
+                .map_err(|_| anyhow::anyhow!("SOCKS5 UDP ASSOCIATE timeout"))??;
                 UdpOutbound::Socks5 { assoc }
             }
         }
@@ -419,12 +438,16 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
                 "selected upstream for UDP"
             );
 
-            let assoc = socks5_udp_associate_for_client(
-                up.addr,
-                state.config.fwmark,
-                state.socks5_credentials(),
+            let assoc = tokio::time::timeout(
+                std::time::Duration::from_secs(state.config.connect_timeout_secs),
+                socks5_udp_associate_for_client(
+                    up.addr,
+                    state.config.fwmark,
+                    state.socks5_credentials(),
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!("SOCKS5 UDP ASSOCIATE timeout"))??;
             UdpOutbound::Socks5 { assoc }
         }
     };
@@ -444,7 +467,18 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
         let state = state.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = run_udp_session_recv_loop(session, state, ready_tx).await {
+            let result = run_udp_session_recv_loop(session.clone(), state.clone(), ready_tx).await;
+            session.cancel.cancel();
+            let mut map = state.runtime.udp.sessions.lock().await;
+            let should_remove = matches!(
+                map.get(&key),
+                Some(UdpSessionEntry::Ready(current)) if Arc::ptr_eq(current, &session)
+            );
+            if should_remove {
+                map.remove(&key);
+            }
+            drop(map);
+            if let Err(e) = result {
                 warn!(error = format!("{:#}", e), "UDP session recv loop exited");
             }
         })
@@ -500,11 +534,11 @@ async fn run_direct_udp_recv_loop(
     ready_tx: oneshot::Sender<()>,
 ) -> Result<()> {
     let key = session.key();
-    let mut buf = new_aligned_udp_buf();
-
+    let mut buf = new_udp_buf();
     let _ = ready_tx.send(());
 
     loop {
+        reset_udp_buf(&mut buf);
         tokio::select! {
             biased;
             _ = session.cancel.cancelled() => {
@@ -553,12 +587,13 @@ async fn run_socks5_udp_recv_loop(
     ready_tx: oneshot::Sender<()>,
 ) -> Result<()> {
     let key = session.key();
-    let mut buf = new_aligned_udp_buf();
+    let mut buf = new_udp_buf();
     let relay_local = relay_sock.local_addr().ok();
 
     let _ = ready_tx.send(());
 
     loop {
+        reset_udp_buf(&mut buf);
         tokio::select! {
             biased;
             _ = session.cancel.cancelled() => {
@@ -665,18 +700,48 @@ pub async fn run_udp_gc_loop(state: Arc<AppState>, cancel: CancellationToken) {
     }
 }
 
+// 获取指定 UdpSessionKey 的串行锁。
+// 如果该 key 之前没有锁，就新建一个插入全局表并返回；
+// 如果已有，直接返回已有的。这样同一个 key 的所有 UDP 包
+// 共享同一把 Mutex，自然串行。
+async fn get_udp_key_lock(key_locks: &UdpKeyLocks, key: UdpSessionKey) -> UdpKeyLock {
+    let mut guard = key_locks.lock().await;
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+// 清理 key_lock 表中已经空闲的锁。
+// Arc::strong_count(lock) == 1 表示只有 map 自己持有这把锁，
+// 没有任何活跃或排队的 packet task 在使用它，可以安全删除。
+async fn reap_idle_udp_key_locks(key_locks: &UdpKeyLocks) {
+    let mut guard = key_locks.lock().await;
+    // strong_count == 1 表示只有 map 持有，没有活跃 task 在等待或使用
+    guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+}
+
 pub async fn run_udp_loop(
     state: Arc<AppState>,
     tproxy_udp: UdpSocket,
     cancel: CancellationToken,
 ) -> Result<()> {
     let tproxy_udp = TProxyUdpSocket::new(tproxy_udp);
-    let mut buf = new_aligned_udp_buf();
+    let mut buf = new_udp_buf();
 
-    let mut pending_sniff: HashMap<UdpSessionKey, PendingUdpSniff> = HashMap::new();
+    // UDP 包并发上限：每包 spawn 一个 task，超限丢弃
+    const UDP_PACKET_TASK_LIMIT: usize = 4096;
+    // 防 task 风暴
+    let packet_sem = Arc::new(tokio::sync::Semaphore::new(UDP_PACKET_TASK_LIMIT));
+
+    // 防同 key 并发
+    let key_locks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // 共享 sniff 状态
+    let pending_sniff = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let mut last_pending_reap_secs = now_secs();
 
     loop {
+        reset_udp_buf(&mut buf);
         let packet = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -697,25 +762,29 @@ pub async fn run_udp_loop(
         let now = now_secs();
         if now.saturating_sub(last_pending_reap_secs) >= UDP_SNIFF_REAP_INTERVAL_SECS {
             last_pending_reap_secs = now;
-            reap_pending_udp_sniff(state.clone(), &mut pending_sniff).await;
+            reap_pending_udp_sniff(state.clone(), pending_sniff.clone()).await;
+            // 顺带清理无 task 使用的 idle key_lock，防内存泄漏
+            reap_idle_udp_key_locks(&key_locks).await;
         }
 
         if packet.len == 0 {
             continue;
         }
 
-        let payload = &buf[..packet.len];
-
+        // 零拷贝：从 BytesMut 切出已填充的前 n 字节，冻结为不可变的 Bytes。
+        // 底层数据不复制，仅做引用计数拆分；split 后 buf 指向剩余尾部。
+        let payload = buf.split_to(packet.len).freeze();
         let spec = UdpSessionSpec::for_tproxy(packet.client_addr, packet.orig_dst);
 
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                info!("UDP tproxy loop shutting down during packet handling");
-                break;
-            }
-            _ = handle_udp_client_payload(state.clone(), &mut pending_sniff, spec, payload) => {}
-        }
+        spawn_udp_packet_handler(
+            state.clone(),
+            packet_sem.clone(),
+            key_locks.clone(),
+            pending_sniff.clone(),
+            spec,
+            payload,
+        )
+        .await;
     }
 
     Ok(())
@@ -733,11 +802,15 @@ pub async fn run_udp_port_forward(
         listen_addr, remote
     );
 
-    let mut buf = new_aligned_udp_buf();
-    let mut pending_sniff: HashMap<UdpSessionKey, PendingUdpSniff> = HashMap::new();
+    let mut buf = new_udp_buf();
+    const UDP_PACKET_TASK_LIMIT: usize = 4096;
+    let packet_sem = Arc::new(tokio::sync::Semaphore::new(UDP_PACKET_TASK_LIMIT));
+    let key_locks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_sniff = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let mut last_pending_reap_secs = now_secs();
 
     loop {
+        reset_udp_buf(&mut buf);
         let (n, client_addr) = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -757,33 +830,64 @@ pub async fn run_udp_port_forward(
 
         if now.saturating_sub(last_pending_reap_secs) >= UDP_SNIFF_REAP_INTERVAL_SECS {
             last_pending_reap_secs = now;
-            reap_pending_udp_sniff(state.clone(), &mut pending_sniff).await;
+            reap_pending_udp_sniff(state.clone(), pending_sniff.clone()).await;
+            reap_idle_udp_key_locks(&key_locks).await;
         }
 
         if n == 0 {
             continue;
         }
 
-        let payload = &buf[..n];
-
+        let payload = buf.split_to(n).freeze();
         let spec =
             UdpSessionSpec::for_port_forward(listen_addr, client_addr, remote, listen_sock.clone());
 
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                info!(
-                    listen_addr = %listen_addr,
-                    remote = %remote,
-                    "port-forward UDP shutting down during packet handling"
-                );
-                break;
-            }
-            _ = handle_udp_client_payload(state.clone(), &mut pending_sniff, spec, payload) => {}
-        }
+        spawn_udp_packet_handler(
+            state.clone(),
+            packet_sem.clone(),
+            key_locks.clone(),
+            pending_sniff.clone(),
+            spec,
+            payload,
+        )
+        .await;
     }
 
     Ok(())
+}
+
+// 将单个 UDP 包丢进后台 task 处理。
+// 流程：先抢全局并发许可 → 再拿该 key 的串行锁 → 最后 spawn。
+// 如果 Semaphore 已满，直接丢弃报文并打 debug 日志。
+async fn spawn_udp_packet_handler(
+    state: Arc<AppState>,
+    packet_sem: Arc<tokio::sync::Semaphore>,
+    key_locks: UdpKeyLocks,
+    pending_sniff: PendingSniffMap,
+    spec: UdpSessionSpec,
+    payload: Bytes,
+) {
+    // 1. 抢当前 UDP loop 的并发许可。失败说明该 loop 已有 4096 个 task 在跑，直接丢包。
+    let Ok(permit) = packet_sem.try_acquire_owned() else {
+        debug!(
+            kind = ?spec.key.kind,
+            client = %spec.key.client_addr,
+            target = %spec.key.target_addr,
+            "UDP packet worker overloaded, dropping packet"
+        );
+        return;
+    };
+
+    // 2. 获取该 key 的串行锁。没有就新建，有就复用。
+    let key_lock = get_udp_key_lock(&key_locks, spec.key).await;
+
+    // 3.  spawn 后台 task。_permit 和 _key_guard 随 task 结束自动释放。
+    // 直接使用 payload，无需拷贝；内部函数如果期望 &[u8]，传 &payload
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _key_guard = key_lock.lock().await;
+        handle_udp_client_payload(state, pending_sniff, spec, &payload).await;
+    });
 }
 
 fn connected_udp_recv_result(

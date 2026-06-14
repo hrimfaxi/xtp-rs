@@ -112,6 +112,10 @@ impl UdpSession {
     }
 
     pub(crate) async fn send_payload(&self, payload: &[u8]) -> Result<usize> {
+        if self.cancel.is_cancelled() {
+            anyhow::bail!("UDP session cancelled");
+        }
+
         let key = self.key();
 
         match &self.outbound {

@@ -976,6 +976,7 @@ mod tests {
             proxy_geosite_tags: vec![],
             client_routes: HashMap::new(),
             client_domain_routes: HashMap::new(),
+            connect_timeout_secs: 20,
         }
     }
 

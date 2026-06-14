@@ -1,4 +1,3 @@
-use aligned_vec::{AVec, RuntimeAlign};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use iptrie::{Ipv4Prefix, Ipv4RTrieSet, Ipv6Prefix, Ipv6RTrieSet};
@@ -11,11 +10,34 @@ use std::os::fd::AsFd;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio_util::bytes::BytesMut;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 pub const UDP_RECV_BUF_SIZE: usize = 65_536;
-pub const UDP_BUF_ALIGN: usize = 4096;
+
+/// 创建可复用的 UDP 接收缓冲区。
+///
+/// 预留双倍容量，目的是降低 `split_to(n).freeze()` 之后、下一轮 `resize()` 时
+/// 触发重新分配（或 CoW 复制）的频率。注意：这并不能“保证”永不复制——因为切出
+/// 的 `Bytes` 可能仍引用原内存块，当剩余尾部空间不足以容纳 `UDP_RECV_BUF_SIZE`
+/// 时，`BytesMut` 会分配新内存并把当前数据复制过去。
+pub fn new_udp_buf() -> BytesMut {
+    let mut buf = BytesMut::with_capacity(UDP_RECV_BUF_SIZE * 2);
+    buf.resize(UDP_RECV_BUF_SIZE, 0);
+    buf
+}
+
+/// 每次 recv 前调用：把长度重置为 `UDP_RECV_BUF_SIZE`。
+///
+/// 由于 `new_udp_buf()` 已预分配双倍容量，前若干轮通常有足够尾部空间而不触发
+/// `realloc`；但当 `split_to` 累计偏移导致尾部空间不足，或仍有外部 `Bytes`
+/// 引用旧内存时，`resize` 可能会分配新内存并复制剩余数据。这种偶尔的复制对
+/// 常规 UDP 小包场景开销很小。
+#[inline]
+pub fn reset_udp_buf(buf: &mut BytesMut) {
+    buf.resize(UDP_RECV_BUF_SIZE, 0);
+}
 
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -44,12 +66,6 @@ pub fn is_anyhow_emsgsize(e: &anyhow::Error) -> bool {
             .map(is_io_emsgsize)
             .unwrap_or(false)
     })
-}
-
-pub fn new_aligned_udp_buf() -> AVec<u8, RuntimeAlign> {
-    let mut buf = AVec::<u8, RuntimeAlign>::with_capacity(UDP_BUF_ALIGN, UDP_RECV_BUF_SIZE);
-    buf.resize(UDP_RECV_BUF_SIZE, 0);
-    buf
 }
 
 pub async fn splice_or_copy_bidirectional<A, B>(

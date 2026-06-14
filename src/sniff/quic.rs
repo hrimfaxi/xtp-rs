@@ -163,6 +163,7 @@ pub struct QuicCryptoReassembly {
     buf: Vec<u8>,
     present: Vec<bool>,
     contiguous_len: usize,
+    last_dcid: Option<Vec<u8>>,
 }
 
 impl QuicCryptoReassembly {
@@ -171,6 +172,7 @@ impl QuicCryptoReassembly {
             buf: Vec::new(),
             present: Vec::new(),
             contiguous_len: 0,
+            last_dcid: None,
         }
     }
 
@@ -193,6 +195,13 @@ impl QuicCryptoReassembly {
             self.contiguous_len += 1;
         }
         Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.present.clear();
+        self.contiguous_len = 0;
+        self.last_dcid = None;
     }
 
     fn contiguous(&self) -> &[u8] {
@@ -421,6 +430,14 @@ fn quic_parse_one_initial_packet(
 
     let dcid = &datagram[off..off + dcid_len];
     off += dcid_len;
+
+    // 检测到新 DCID 时重置 reassembly buffer，避免旧连接数据混入
+    if let Some(ref last) = crypto.last_dcid
+        && last.as_slice() != dcid
+    {
+        crypto.reset();
+    }
+    crypto.last_dcid = Some(dcid.to_vec());
 
     let scid_len = *datagram.get(off).ok_or(UdpSniffError::InsufficientPrefix)? as usize;
     off += 1;

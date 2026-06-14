@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use tokio_util::bytes::Bytes;
 use tracing::{debug, trace, warn};
+
+// 共享的 UDP sniff 状态表：每个 UdpSessionKey 对应一个正在 sniff 中的会话。
+// 由于多个 UDP packet task 可能并发访问，需要用 Arc<Mutex> 保护。
+pub(crate) type PendingSniffMap = Arc<tokio::sync::Mutex<HashMap<UdpSessionKey, PendingUdpSniff>>>;
 
 use crate::sniff::udp::{
     UdpSniffOutcome, UdpSnifferSessionEngine, udp_sniff_error_reason, udp_sniff_protocol_name,
@@ -9,33 +15,34 @@ use crate::state::AppState;
 use crate::udp::session::{UdpRoutingMode, UdpSession, UdpSessionKey, UdpSessionSpec};
 
 pub(crate) struct PendingReplayBuffer {
-    datagrams: Vec<Vec<u8>>,
+    datagrams: Vec<Bytes>,
     cached_bytes: usize,
 }
 
 impl PendingReplayBuffer {
+    // 接受 &[u8]，内部复制为 Bytes
     pub(crate) fn new(first_payload: &[u8]) -> Self {
         Self {
-            datagrams: vec![first_payload.to_vec()],
+            datagrams: vec![Bytes::copy_from_slice(first_payload)],
             cached_bytes: first_payload.len(),
         }
     }
 
+    // 接受 &[u8]，内部复制为 Bytes
     pub(crate) fn push_datagram(&mut self, payload: &[u8]) -> bool {
         let next_bytes = self.cached_bytes.saturating_add(payload.len());
-
-        if self.datagrams.len() >= UDP_SNIFF_MAX_CACHED_DATAGRAMS {
+        if self.datagrams.len() >= UDP_SNIFF_MAX_CACHED_DATAGRAMS
+            || next_bytes > UDP_SNIFF_MAX_CACHED_BYTES
+        {
             return false;
         }
-
-        if next_bytes > UDP_SNIFF_MAX_CACHED_BYTES {
-            return false;
-        }
-
-        self.datagrams.push(payload.to_vec());
+        self.datagrams.push(Bytes::copy_from_slice(payload));
         self.cached_bytes = next_bytes;
-
         true
+    }
+
+    pub(crate) fn into_datagrams(self) -> Vec<Bytes> {
+        self.datagrams
     }
 
     pub(crate) fn datagram_count(&self) -> usize {
@@ -44,10 +51,6 @@ impl PendingReplayBuffer {
 
     pub(crate) fn cached_bytes(&self) -> usize {
         self.cached_bytes
-    }
-
-    pub(crate) fn into_datagrams(self) -> Vec<Vec<u8>> {
-        self.datagrams
     }
 }
 
@@ -186,14 +189,17 @@ pub(crate) async fn flush_pending_udp_sniff(state: Arc<AppState>, pending: Pendi
 
 pub(crate) async fn handle_udp_client_payload(
     state: Arc<AppState>,
-    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
+    pending_sniff: PendingSniffMap,
     spec: UdpSessionSpec,
     payload: &[u8],
 ) {
+    if state.runtime.udp.closed.load(Ordering::SeqCst) {
+        return;
+    }
     let key = spec.key;
 
     if let Some(session) = state.runtime.udp.get_ready_udp_session(key).await {
-        pending_sniff.remove(&key);
+        pending_sniff.lock().await.remove(&key);
 
         trace!(
             kind = ?key.kind,
@@ -207,26 +213,30 @@ pub(crate) async fn handle_udp_client_payload(
         return;
     }
 
-    if handle_pending_udp_sniff(state.clone(), pending_sniff, spec.clone(), payload).await {
+    if handle_pending_udp_sniff(state.clone(), pending_sniff.clone(), spec.clone(), payload).await {
         return;
     }
 
-    if handle_new_udp_sniff(state.clone(), pending_sniff, spec.clone(), payload).await {
+    if handle_new_udp_sniff(state.clone(), pending_sniff.clone(), spec.clone(), payload).await {
         return;
     }
 
     forward_udp_payload(state, spec, payload).await;
 }
 
+// 处理该 key 已有的 pending sniff。
+// 如果 pending 已过期或太大，flush 后转发当前包；
+// 如果 sniff 成功，flush 并标记 host；
+// 如果还需要数据，把 pending 塞回 map 继续等。
 pub(crate) async fn handle_pending_udp_sniff(
     state: Arc<AppState>,
-    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
+    pending_sniff: PendingSniffMap,
     spec: UdpSessionSpec,
     payload: &[u8],
 ) -> bool {
     let key = spec.key;
 
-    let Some(mut pending) = pending_sniff.remove(&key) else {
+    let Some(mut pending) = pending_sniff.lock().await.remove(&key) else {
         return false;
     };
 
@@ -280,8 +290,11 @@ pub(crate) async fn handle_pending_udp_sniff(
                 "UDP sniff still need more",
             );
 
-            pending_sniff.insert(key, pending);
-            enforce_pending_udp_sniff_capacity(pending_sniff);
+            {
+                let mut guard = pending_sniff.lock().await;
+                guard.insert(key, pending);
+            }
+            enforce_pending_udp_sniff_capacity(pending_sniff).await;
         }
         UdpSniffOutcome::NotMatched => {
             debug!(
@@ -312,7 +325,7 @@ pub(crate) async fn handle_pending_udp_sniff(
 
 pub(crate) async fn handle_new_udp_sniff(
     state: Arc<AppState>,
-    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
+    pending_sniff: PendingSniffMap,
     spec: UdpSessionSpec,
     payload: &[u8],
 ) -> bool {
@@ -362,8 +375,11 @@ pub(crate) async fn handle_new_udp_sniff(
                 );
 
                 let pending = PendingUdpSniff::new(spec, sniff_session, payload);
-                pending_sniff.insert(key, pending);
-                enforce_pending_udp_sniff_capacity(pending_sniff);
+                {
+                    let mut guard = pending_sniff.lock().await;
+                    guard.insert(key, pending);
+                }
+                enforce_pending_udp_sniff_capacity(pending_sniff).await;
                 return true;
             }
             UdpSniffOutcome::NotMatched => {
@@ -394,70 +410,58 @@ pub(crate) async fn handle_new_udp_sniff(
     false
 }
 
-pub(crate) async fn reap_pending_udp_sniff(
-    state: Arc<AppState>,
-    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
-) {
+// 清理过期的 pending sniff：把超时的 pending flush 掉，并释放资源。
+// 由主循环每秒调用一次。
+pub(crate) async fn reap_pending_udp_sniff(state: Arc<AppState>, pending_sniff: PendingSniffMap) {
     use crate::util::now_secs;
     let now = now_secs();
 
-    let expired_keys: Vec<UdpSessionKey> = pending_sniff
-        .iter()
-        .filter_map(|(key, pending)| {
-            if now.saturating_sub(pending.started_secs) >= UDP_SNIFF_TIMEOUT_SECS {
-                Some(*key)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for key in expired_keys {
-        if let Some(pending) = pending_sniff.remove(&key) {
-            debug!(
-                kind = ?key.kind,
-                client = %key.client_addr,
-                target = %key.target_addr,
-                cached_datagrams = pending.datagram_count(),
-                cached_bytes = pending.cached_bytes(),
-                "UDP sniff pending expired by reap"
-            );
-
-            flush_pending_udp_sniff(state.clone(), pending).await;
-        }
-    }
-
-    while pending_sniff.len() > UDP_SNIFF_MAX_PENDING_SESSIONS {
-        let oldest_key = pending_sniff
+    // 先收集过期 keys（只读锁，快速）
+    let expired_keys: Vec<UdpSessionKey> = {
+        let guard = pending_sniff.lock().await;
+        guard
             .iter()
-            .min_by_key(|(_, pending)| pending.started_secs)
-            .map(|(key, _)| *key);
+            .filter_map(|(key, pending)| {
+                if now.saturating_sub(pending.started_secs) >= UDP_SNIFF_TIMEOUT_SECS {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
 
-        let Some(oldest_key) = oldest_key else {
-            break;
-        };
+    // 批量 remove：一次写锁把 expired 全拿出来，再逐个 flush
+    let expired_pendings: Vec<PendingUdpSniff> = {
+        let mut guard = pending_sniff.lock().await;
+        expired_keys
+            .into_iter()
+            .filter_map(|key| guard.remove(&key))
+            .collect()
+    };
 
-        if let Some(pending) = pending_sniff.remove(&oldest_key) {
-            warn!(
-                kind = ?oldest_key.kind,
-                client = %oldest_key.client_addr,
-                target = %oldest_key.target_addr,
-                cached_datagrams = pending.datagram_count(),
-                cached_bytes = pending.cached_bytes(),
-                pending_len = pending_sniff.len(),
-                "UDP sniff pending overflow, dropping oldest"
-            );
-
-            drop(pending);
-        }
+    for pending in expired_pendings {
+        debug!(
+            kind = ?pending.spec.key.kind,
+            client = %pending.spec.key.client_addr,
+            target = %pending.spec.key.target_addr,
+            cached_datagrams = pending.datagram_count(),
+            cached_bytes = pending.cached_bytes(),
+            "UDP sniff pending expired by reap"
+        );
+        flush_pending_udp_sniff(state.clone(), pending).await;
     }
+
+    enforce_pending_udp_sniff_capacity(pending_sniff).await;
 }
 
-pub(crate) fn enforce_pending_udp_sniff_capacity(
-    pending_sniff: &mut HashMap<UdpSessionKey, PendingUdpSniff>,
-) {
-    while pending_sniff.len() > UDP_SNIFF_MAX_PENDING_SESSIONS {
-        let oldest_key = pending_sniff
+pub(crate) async fn enforce_pending_udp_sniff_capacity(pending_sniff: PendingSniffMap) {
+    loop {
+        let mut guard = pending_sniff.lock().await;
+        if guard.len() <= UDP_SNIFF_MAX_PENDING_SESSIONS {
+            break;
+        }
+        let oldest_key = guard
             .iter()
             .min_by_key(|(_, pending)| pending.started_secs)
             .map(|(key, _)| *key);
@@ -466,14 +470,14 @@ pub(crate) fn enforce_pending_udp_sniff_capacity(
             break;
         };
 
-        if let Some(pending) = pending_sniff.remove(&oldest_key) {
+        if let Some(pending) = guard.remove(&oldest_key) {
             warn!(
                 kind = ?oldest_key.kind,
                 client = %oldest_key.client_addr,
                 target = %oldest_key.target_addr,
                 cached_datagrams = pending.datagram_count(),
                 cached_bytes = pending.cached_bytes(),
-                pending_len = pending_sniff.len(),
+                pending_len = guard.len(),
                 "UDP sniff pending overflow, dropping oldest immediately"
             );
 
@@ -563,10 +567,9 @@ mod tests {
     }
 
     // ---- enforce_pending_udp_sniff_capacity ----
-    #[test]
-    fn enforce_removes_oldest_when_over_capacity() {
-        let mut map = HashMap::new();
-        // 超过最大容量的条目
+    #[tokio::test]
+    async fn enforce_removes_oldest_when_over_capacity() {
+        let map = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let total = UDP_SNIFF_MAX_PENDING_SESSIONS + 2;
         for i in 0..total {
             let spec = UdpSessionSpec::for_tproxy(
@@ -575,18 +578,17 @@ mod tests {
             );
             let sniffer = Box::new(DummySniffer);
             let mut pending = PendingUdpSniff::new(spec, sniffer, b"x");
-            pending.started_secs = i as u64; // 序号越小越老
-            map.insert(pending.spec.key, pending);
+            pending.started_secs = i as u64;
+            map.lock().await.insert(pending.spec.key, pending);
         }
-        enforce_pending_udp_sniff_capacity(&mut map);
-        assert!(map.len() <= UDP_SNIFF_MAX_PENDING_SESSIONS);
-
-        // 最老的条目 (started_secs == 0) 应被删除
+        enforce_pending_udp_sniff_capacity(map.clone()).await;
+        let guard = map.lock().await;
+        assert!(guard.len() <= UDP_SNIFF_MAX_PENDING_SESSIONS);
         let oldest_key = UdpSessionSpec::for_tproxy(
             "127.0.0.1:1000".parse().unwrap(),
             "10.0.0.1:443".parse().unwrap(),
         )
         .key;
-        assert!(!map.contains_key(&oldest_key));
+        assert!(!guard.contains_key(&oldest_key));
     }
 }

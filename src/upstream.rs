@@ -23,7 +23,7 @@ pub struct Upstream {
     pub addr: SocketAddr,
     pub groups: Vec<String>,
 
-    registry: Mutex<Vec<(Weak<()>, std::os::fd::RawFd)>>,
+    registry: tokio::sync::Mutex<Vec<(Weak<()>, std::os::fd::RawFd)>>,
 
     tcp_score: AtomicU32,
 
@@ -44,7 +44,7 @@ impl Upstream {
     pub fn new(id: impl Into<String>, addr: SocketAddr, groups: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             id: id.into(),
-            registry: Mutex::new(Vec::new()),
+            registry: tokio::sync::Mutex::new(Vec::new()),
             addr,
             groups,
             tcp_score: AtomicU32::new(500),
@@ -65,13 +65,10 @@ impl Upstream {
         self.quic_weight.store(w.clamp(0, 100), Ordering::Relaxed);
     }
 
-    pub fn track(&self, fd: std::os::fd::RawFd) -> Arc<()> {
+    pub async fn track(&self, fd: std::os::fd::RawFd) -> Arc<()> {
         let token = Arc::new(());
         let weak = Arc::downgrade(&token);
-        self.registry
-            .lock()
-            .expect("bad register lock")
-            .push((weak, fd));
+        self.registry.lock().await.push((weak, fd));
         token
     }
 
@@ -85,7 +82,7 @@ impl Upstream {
                 _ = interval.tick() => {},
             }
             let (recv, sent, alive) = {
-                let mut reg = self.registry.lock().expect("bad registry lock");
+                let mut reg = self.registry.lock().await;
                 reg.retain(|(w, _)| w.strong_count() > 0);
                 let mut r = 0u64;
                 let mut s = 0u64;

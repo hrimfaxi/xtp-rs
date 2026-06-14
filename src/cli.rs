@@ -151,6 +151,12 @@ pub struct Config {
     /// - 用于伪造源地址回包的 fake UDP socket
     pub udp_session_timeout_secs: u64,
 
+    #[serde(default = "default_connect_timeout_secs")]
+    /// 上游连接超时时间，单位秒。
+    ///
+    /// 用于 TCP direct/SOCKS5 连接和 UDP SOCKS5 ASSOCIATE 的超时。
+    pub connect_timeout_secs: u64,
+
     #[serde(default = "default_splice")]
     /// TCP 转发时是否优先使用 splice/zero-copy。
     ///
@@ -433,6 +439,10 @@ pub fn default_udp_session_timeout_secs() -> u64 {
     60
 }
 
+pub fn default_connect_timeout_secs() -> u64 {
+    20
+}
+
 pub fn default_splice() -> bool {
     false
 }
@@ -572,6 +582,14 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.quic_weight > 100 {
             bail!("quic_weight must be in range 0..=100");
+        }
+
+        if self.udp_session_timeout_secs == 0 {
+            bail!("udp_session_timeout_secs must be > 0");
+        }
+
+        if self.connect_timeout_secs == 0 {
+            bail!("connect_timeout_secs must be > 0");
         }
 
         // 校验 upstream groups 及路由引用
@@ -723,6 +741,7 @@ mod tests {
             direct_geosite_tags: vec![],
             client_routes: HashMap::new(),
             client_domain_routes: HashMap::new(),
+            connect_timeout_secs: 20,
         }
     }
 

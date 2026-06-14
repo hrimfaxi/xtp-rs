@@ -62,6 +62,7 @@ async fn try_connect_socks5_group(
             up.addr,
             state.config.fwmark,
             state.socks5_credentials(),
+            std::time::Duration::from_secs(state.config.connect_timeout_secs),
         )
         .await
         {
@@ -98,25 +99,37 @@ pub async fn connect_tcp_upstream(
     socks5_addr: SocketAddr,
     fwmark: u32,
     creds: Option<(&str, &str)>,
+    timeout: std::time::Duration,
 ) -> Result<TcpStream> {
     match target {
         TcpUpstreamTarget::Direct(addr) => {
             debug!(addr = %addr, "direct connect");
-            direct_connect(*addr, fwmark).await
+            tokio::time::timeout(timeout, direct_connect(*addr, fwmark))
+                .await
+                .map_err(|_| anyhow::anyhow!("direct connect timeout"))?
         }
         TcpUpstreamTarget::Socks5Ip(addr) => {
             debug!(addr = %addr, "proxy connect by ip");
-            socks5_connect(Socks5Target::Ip(*addr), socks5_addr, fwmark, creds).await
+            tokio::time::timeout(
+                timeout,
+                socks5_connect(Socks5Target::Ip(*addr), socks5_addr, fwmark, creds),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("SOCKS5 connect timeout"))?
         }
         TcpUpstreamTarget::Socks5Domain { host, port } => {
             debug!(host = %host, port = port, "proxy connect by hostname");
-            socks5_connect(
-                Socks5Target::Domain(host.as_str(), *port),
-                socks5_addr,
-                fwmark,
-                creds,
+            tokio::time::timeout(
+                timeout,
+                socks5_connect(
+                    Socks5Target::Domain(host.as_str(), *port),
+                    socks5_addr,
+                    fwmark,
+                    creds,
+                ),
             )
             .await
+            .map_err(|_| anyhow::anyhow!("SOCKS5 connect timeout"))?
         }
     }
 }
@@ -168,7 +181,10 @@ pub async fn handle_tcp_connection(
     // 4. 代理路径上选 upstream 分组
     let (mut upstream, up) = match target {
         TcpUpstreamTarget::Direct(target) => {
-            let s = direct_connect(target, state.config.fwmark).await?;
+            let timeout = std::time::Duration::from_secs(state.config.connect_timeout_secs);
+            let s = tokio::time::timeout(timeout, direct_connect(target, state.config.fwmark))
+                .await
+                .map_err(|_| anyhow::anyhow!("direct connect timeout"))??;
             (s, None)
         }
         _ => {
@@ -232,7 +248,10 @@ pub async fn handle_tcp_connection(
     };
 
     let start = Instant::now();
-    let _token = up.as_ref().map(|up| up.track(upstream.as_raw_fd()));
+    let _token = match up.as_ref() {
+        Some(up) => Some(up.track(upstream.as_raw_fd()).await),
+        None => None,
+    };
     let splice_result =
         splice_or_copy_bidirectional(state.config.splice, &mut client, &mut upstream).await;
     let duration = start.elapsed();
@@ -344,7 +363,7 @@ pub async fn run_tcp_port_forward(
                             };
 
                             let start = Instant::now();
-                            let _token = up.track(upstream.as_raw_fd());
+                            let _token = up.track(upstream.as_raw_fd()).await;
                             let splice_result = splice_or_copy_bidirectional(
                                 state.config.splice,
                                 &mut client,
