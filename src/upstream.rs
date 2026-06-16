@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -16,6 +17,9 @@ use tracing::{debug, error, info, trace, warn};
 use crate::socks5::{Socks5Target, socks5_connect};
 use crate::state::AppState;
 use crate::util::{get_tcp_info_ext_raw, now_secs};
+
+/// 未初始化的分数（表示从未更新过）
+const UNINITIALIZED_SCORE: u32 = 500;
 
 #[derive(Debug)]
 pub struct Upstream {
@@ -151,7 +155,8 @@ impl Upstream {
             (false, false) => 500,
         };
 
-        let tcp_valid = tcp != 500;
+        // 分数等于 UNINITIALIZED_SCORE 说明从未通过 TCP 流量更新过，视为无效
+        let tcp_valid = tcp != UNINITIALIZED_SCORE;
         let quic_valid = uplink_valid || downlink_valid;
         let qw = self.quic_weight.load(Ordering::Relaxed);
         let tw = 100 - qw;
@@ -222,8 +227,10 @@ pub struct UpstreamSet {
 }
 
 impl UpstreamSet {
-    pub fn new(items: Vec<Arc<Upstream>>, tolerance: u32, quic_weight: u32) -> Self {
-        assert!(!items.is_empty());
+    pub fn new(items: Vec<Arc<Upstream>>, tolerance: u32, quic_weight: u32) -> Result<Self> {
+        if items.is_empty() {
+            bail!("UpstreamSet cannot be created with empty items");
+        }
 
         let mut groups: HashMap<String, Vec<Arc<Upstream>>> = HashMap::new();
         for up in &items {
@@ -239,12 +246,12 @@ impl UpstreamSet {
             up.set_quic_weight(quic_weight);
         }
 
-        Self {
+        Ok(Self {
             groups,
             all_items: items,
             current: Mutex::new(HashMap::new()),
             tolerance,
-        }
+        })
     }
 
     pub fn pick(&self) -> Option<Arc<Upstream>> {
@@ -878,7 +885,7 @@ mod tests {
 
     fn upstream_set(ids: &[&str], tolerance: u32) -> UpstreamSet {
         let items: Vec<_> = ids.iter().map(|id| upstream(id)).collect();
-        UpstreamSet::new(items, tolerance, 70)
+        UpstreamSet::new(items, tolerance, 70).unwrap()
     }
 
     #[test]
@@ -998,7 +1005,7 @@ mod tests {
             upstream_with_groups("c", vec!["office".to_string()]),
             upstream_with_groups("d", vec!["office".to_string()]),
         ];
-        let set = UpstreamSet::new(items, 50, 70);
+        let set = UpstreamSet::new(items, 50, 70).unwrap();
 
         // sticky default -> a, office -> c
         {

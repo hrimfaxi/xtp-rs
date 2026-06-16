@@ -88,19 +88,21 @@ where
     }
 }
 
-pub fn warn_if_splice_with_forwarding(splice_enabled: bool) {
+pub async fn warn_if_splice_with_forwarding(splice_enabled: bool) {
     if !splice_enabled {
         return;
     }
     const PREFIX: &str = "/proc/sys/net/";
-    let read_proc = |suffix: &str| -> bool {
-        std::fs::read_to_string(format!("{}{}", PREFIX, suffix))
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .is_some_and(|n| n != 0)
-    };
-    let v4 = read_proc("ipv4/ip_forward");
-    let v6 = read_proc("ipv6/conf/all/forwarding");
+    async fn read_proc(suffix: &str) -> bool {
+        match tokio::fs::read_to_string(format!("{}{}", PREFIX, suffix)).await {
+            Ok(s) => s.trim().parse::<i32>().map(|n| n != 0).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+    let (v4, v6) = tokio::join!(
+        read_proc("ipv4/ip_forward"),
+        read_proc("ipv6/conf/all/forwarding")
+    );
     if v4 || v6 {
         warn!(
             ipv4 = v4,

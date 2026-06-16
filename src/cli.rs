@@ -572,11 +572,7 @@ impl Config {
             })
             .collect();
 
-        Ok(UpstreamSet::new(
-            items,
-            self.upstream_switch_tolerance,
-            self.quic_weight,
-        ))
+        UpstreamSet::new(items, self.upstream_switch_tolerance, self.quic_weight)
     }
 
     pub fn validate(&self) -> Result<()> {

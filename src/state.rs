@@ -366,7 +366,7 @@ impl AppState {
 
     /// 从 Config 从头构建，MMDB 也重新加载
     pub async fn build(config: Config, config_path: String) -> Result<Self> {
-        warn_if_splice_with_forwarding(config.splice);
+        warn_if_splice_with_forwarding(config.splice).await;
 
         let mmdb = match config.mmdb_path.as_deref() {
             Some("") | None => {
@@ -433,7 +433,8 @@ impl AppState {
             use std::collections::HashSet;
 
             // Read the geosite.dat file
-            let data = std::fs::read(path)
+            let data = tokio::fs::read(path)
+                .await
                 .with_context(|| format!("failed to read geosite file: {}", path))?;
 
             // Decode the entire dataset
@@ -892,7 +893,7 @@ mod tests {
             "127.0.0.1:1080".parse().unwrap(),
             vec!["default".to_string()],
         );
-        let upstreams = UpstreamSet::new(vec![upstream], 0, 70);
+        let upstreams = UpstreamSet::new(vec![upstream], 0, 70).unwrap();
         let udp_runtime = Arc::new(UdpRuntime::new(Duration::from_secs(60)));
         AppState {
             mmdb: None,

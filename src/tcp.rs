@@ -67,7 +67,12 @@ async fn try_connect_socks5_group(
         .await
         {
             Ok(s) => return Ok((s, up)),
-            Err(_) => {
+            Err(e) => {
+                warn!(
+                    upstream_id = %up.id,
+                    error = format!("{:#}", e),
+                    "upstream connect failed"
+                );
                 if !state.config.disable_upstream_score {
                     up.penalize();
                 }
