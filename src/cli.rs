@@ -421,6 +421,22 @@ pub struct Config {
     #[serde(default)]
     /// 客户端源 IP → {域名模式 → upstream 分组}
     pub client_domain_routes: HashMap<String, HashMap<String, String>>,
+
+    #[serde(default = "default_route_cache_ttl_secs")]
+    /// 路由结果缓存 TTL，单位秒。
+    ///
+    /// 缓存 `should_direct` 判定结果和 upstream 选择结果。
+    /// - `0`：禁用缓存（每次路由决策都完整计算）
+    /// - `>0`：相同 key 的结果在 TTL 内直接复用
+    /// 默认 5 秒。
+    pub route_cache_ttl_secs: u64,
+
+    #[serde(default = "default_route_cache_max")]
+    /// 路由结果缓存最大条目数。
+    ///
+    /// direct cache 和 upstream cache 各自独立上限。
+    /// 默认 4096。
+    pub route_cache_max: usize,
 }
 
 pub fn default_listen() -> String {
@@ -541,6 +557,14 @@ pub fn default_health_check_url() -> String {
 
 pub fn default_gain() -> f64 {
     1.0
+}
+
+pub fn default_route_cache_ttl_secs() -> u64 {
+    5
+}
+
+pub fn default_route_cache_max() -> usize {
+    4096
 }
 
 pub fn parse_listen_addr(listen: &str) -> Result<(IpAddr, u16)> {
@@ -757,6 +781,8 @@ mod tests {
             client_routes: HashMap::new(),
             client_domain_routes: HashMap::new(),
             connect_timeout_secs: 20,
+            route_cache_ttl_secs: 5,
+            route_cache_max: 4096,
         }
     }
 

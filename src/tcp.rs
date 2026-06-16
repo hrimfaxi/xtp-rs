@@ -147,6 +147,126 @@ pub async fn direct_connect(orig_dst: SocketAddr, fwmark: u32) -> Result<TcpStre
         .with_context(|| format!("direct connect to {orig_dst} failed"))
 }
 
+async fn relay_tcp(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    splice: bool,
+    target: SocketAddr,
+    up: Option<&Upstream>,
+    start: Instant,
+) -> Result<()> {
+    let splice_result = splice_or_copy_bidirectional(splice, client, upstream).await;
+    let duration = start.elapsed();
+
+    match splice_result {
+        Ok((sent, recv)) => {
+            if let Some(up) = up {
+                debug!(
+                    target = %target,
+                    upstream_id = %up.id,
+                    score = up.score(),
+                    sent = sent,
+                    recv = recv,
+                    duration_ms = duration.as_millis(),
+                    "TCP finished"
+                );
+            } else {
+                debug!(
+                    target = %target,
+                    duration_ms = duration.as_millis(),
+                    sent = sent,
+                    recv = recv,
+                    "TCP direct finished"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(up) = up {
+                error!(
+                    target = %target,
+                    upstream_id = %up.id,
+                    score = up.score(),
+                    error = format!("{:#}", e),
+                    "TCP relay error"
+                );
+            } else {
+                error!(
+                    target = %target,
+                    error = format!("{:#}", e),
+                    "TCP direct relay error"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn pick_and_connect(
+    target: &TcpUpstreamTarget,
+    state: &Arc<AppState>,
+    client_addr: &SocketAddr,
+    orig_dst: SocketAddr,
+    domain: Option<&str>,
+) -> Result<(TcpStream, Arc<Upstream>)> {
+    trace!(
+        client = %client_addr,
+        orig_dst = %orig_dst,
+        domain = ?domain,
+        "tcp upstream select"
+    );
+
+    let group = if let Some(domain_str) = domain {
+        let domain_group = state
+            .runtime
+            .client_domain_routes
+            .lookup(client_addr.ip())
+            .and_then(|t| t.lookup(domain_str));
+        trace!(
+            client_ip = %client_addr.ip(),
+            domain = %domain_str,
+            domain_result = %domain_group.unwrap_or("None"),
+            "tcp client_domain_routes lookup"
+        );
+
+        let ip_group = state.runtime.client_routes.lookup(client_addr.ip());
+        trace!(
+            client_ip = %client_addr.ip(),
+            ip_result = %ip_group.map(|s| s.as_str()).unwrap_or("None"),
+            "tcp client_routes lookup"
+        );
+
+        domain_group
+            .or_else(|| ip_group.map(|s| s.as_str()))
+            .unwrap_or("default")
+    } else {
+        let ip_group = state.runtime.client_routes.lookup(client_addr.ip());
+        trace!(
+            client_ip = %client_addr.ip(),
+            ip_result = %ip_group.map(|s| s.as_str()).unwrap_or("None"),
+            "tcp client_routes lookup (no domain)"
+        );
+
+        ip_group.map_or("default", |s| s.as_str())
+    };
+
+    trace!(
+        client = %client_addr,
+        group = %group,
+        "tcp selected group"
+    );
+
+    let (s, up) = try_connect_socks5_group(target, state, group).await?;
+    debug!(
+        upstream_id = %up.id,
+        upstream_addr = %up.addr,
+        score = up.score(),
+        target = %orig_dst,
+        "selected upstream"
+    );
+    Ok((s, up))
+}
+
 pub async fn handle_tcp_connection(
     mut client: TcpStream,
     client_addr: SocketAddr,
@@ -163,6 +283,27 @@ pub async fn handle_tcp_connection(
     // 2. 判断是否需要 sniff 域名
     let need_sniff_for_geosite = state.need_geosite_sniff();
     let need_sniff_for_upstream = state.need_upstream_domain_sniff(client_addr.ip());
+
+    // 1a. 仅当确定不需要 sniff 时，才走 fast-path 直连
+    if direct_by_ip && !need_sniff_for_geosite && !need_sniff_for_upstream {
+        let target = decide_tcp_upstream_target(orig_dst, true, None);
+        if let TcpUpstreamTarget::Direct(target_addr) = target {
+            let timeout = std::time::Duration::from_secs(state.config.connect_timeout_secs);
+            let mut upstream =
+                tokio::time::timeout(timeout, direct_connect(target_addr, state.config.fwmark))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("direct connect timeout"))??;
+            return relay_tcp(
+                &mut client,
+                &mut upstream,
+                state.config.splice,
+                orig_dst,
+                None,
+                Instant::now(),
+            )
+            .await;
+        }
+    }
 
     // 只有以下情况才 sniff：
     // - geosite 需要域名辅助决策（无论直连还是代理）
@@ -185,124 +326,101 @@ pub async fn handle_tcp_connection(
 
     // 4. 代理路径上选 upstream 分组
     let (mut upstream, up) = match target {
-        TcpUpstreamTarget::Direct(target) => {
+        TcpUpstreamTarget::Direct(target_addr) => {
             let timeout = std::time::Duration::from_secs(state.config.connect_timeout_secs);
-            let s = tokio::time::timeout(timeout, direct_connect(target, state.config.fwmark))
+            let s = tokio::time::timeout(timeout, direct_connect(target_addr, state.config.fwmark))
                 .await
                 .map_err(|_| anyhow::anyhow!("direct connect timeout"))??;
             (s, None)
         }
         _ => {
-            trace!(
-                client = %client_addr,
-                orig_dst = %orig_dst,
-                domain = ?domain,
-                "tcp upstream select"
-            );
-
-            let group = if let Some(ref domain_str) = domain {
-                let domain_group = state
-                    .runtime
-                    .client_domain_routes
-                    .lookup(client_addr.ip())
-                    .and_then(|t| t.lookup(domain_str));
-                trace!(
-                    client_ip = %client_addr.ip(),
-                    domain = %domain_str,
-                    domain_result = %domain_group.unwrap_or("None"),
-                    "tcp client_domain_routes lookup"
-                );
-
-                let ip_group = state.runtime.client_routes.lookup(client_addr.ip());
-                trace!(
-                    client_ip = %client_addr.ip(),
-                    ip_result = %ip_group.map(|s| s.as_str()).unwrap_or("None"),
-                    "tcp client_routes lookup"
-                );
-
-                domain_group
-                    .or_else(|| ip_group.map(|s| s.as_str()))
-                    .unwrap_or("default")
+            let target_ip = orig_dst.ip();
+            // 尝试 upstream 缓存
+            if let Some(cached_up) =
+                state.get_cached_upstream(client_addr.ip(), target_ip, domain.as_deref())
+            {
+                match connect_tcp_upstream(
+                    &target,
+                    cached_up.addr,
+                    state.config.fwmark,
+                    state.socks5_credentials(),
+                    std::time::Duration::from_secs(state.config.connect_timeout_secs),
+                )
+                .await
+                {
+                    Ok(s) => {
+                        debug!(
+                            upstream_id = %cached_up.id,
+                            upstream_addr = %cached_up.addr,
+                            score = cached_up.score(),
+                            target = %orig_dst,
+                            "cached upstream"
+                        );
+                        (s, Some(cached_up))
+                    }
+                    Err(e) => {
+                        warn!(
+                            upstream_id = %cached_up.id,
+                            error = format!("{:#}", e),
+                            "cached upstream connect failed, falling back to pick"
+                        );
+                        state.remove_cached_upstream(
+                            client_addr.ip(),
+                            target_ip,
+                            domain.as_deref(),
+                        );
+                        if !state.config.disable_upstream_score {
+                            cached_up.penalize();
+                        }
+                        let (s, up) = pick_and_connect(
+                            &target,
+                            &state,
+                            &client_addr,
+                            orig_dst,
+                            domain.as_deref(),
+                        )
+                        .await?;
+                        (s, Some(up))
+                    }
+                }
             } else {
-                let ip_group = state.runtime.client_routes.lookup(client_addr.ip());
-                trace!(
-                    client_ip = %client_addr.ip(),
-                    ip_result = %ip_group.map(|s| s.as_str()).unwrap_or("None"),
-                    "tcp client_routes lookup (no domain)"
-                );
-
-                ip_group.map_or("default", |s| s.as_str())
-            };
-
-            trace!(
-                client = %client_addr,
-                group = %group,
-                "tcp selected group"
-            );
-
-            let (s, up) = try_connect_socks5_group(&target, &state, group).await?;
-            debug!(
-                upstream_id = %up.id,
-                upstream_addr = %up.addr,
-                score = up.score(),
-                target = %orig_dst,
-                "selected upstream"
-            );
-            (s, Some(up))
+                let (s, up) =
+                    pick_and_connect(&target, &state, &client_addr, orig_dst, domain.as_deref())
+                        .await?;
+                (s, Some(up))
+            }
         }
     };
 
-    let start = Instant::now();
-    let _token = match up.as_ref() {
-        Some(up) => Some(up.track(upstream.as_raw_fd()).await),
-        None => None,
-    };
-    let splice_result =
-        splice_or_copy_bidirectional(state.config.splice, &mut client, &mut upstream).await;
-    let duration = start.elapsed();
+    // 缓存 upstream 选择
+    if let Some(ref up) = up {
+        state.cache_upstream(client_addr.ip(), orig_dst.ip(), domain.as_deref(), up);
+    }
 
-    match splice_result {
-        Ok((sent, recv)) => {
-            // 只有 SOCKS5 路径才更新分数
-            if let Some(ref up) = up {
-                debug!(
-                    target = %orig_dst,
-                    upstream_id = %up.id,
-                    score = up.score(),
-                    sent = sent,
-                    recv = recv,
-                    duration_ms = duration.as_millis(),
-                    "TCP finished"
-                );
-            } else {
-                debug!(
-                    target = %orig_dst,
-                    duration_ms = duration.as_millis(),
-                    sent = sent,
-                    recv = recv,
-                    "TCP direct finished"
-                );
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if let Some(ref up) = up {
-                error!(
-                    target = %orig_dst,
-                    upstream_id = %up.id,
-                    score = up.score(),
-                    error = format!("{:#}", e),
-                    "TCP relay error"
-                );
-            } else {
-                error!(
-                    target = %orig_dst,
-                    error = format!("{:#}", e),
-                    "TCP direct relay error"
-                );
-            }
-            Err(e)
-        }
+    let relay_start = Instant::now();
+    if let Some(ref up) = up {
+        let token = up.track(upstream.as_raw_fd()).await;
+        let result = relay_tcp(
+            &mut client,
+            &mut upstream,
+            state.config.splice,
+            orig_dst,
+            Some(up),
+            relay_start,
+        )
+        .await;
+        drop(token);
+        result
+    } else {
+        relay_tcp(
+            &mut client,
+            &mut upstream,
+            state.config.splice,
+            orig_dst,
+            None,
+            relay_start,
+        )
+        .await
     }
 }
 

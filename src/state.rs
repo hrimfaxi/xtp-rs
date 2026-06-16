@@ -2,12 +2,14 @@ use anyhow::{Context, Result, bail};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iptrie::{IpPrefix, Ipv4RTrieSet, Ipv6RTrieSet};
 use maxminddb::Reader;
-use maxminddb::geoip2::Country;
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 #[allow(unused_imports)]
 use tracing::{debug, error, info, trace, warn};
@@ -25,7 +27,7 @@ use crate::socket_factory::{
 };
 use crate::tcp::{run_tcp_port_forward, tcp_accept_loop};
 use crate::udp::{UdpRuntime, run_udp_gc_loop, run_udp_loop, run_udp_port_forward};
-use crate::upstream::{UpstreamSet, run_health_check_task};
+use crate::upstream::{Upstream, UpstreamSet, run_health_check_task};
 use crate::util::{
     TaskGuard, build_ip_tries, canonical_domain, domain_matches_suffix, parse_ip_net_list,
     parse_ip_or_cidr, warn_if_splice_with_forwarding,
@@ -120,6 +122,42 @@ pub struct AppRuntime {
 #[cfg(feature = "geosite")]
 type GeositeIndex = HashMap<String, Vec<geosite_rs::Domain>>;
 
+#[cfg(feature = "geosite")]
+struct CompiledGeositeTag {
+    exact: HashSet<String>,
+    suffixes: HashSet<String>,
+    plain: Vec<String>,
+}
+
+#[cfg(feature = "geosite")]
+type CompiledGeosite = HashMap<String, CompiledGeositeTag>;
+
+/// MMDB 最小解码结构：只取 country.iso_code，跳过 continent/names/traits 等。
+#[derive(Deserialize)]
+struct MinimalMmdb<'a> {
+    #[serde(borrow, default)]
+    country: MinimalCountry<'a>,
+}
+
+#[derive(Deserialize, Default)]
+struct MinimalCountry<'a> {
+    #[serde(borrow, default)]
+    iso_code: Option<&'a str>,
+}
+
+fn normalize_domain(domain: Option<&str>) -> Option<String> {
+    domain.map(|d| canonical_domain(d))
+}
+
+/// Key = (目标 IP, 规范化域名)。域名为 None 表示 IP-only 判定（sniff 前）。
+/// Value = (是否直连, 写入时间)。
+type DirectCache = DashMap<(IpAddr, Option<String>), (bool, Instant)>;
+
+/// Key = (客户端 IP, 目标 IP, 规范化域名)。需要客户端 IP 是因为 upstream 选择
+/// 依赖 client_routes / client_domain_routes，不同客户端可能路由到不同分组。
+/// Value = (选中的 upstream, 写入时间)。
+type UpstreamCache = DashMap<(IpAddr, IpAddr, Option<String>), (Arc<Upstream>, Instant)>;
+
 pub struct AppState {
     pub mmdb: Option<Arc<Reader<Vec<u8>>>>,
     pub config: Config,
@@ -139,8 +177,14 @@ pub struct AppState {
     pub health_check: TaskGuard,
     pub udp_gc: TaskGuard,
     pub runtime: Arc<AppRuntime>,
+    direct_cache: DirectCache,
+    route_cache_ttl: Duration,
+    upstream_cache: UpstreamCache,
     #[cfg(feature = "geosite")]
+    #[allow(dead_code)]
     pub geosite: Option<Arc<GeositeIndex>>,
+    #[cfg(feature = "geosite")]
+    compiled_geosite: Option<CompiledGeosite>,
 }
 
 fn ipv4_trie_contains(trie: &Ipv4RTrieSet, ip: &Ipv4Addr) -> bool {
@@ -175,6 +219,7 @@ impl From<i32> for GeositeDomainType {
 }
 
 #[cfg(feature = "geosite")]
+#[allow(dead_code)]
 fn geosite_domain_match(rule: &geosite_rs::Domain, domain: &str) -> bool {
     let domain = canonical_domain(domain);
     let value = canonical_domain(&rule.value);
@@ -192,19 +237,80 @@ fn geosite_domain_match(rule: &geosite_rs::Domain, domain: &str) -> bool {
 }
 
 #[cfg(feature = "geosite")]
-fn geosite_contains(index: &GeositeIndex, tag: &str, domain: &str) -> bool {
-    let Some(rules) = index.get(&tag.to_lowercase()) else {
+fn compile_geosite(index: &GeositeIndex) -> CompiledGeosite {
+    index
+        .iter()
+        .map(|(tag, rules)| {
+            let mut exact = HashSet::new();
+            let mut suffixes = HashSet::new();
+            let mut plain = Vec::new();
+
+            for rule in rules {
+                let value = canonical_domain(&rule.value);
+                if value.is_empty() {
+                    continue;
+                }
+                match GeositeDomainType::from(rule.r#type) {
+                    GeositeDomainType::Full => {
+                        exact.insert(value);
+                    }
+                    GeositeDomainType::Domain => {
+                        suffixes.insert(value);
+                    }
+                    GeositeDomainType::Plain => {
+                        plain.push(value);
+                    }
+                    _ => {} // Regex / Unknown 忽略
+                }
+            }
+
+            (
+                tag.clone(),
+                CompiledGeositeTag {
+                    exact,
+                    suffixes,
+                    plain,
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "geosite")]
+fn compiled_geosite_contains(compiled: &CompiledGeosite, tag: &str, domain: &str) -> bool {
+    let Some(ct) = compiled.get(tag) else {
         return false;
     };
 
-    rules.iter().any(|rule| geosite_domain_match(rule, domain))
+    let domain = canonical_domain(domain);
+
+    if ct.exact.contains(&domain) {
+        return true;
+    }
+
+    if ct.suffixes.contains(&domain) {
+        return true;
+    }
+    for (i, ch) in domain.char_indices() {
+        if ch == '.' && ct.suffixes.contains(&domain[i + 1..]) {
+            return true;
+        }
+    }
+
+    for plain in &ct.plain {
+        if domain.contains(plain) {
+            return true;
+        }
+    }
+
+    false
 }
 
 impl AppState {
     /// geosite 是否需要域名 sniff
     pub fn need_geosite_sniff(&self) -> bool {
         #[cfg(feature = "geosite")]
-        if self.geosite.is_some()
+        if self.compiled_geosite.is_some()
             && (!self.config.proxy_geosite_tags.is_empty()
                 || !self.config.direct_geosite_tags.is_empty())
             && matches!(
@@ -246,6 +352,18 @@ impl AppState {
             ProxyMode::Smart => {}
         }
 
+        let cache_active = !self.route_cache_ttl.is_zero();
+        if cache_active {
+            let key = (ip, normalize_domain(domain));
+            if let Some(entry) = self.direct_cache.get(&key) {
+                if entry.1.elapsed() < self.route_cache_ttl {
+                    return entry.0;
+                }
+                drop(entry);
+                self.direct_cache.remove(&key);
+            }
+        }
+
         #[cfg(not(feature = "geosite"))]
         {
             _ = domain;
@@ -253,42 +371,113 @@ impl AppState {
 
         // 域名规则优先
         #[cfg(feature = "geosite")]
-        if let (Some(geo), Some(domain)) = (&self.geosite, domain) {
+        if let (Some(compiled), Some(domain)) = (&self.compiled_geosite, domain) {
             for tag in &self.config.proxy_geosite_tags {
-                if geosite_contains(geo, tag, domain) {
+                if compiled_geosite_contains(compiled, tag, domain) {
                     debug!(%domain, %tag, "force proxy (geosite)");
+                    if cache_active {
+                        self.direct_cache_insert(ip, Some(domain), false);
+                    }
                     return false;
                 }
             }
             for tag in &self.config.direct_geosite_tags {
-                if geosite_contains(geo, tag, domain) {
+                if compiled_geosite_contains(compiled, tag, domain) {
                     debug!(%domain, %tag, "force direct (geosite)");
+                    if cache_active {
+                        self.direct_cache_insert(ip, Some(domain), true);
+                    }
                     return true;
                 }
             }
         }
 
-        match ip {
+        let result = match ip {
             IpAddr::V4(ipv4) => {
                 if ipv4_trie_contains(&self.force_socks5_v4, &ipv4) {
-                    return false;
-                }
-                if ipv4_trie_contains(&self.force_direct_v4, &ipv4) {
-                    return true;
+                    false
+                } else if ipv4_trie_contains(&self.force_direct_v4, &ipv4) {
+                    true
+                } else {
+                    (self.config.direct_local_ip && is_must_direct_local_ip(ip))
+                        || self.is_direct_country_ip(ip)
                 }
             }
             IpAddr::V6(ipv6) => {
                 if ipv6_trie_contains(&self.force_socks5_v6, &ipv6) {
-                    return false;
-                }
-                if ipv6_trie_contains(&self.force_direct_v6, &ipv6) {
-                    return true;
+                    false
+                } else if ipv6_trie_contains(&self.force_direct_v6, &ipv6) {
+                    true
+                } else {
+                    (self.config.direct_local_ip && is_must_direct_local_ip(ip))
+                        || self.is_direct_country_ip(ip)
                 }
             }
-        }
+        };
 
-        (self.config.direct_local_ip && is_must_direct_local_ip(ip))
-            || self.is_direct_country_ip(ip)
+        if cache_active {
+            self.direct_cache_insert(ip, domain, result);
+        }
+        result
+    }
+
+    fn direct_cache_insert(&self, ip: IpAddr, domain: Option<&str>, direct: bool) {
+        if self.direct_cache.len() >= self.config.route_cache_max {
+            let ttl = self.route_cache_ttl;
+            self.direct_cache.retain(|_, v| v.1.elapsed() < ttl);
+        }
+        self.direct_cache
+            .insert((ip, normalize_domain(domain)), (direct, Instant::now()));
+    }
+
+    pub fn get_cached_upstream(
+        &self,
+        client_ip: IpAddr,
+        target_ip: IpAddr,
+        domain: Option<&str>,
+    ) -> Option<Arc<Upstream>> {
+        if self.route_cache_ttl.is_zero() {
+            return None;
+        }
+        let key = (client_ip, target_ip, normalize_domain(domain));
+        if let Some(entry) = self.upstream_cache.get(&key) {
+            if entry.1.elapsed() < self.route_cache_ttl {
+                return Some(Arc::clone(&entry.0));
+            }
+            drop(entry);
+            self.upstream_cache.remove(&key);
+        }
+        None
+    }
+
+    pub fn cache_upstream(
+        &self,
+        client_ip: IpAddr,
+        target_ip: IpAddr,
+        domain: Option<&str>,
+        up: &Arc<Upstream>,
+    ) {
+        if self.route_cache_ttl.is_zero() {
+            return;
+        }
+        if self.upstream_cache.len() >= self.config.route_cache_max {
+            let ttl = self.route_cache_ttl;
+            self.upstream_cache.retain(|_, v| v.1.elapsed() < ttl);
+        }
+        self.upstream_cache.insert(
+            (client_ip, target_ip, normalize_domain(domain)),
+            (Arc::clone(up), Instant::now()),
+        );
+    }
+
+    pub fn remove_cached_upstream(
+        &self,
+        client_ip: IpAddr,
+        target_ip: IpAddr,
+        domain: Option<&str>,
+    ) {
+        self.upstream_cache
+            .remove(&(client_ip, target_ip, normalize_domain(domain)));
     }
 
     pub fn is_direct_country_ip(&self, ip: IpAddr) -> bool {
@@ -301,12 +490,12 @@ impl AppState {
             Err(_) => return false,
         };
 
-        let country = match lookup_result.decode::<Country>() {
-            Ok(Some(c)) => c,
+        let record = match lookup_result.decode::<MinimalMmdb<'_>>() {
+            Ok(Some(r)) => r,
             _ => return false,
         };
 
-        country
+        record
             .country
             .iso_code
             .map(|code| {
@@ -490,6 +679,9 @@ impl AppState {
             None
         };
 
+        #[cfg(feature = "geosite")]
+        let compiled_geosite = geosite.as_ref().map(|geo| compile_geosite(geo));
+
         #[cfg(not(feature = "geosite"))]
         {
             if config.geosite_path.is_some()
@@ -562,6 +754,8 @@ impl AppState {
             routes
         };
 
+        let route_cache_ttl = Duration::from_secs(config.route_cache_ttl_secs);
+
         Ok(AppState {
             mmdb,
             config,
@@ -586,8 +780,13 @@ impl AppState {
                 client_routes,
                 client_domain_routes,
             }),
+            direct_cache: DashMap::new(),
+            route_cache_ttl,
+            upstream_cache: DashMap::new(),
             #[cfg(feature = "geosite")]
             geosite,
+            #[cfg(feature = "geosite")]
+            compiled_geosite,
         })
     }
 
@@ -923,8 +1122,13 @@ mod tests {
                 client_routes: ClientIpRoutes::new(),
                 client_domain_routes: ClientDomainRoutes::new(),
             }),
+            direct_cache: DashMap::new(),
+            route_cache_ttl: Duration::from_secs(5),
+            upstream_cache: DashMap::new(),
             #[cfg(feature = "geosite")]
             geosite: None,
+            #[cfg(feature = "geosite")]
+            compiled_geosite: None,
         }
     }
 
@@ -980,6 +1184,8 @@ mod tests {
             client_routes: HashMap::new(),
             client_domain_routes: HashMap::new(),
             connect_timeout_secs: 20,
+            route_cache_ttl_secs: 5,
+            route_cache_max: 4096,
         }
     }
 

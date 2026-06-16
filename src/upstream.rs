@@ -18,8 +18,8 @@ use crate::socks5::{Socks5Target, socks5_connect};
 use crate::state::AppState;
 use crate::util::{get_tcp_info_ext_raw, now_secs};
 
-/// 未初始化的分数（表示从未更新过）
-const UNINITIALIZED_SCORE: u32 = 500;
+/// TCP 分数默认值（未通过流量更新前使用）
+const DEFAULT_SCORE: u32 = 500;
 
 #[derive(Debug)]
 pub struct Upstream {
@@ -31,6 +31,7 @@ pub struct Upstream {
     registry: tokio::sync::Mutex<Vec<(Weak<()>, std::os::fd::RawFd)>>,
 
     tcp_score: AtomicU32,
+    tcp_score_initialized: AtomicBool,
 
     last_total_recv: AtomicU64,
     last_total_sent: AtomicU64,
@@ -46,14 +47,20 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn new(id: impl Into<String>, addr: SocketAddr, groups: Vec<String>, gain: f64) -> Arc<Self> {
+    pub fn new(
+        id: impl Into<String>,
+        addr: SocketAddr,
+        groups: Vec<String>,
+        gain: f64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id: id.into(),
             registry: tokio::sync::Mutex::new(Vec::new()),
             addr,
             groups,
             gain,
-            tcp_score: AtomicU32::new(UNINITIALIZED_SCORE),
+            tcp_score: AtomicU32::new(DEFAULT_SCORE),
+            tcp_score_initialized: AtomicBool::new(false),
             quic_uplink_score: AtomicU32::new(500),
             quic_downlink_score: AtomicU32::new(500),
             quic_uplink_last_update_secs: AtomicU64::new(0),
@@ -129,6 +136,7 @@ impl Upstream {
                 let speed_str = format!("{:.2}", speed_mbps);
 
                 self.tcp_score.store(blended, Ordering::Relaxed);
+                self.tcp_score_initialized.store(true, Ordering::Relaxed);
                 let delta_mb = format!("{:.2}", delta_bytes as f64 / 1024.0 / 1024.0);
                 debug!(
                     id = %self.id,
@@ -157,8 +165,8 @@ impl Upstream {
             (false, false) => 500,
         };
 
-        // 分数等于 UNINITIALIZED_SCORE 说明从未通过 TCP 流量更新过，视为无效
-        let tcp_valid = tcp != UNINITIALIZED_SCORE;
+        // tcp_score_initialized 为 false 说明从未通过 TCP 流量更新过，视为无效
+        let tcp_valid = self.tcp_score_initialized.load(Ordering::Relaxed);
         let quic_valid = uplink_valid || downlink_valid;
         let qw = self.quic_weight.load(Ordering::Relaxed);
         let tw = 100 - qw;
@@ -228,6 +236,7 @@ impl Upstream {
 
     pub fn penalize(&self) {
         self.tcp_score.store(100, Ordering::Relaxed);
+        self.tcp_score_initialized.store(true, Ordering::Relaxed);
         self.quic_uplink_score.store(100, Ordering::Relaxed);
         self.quic_downlink_score.store(100, Ordering::Relaxed);
         let now = now_secs();
@@ -736,6 +745,7 @@ pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationTok
                 }
                 if failures >= fail_threshold {
                     up.tcp_score.store(300, Ordering::Relaxed);
+                    up.tcp_score_initialized.store(true, Ordering::Relaxed);
                     info!(id = %up.id, "upstream health recovered, score reset to 300");
                 }
             } else {
@@ -847,6 +857,12 @@ mod tests {
         )
     }
 
+    /// 直接设置 TCP 分数并标记为已初始化（绕过 run_score_task）
+    fn set_tcp_score(up: &Upstream, score: u32) {
+        up.tcp_score.store(score, Ordering::Relaxed);
+        up.tcp_score_initialized.store(true, Ordering::Relaxed);
+    }
+
     /// 直接设置 QUIC 分数并标记为已更新（绕过 3:7 平滑混合）
     fn set_quic_uplink(up: &Upstream, score: u32) {
         up.quic_uplink_score.store(score, Ordering::Relaxed);
@@ -868,7 +884,7 @@ mod tests {
     #[test]
     fn score_uses_downlink_when_uplink_missing() {
         let up = make_upstream("c");
-        up.tcp_score.store(600, Ordering::Relaxed);
+        set_tcp_score(&up, 600);
         set_quic_downlink(&up, 700);
         // uplink never updated => invalid, quic = downlink = 700
         let expected = (600 * 30 + 700 * 70) / 100; // 670
@@ -878,7 +894,7 @@ mod tests {
     #[test]
     fn score_averages_both_links() {
         let up = make_upstream("d");
-        up.tcp_score.store(600, Ordering::Relaxed);
+        set_tcp_score(&up, 600);
         set_quic_uplink(&up, 800);
         set_quic_downlink(&up, 600);
         let expected = (600 * 30 + 700 * 70) / 100; // 670
@@ -890,6 +906,7 @@ mod tests {
         let up = make_upstream("e");
         up.penalize();
         assert_eq!(up.tcp_score.load(Ordering::Relaxed), 100);
+        assert!(up.tcp_score_initialized.load(Ordering::Relaxed));
         assert_eq!(up.quic_uplink_score.load(Ordering::Relaxed), 100);
         assert_eq!(up.quic_downlink_score.load(Ordering::Relaxed), 100);
     }
@@ -955,7 +972,7 @@ mod tests {
     fn tolerance_sticky_when_best_not_exceeding() {
         let set = upstream_set(&["a", "b"], 50);
         for u in set.iter() {
-            u.tcp_score.store(500, Ordering::Relaxed);
+            set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
         // sticky to "a"
@@ -978,7 +995,7 @@ mod tests {
         }
         // "a" at 500
         for u in set.iter() {
-            u.tcp_score.store(500, Ordering::Relaxed);
+            set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
         // "b" quic=700 => score=(500*3+700*7)/10=640, diff=140 > 100
@@ -991,7 +1008,7 @@ mod tests {
     #[test]
     fn score_blends_tcp_and_quic() {
         let up = make_upstream("b");
-        up.tcp_score.store(600, Ordering::Relaxed);
+        set_tcp_score(&up, 600);
         set_quic_uplink(&up, 800);
         // 默认 qw=70, tw=30
         let expected = (600 * 30 + 800 * 70) / 100; // 740
@@ -1002,7 +1019,7 @@ mod tests {
     fn score_respects_custom_quic_weight() {
         let up = make_upstream("f");
         up.set_quic_weight(50); // 5:5
-        up.tcp_score.store(600, Ordering::Relaxed);
+        set_tcp_score(&up, 600);
         set_quic_uplink(&up, 800);
         let expected = (600 * 50 + 800 * 50) / 100; // 700
         assert_eq!(up.score(), expected);
@@ -1047,7 +1064,7 @@ mod tests {
     #[test]
     fn effective_score_default_gain() {
         let up = make_upstream("a");
-        up.tcp_score.store(500, Ordering::Relaxed);
+        set_tcp_score(&up, 500);
         // gain=1.0, effective = 500 * 1.0 = 500
         assert_eq!(up.effective_score(), 500);
     }
@@ -1060,7 +1077,7 @@ mod tests {
             vec!["default".to_string()],
             2.0,
         );
-        up.tcp_score.store(500, Ordering::Relaxed);
+        set_tcp_score(&up, 500);
         assert_eq!(up.effective_score(), 1000);
     }
 
@@ -1072,7 +1089,7 @@ mod tests {
             vec!["default".to_string()],
             0.5,
         );
-        up.tcp_score.store(1000, Ordering::Relaxed);
+        set_tcp_score(&up, 1000);
         assert_eq!(up.effective_score(), 500);
     }
 
@@ -1084,7 +1101,7 @@ mod tests {
             vec!["default".to_string()],
             0.001,
         );
-        up.tcp_score.store(1, Ordering::Relaxed);
+        set_tcp_score(&up, 1);
         // 1 * 0.001 = 0.001, clamped to 1
         assert_eq!(up.effective_score(), 1);
     }
@@ -1097,7 +1114,7 @@ mod tests {
             vec!["default".to_string()],
             100_000.0,
         );
-        up.tcp_score.store(1000, Ordering::Relaxed);
+        set_tcp_score(&up, 1000);
         // 1000 * 100000 = 100_000_000, clamped to 10_000_000
         assert_eq!(up.effective_score(), 10_000_000);
     }
@@ -1110,7 +1127,7 @@ mod tests {
             vec!["default".to_string()],
             3.0,
         );
-        up.tcp_score.store(500, Ordering::Relaxed);
+        set_tcp_score(&up, 500);
         assert_eq!(up.effective_score(), 1500);
         // raw score unchanged
         assert_eq!(up.score(), 500);
@@ -1137,7 +1154,7 @@ mod tests {
         ];
         // same raw score
         for u in &items {
-            u.tcp_score.store(500, Ordering::Relaxed);
+            set_tcp_score(u, 500);
         }
         let set = UpstreamSet::new(items, 0, 70).unwrap();
 
@@ -1180,7 +1197,7 @@ mod tests {
             ),
         ];
         for u in &items {
-            u.tcp_score.store(500, Ordering::Relaxed);
+            set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
         let set = UpstreamSet::new(items, 50, 70).unwrap();
@@ -1208,7 +1225,7 @@ mod tests {
             ),
         ];
         for u in &items2 {
-            u.tcp_score.store(500, Ordering::Relaxed);
+            set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
         let set2 = UpstreamSet::new(items2, 50, 70).unwrap();
