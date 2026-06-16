@@ -892,6 +892,7 @@ mod tests {
             "test",
             "127.0.0.1:1080".parse().unwrap(),
             vec!["default".to_string()],
+            1.0,
         );
         let upstreams = UpstreamSet::new(vec![upstream], 0, 70).unwrap();
         let udp_runtime = Arc::new(UdpRuntime::new(Duration::from_secs(60)));
@@ -963,6 +964,7 @@ mod tests {
                 id: "test".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
                 groups: None,
+                gain: 1.0,
             }],
             disable_upstream_score: false,
             upstream_switch_tolerance: 0,

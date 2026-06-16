@@ -57,6 +57,10 @@ pub struct UpstreamConfig {
     #[serde(default)]
     /// 所属分组，未设置则自动属于 ["default"]
     pub groups: Option<Vec<String>>,
+    #[serde(default = "default_gain")]
+    /// 乘数因子，用于放大或缩小该 upstream 的动态分数。
+    /// 必须 > 0.0，否则配置加载失败。
+    pub gain: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -535,6 +539,10 @@ pub fn default_health_check_url() -> String {
     "cp.cloudflare.com".to_string()
 }
 
+pub fn default_gain() -> f64 {
+    1.0
+}
+
 pub fn parse_listen_addr(listen: &str) -> Result<(IpAddr, u16)> {
     let addr: SocketAddr = listen
         .parse()
@@ -568,7 +576,7 @@ impl Config {
                     .groups
                     .clone()
                     .unwrap_or_else(|| vec!["default".to_string()]);
-                Upstream::new(u.id.trim().to_string(), u.addr, groups)
+                Upstream::new(u.id.trim().to_string(), u.addr, groups, u.gain)
             })
             .collect();
 
@@ -586,6 +594,16 @@ impl Config {
 
         if self.connect_timeout_secs == 0 {
             bail!("connect_timeout_secs must be > 0");
+        }
+
+        for u in &self.upstream {
+            if !u.gain.is_finite() || u.gain <= 0.0 {
+                bail!(
+                    "upstream '{}' gain must be a finite positive number, got {}",
+                    u.id,
+                    u.gain
+                );
+            }
         }
 
         // 校验 upstream groups 及路由引用
@@ -723,6 +741,7 @@ mod tests {
                 id: "u1".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
                 groups: None,
+                gain: default_gain(),
             }],
             disable_upstream_score: false,
             upstream_switch_tolerance: 0,
@@ -761,6 +780,7 @@ mod tests {
                 id: "x".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
                 groups: None,
+                gain: default_gain(),
             }],
             ..minimal_config()
         };
@@ -784,11 +804,13 @@ mod tests {
                     id: "dup".into(),
                     addr: "127.0.0.1:1".parse().unwrap(),
                     groups: None,
+                    gain: default_gain(),
                 },
                 UpstreamConfig {
                     id: "dup".into(),
                     addr: "127.0.0.1:2".parse().unwrap(),
                     groups: None,
+                    gain: default_gain(),
                 },
             ],
             ..minimal_config()
@@ -830,6 +852,7 @@ mod tests {
                 id: "   ".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
                 groups: None,
+                gain: default_gain(),
             }],
             ..minimal_config()
         };
@@ -904,6 +927,76 @@ mod tests {
                     mode_str
                 );
             }
+        }
+
+        #[test]
+        fn deserialize_gain_default() {
+            let toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            let cfg: super::Config = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.upstream[0].gain, 1.0);
+        }
+
+        #[test]
+        fn deserialize_gain_custom() {
+            let toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"\ngain = 2.5";
+            let cfg: super::Config = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.upstream[0].gain, 2.5);
+        }
+
+        #[test]
+        fn validate_gain_zero_rejected() {
+            let cfg = super::Config {
+                upstream: vec![super::UpstreamConfig {
+                    id: "test".into(),
+                    addr: "127.0.0.1:1080".parse().unwrap(),
+                    groups: None,
+                    gain: 0.0,
+                }],
+                ..super::tests::minimal_config()
+            };
+            assert!(cfg.validate().is_err());
+        }
+
+        #[test]
+        fn validate_gain_negative_rejected() {
+            let cfg = super::Config {
+                upstream: vec![super::UpstreamConfig {
+                    id: "test".into(),
+                    addr: "127.0.0.1:1080".parse().unwrap(),
+                    groups: None,
+                    gain: -1.0,
+                }],
+                ..super::tests::minimal_config()
+            };
+            assert!(cfg.validate().is_err());
+        }
+
+        #[test]
+        fn validate_gain_nan_rejected() {
+            let cfg = super::Config {
+                upstream: vec![super::UpstreamConfig {
+                    id: "test".into(),
+                    addr: "127.0.0.1:1080".parse().unwrap(),
+                    groups: None,
+                    gain: f64::NAN,
+                }],
+                ..super::tests::minimal_config()
+            };
+            assert!(cfg.validate().is_err());
+        }
+
+        #[test]
+        fn validate_gain_infinity_rejected() {
+            let cfg = super::Config {
+                upstream: vec![super::UpstreamConfig {
+                    id: "test".into(),
+                    addr: "127.0.0.1:1080".parse().unwrap(),
+                    groups: None,
+                    gain: f64::INFINITY,
+                }],
+                ..super::tests::minimal_config()
+            };
+            assert!(cfg.validate().is_err());
         }
     }
 }

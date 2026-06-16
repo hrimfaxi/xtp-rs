@@ -15,17 +15,17 @@
   支持运行时通过 `SIGUSR1` 在 `smart` / `global` / `bypass` 模式间动态切换。
 
 - 📡 **多 SOCKS5 上游**  
-  支持配置多个上游 SOCKS5 服务器，并支持用户名/密码认证。
+  支持配置多个上游 SOCKS5 服务器，支持用户名/密码认证、分组路由和增益系数。
 
 - 📈 **动态上游评分**  
-  实时监控 TCP 吞吐量（通过 `TCP_INFO`），并接收 QUIC 探针（RTT/丢包率/MTU）报告，采用平方加权随机算法自动选择最优上游。
+  实时监控 TCP 吞吐量（通过 `TCP_INFO`），并接收 QUIC 探针（RTT/丢包率/MTU）报告，采用平方加权随机算法自动选择最优上游。支持粘性切换容忍度避免频繁切换。
 
 - 👃 **域名嗅探**  
   - **TLS SNI**：从 TLS ClientHello 中提取域名（用于 HTTPS）。  
   - **HTTP Host**：从 HTTP/1.x 请求头中提取域名（用于明文 HTTP）。  
-  - **QUIC SNI**：从 QUIC Initial 包中解析域名（实验性，默认关闭）。  
+  - **QUIC SNI**：从 QUIC Initial 包中解析域名（默认启用）。  
 
-  > 注意：上述嗅探功能在配置文件中默认均为 **关闭**，需手动设置 `sniff_tls_sni = true` 等开启。编译时均已包含相关代码（features 默认启用）。
+  > 注意：上述嗅探功能在配置文件中默认均为 **关闭**，需手动设置 `sniff_tls_sni = true` 等开启。编译时默认包含所有嗅探代码。
 
 - ⚙️ **端口转发**  
   将本地 TCP/UDP 端口强制通过 SOCKS5 转发到指定目标（可用于 DNS over SOCKS5、远程访问等）。
@@ -40,12 +40,15 @@
 - 📦 **一键部署脚本**  
   提供 `setup-xtp-rs.sh` / `unsetup-xtp-rs.sh` 脚本，快速配置 nftables + 策略路由，实现透明代理环境搭建。
 
+- 🔀 **客户端路由**  
+  支持按客户端源 IP 分配不同 upstream 分组，实现精细化流量管理。
+
 ---
 
 ## 📦 构建
 
 ### 依赖
-- Rust 1.70+
+- Rust 1.70+（edition 2024）
 - Linux 内核（需启用 `TPROXY`、`IP_TRANSPARENT`、`NF_SOCKET` 等选项）
 
 ### 编译
@@ -66,7 +69,7 @@ cargo build --release --no-default-features --features "sniff-tls,sniff-http,geo
 |---------|------|
 | `sniff-tls` | TLS SNI 嗅探（默认启用） |
 | `sniff-http` | HTTP Host 嗅探（默认启用） |
-| `sniff-quic` | QUIC SNI 嗅探（默认禁用） |
+| `sniff-quic` | QUIC SNI 嗅探（默认启用） |
 | `geosite`   | geosite.dat 分流支持（默认启用） |
 
 ---
@@ -90,7 +93,7 @@ cd contrib/usr/libexec/xtp-rs
 sudo ./setup-xtp-rs.sh
 
 # 启动 xtp-rs（需另开终端或后台运行）
-sudo ../target/release/xtp-rs -c /etc/xtp-rs/config.toml
+sudo xtp-rs -c /etc/xtp-rs/config.toml
 
 # 停止 xtp-rs 后清理环境
 sudo ./unsetup-xtp-rs.sh
@@ -153,10 +156,14 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 | `udp` | bool | `true` | 是否启用 UDP 转发 |
 | `fwmark` | u32 | `2` | **注意**：直连 / SOCKS5 出站 socket 使用的 fwmark。
 必须与脚本中的 XTP_BYPASS_MARK（默认 2）保持一致，以确保 xtp-rs 自身发出的连接不会被透明代理再次劫持，从而避免环路。 |
+| `socks5_user` | string | 无 | SOCKS5 认证用户名（需与 `socks5_password` 同时配置） |
+| `socks5_password` | string | 无 | SOCKS5 认证密码（需与 `socks5_user` 同时配置） |
 | `mmdb_path` | string | 无 | GeoIP2 Country 数据库路径（留空禁用国家判定） |
 | `direct_countries` | [string] | `["CN"]` | 直连的国家代码（ISO 3166-1 alpha-2） |
 | `force_direct_ips` | [string] | `[]` | 强制直连的 IP/CIDR（优先级低于 force_socks5） |
 | `force_socks5_ips` | [string] | `[]` | 强制走代理的 IP/CIDR（最高优先级） |
+| `force_direct_ips_file` | string | 无 | 额外的强制直连 IP/CIDR 文件路径（每行一个） |
+| `force_socks5_ips_file` | string | 无 | 额外的强制 SOCKS5 IP/CIDR 文件路径（每行一个） |
 | `direct_local_ip` | bool | `true` | 回环/链路本地地址是否强制直连 |
 | `sniff_tls_sni` | bool | `false` | 是否启用 TLS SNI 嗅探（仅非直连 TCP） |
 | `sniff_http_host` | bool | `false` | 是否启用 HTTP Host 嗅探 |
@@ -165,12 +172,54 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 | `geosite_path` | string | 无 | geosite.dat 文件路径（需编译 geosite feature） |
 | `proxy_geosite_tags` | [string] | `[]` | 走代理的 geosite 分类（如 `gfw`） |
 | `direct_geosite_tags` | [string] | `[]` | 走直连的 geosite 分类（如 `geolocation-cn`） |
+| `log_level` | string | 从环境变量读取，否则 `info` | 日志级别：`error`/`warn`/`info`/`debug`/`trace` |
+| `udp_session_timeout_secs` | u64 | `60` | UDP 会话空闲超时时间（秒） |
+| `connect_timeout_secs` | u64 | `20` | 上游连接超时时间（秒） |
+| `splice` | bool | `false` | TCP 转发是否优先使用 splice 零拷贝 |
+
+### 上游动态评分参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `disable_upstream_score` | bool | `false` | 禁用上游动态评分（启用后完全随机选择） |
+| `upstream_switch_tolerance` | u32 | `0` | 粘性切换容忍度（分），0 表示不启用粘性 |
+| `quic_weight` | u32 | `70` | QUIC 探针在选路分数中的权重（0-100） |
+
+### 健康检查参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `health_check_interval_secs` | u64 | `0` | 主动健康检查间隔（秒），0 表示禁用 |
+| `health_check_timeout_secs` | u64 | `5` | 单次健康检查超时（秒） |
+| `health_check_fail_threshold` | u32 | `2` | 连续失败次数阈值 |
+| `health_check_url` | string | `"cp.cloudflare.com"` | 健康检查目标 URL |
+
+### TLS 嗅探参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `tcp_peek_buffer_size` | usize | `32768` | TCP 首包 sniff 全局缓冲区上限（字节） |
+| `tls_sniff_peek_len` | usize | `2048` | TLS sniff 首次 peek 长度（字节） |
+| `tls_sniff_max_len` | usize | `32768` | TLS sniff 最大探测长度（字节） |
+| `tls_sniff_max_retries` | usize | `5` | TLS sniff 最大重试次数 |
+| `tls_sniff_wait_more_ms` | u64 | `100` | TLS sniff 等待更多数据时间（毫秒） |
+| `tls_sniff_timeout_ms` | u64 | `1000` | TLS sniff 总超时时间（毫秒） |
+
+### HTTP 嗅探参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `http_sniff_peek_len` | usize | `512` | HTTP sniff 首次 peek 长度（字节） |
+| `http_sniff_max_len` | usize | `16384` | HTTP sniff 最大探测长度（字节） |
+| `http_sniff_max_retries` | usize | `5` | HTTP sniff 最大重试次数 |
+| `http_sniff_wait_more_ms` | u64 | `100` | HTTP sniff 等待更多数据时间（毫秒） |
+| `http_sniff_timeout_ms` | u64 | `1000` | HTTP sniff 总超时时间（毫秒） |
 
 > **重要**：  
 > - XTP_FWMARK=1：用于标记入站需要代理的流量（由 nftables 规则设置）。
 > - XTP_BYPASS_MARK=2：用于标记已代理/直连的出站流量（xtp-rs 程序设置）。
 因此配置文件中的 fwmark 必须设为 2，不能为 1，否则代理程序自己的请求会被再次劫持。
-> - 嗅探功能默认关闭，需要手动开启。编译时默认包含所有嗅探代码（除 QUIC 外），运行时开启不会带来额外性能损失（仅处理非直连流量的首包）。
+> - 嗅探功能默认关闭，需要手动开启。编译时默认包含所有嗅探代码，运行时开启不会带来额外性能损失（仅处理非直连流量的首包）。
 
 ### 上游配置
 
@@ -178,10 +227,28 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 [[upstream]]
 id = "server1"                 # 唯一标识
 addr = "192.168.1.100:1080"   # SOCKS5 地址
+# groups = ["default"]         # 所属分组，未设置则自动属于 ["default"]
+# gain = 1.0                   # 乘数因子，用于放大或缩小该 upstream 的动态分数
 ```
 
 - 至少配置一个 `upstream`。
 - 可配置多个，系统会动态评分并加权随机选择。
+- `gain` 必须大于 0，用于调整该 upstream 的选路权重。
+- `groups` 用于配合 `client_routes` 实现分组路由。
+
+### 客户端路由配置
+
+```toml
+# 按客户端源 IP 分配 upstream 分组
+[client_routes]
+"192.168.1.100" = "group_a"
+"192.168.2.0/24" = "group_b"
+
+# 按客户端源 IP + 域名模式分配 upstream 分组
+[client_domain_routes."192.168.1.100"]
+".google.com" = "proxy_group"    # 后缀匹配
+"example.com" = "direct_group"   # 精确匹配
+```
 
 ### 端口转发
 
@@ -199,19 +266,30 @@ network = "both"              # tcp / udp / both
 
 ```
 xtp-rs/
+├── contrib/
+│   ├── etc/
+│   │   ├── capabilities/xtp-rs.json  # Linux capabilities 配置
+│   │   ├── init.d/xtp-rs             # OpenWrt init 脚本
+│   │   └── xtp-rs/
+│   │       ├── config.toml            # 完整配置模板
+│   │       └── Country-only-cn-private.mmdb  # GeoIP 数据库示例
+│   └── usr/libexec/xtp-rs/
+│       ├── common.sh                  # 公共函数库
+│       ├── setup-xtp-rs.sh           # 透明代理环境安装脚本
+│       └── unsetup-xtp-rs.sh         # 清理脚本
 ├── scripts/
-│   ├── common.sh               # 公共函数库
-│   ├── setup-xtp-rs.sh         # 透明代理环境安装脚本
-│   └── unsetup-xtp-rs.sh       # 清理脚本
+│   └── test_socks5_udp.py            # UDP 测试脚本
 ├── src/
-│   ├── cli.rs                  # 命令行和配置结构
-│   ├── sniff/                  # 协议嗅探（tls, http, quic）
-│   ├── socks5.rs               # SOCKS5 客户端实现
-│   ├── tcp.rs                  # TCP 透明代理处理
-│   ├── udp/                    # UDP 会话管理与转发
-│   ├── upstream.rs             # 上游评分与选择
-│   ├── state.rs                # 全局状态与生命周期
-│   └── util.rs                 # 工具函数
+│   ├── cli.rs                         # 命令行和配置结构
+│   ├── main.rs                        # 程序入口
+│   ├── sniff/                         # 协议嗅探（tls, http, quic）
+│   ├── socks5.rs                      # SOCKS5 客户端实现
+│   ├── socket_factory.rs             # Socket 创建工厂
+│   ├── tcp.rs                         # TCP 透明代理处理
+│   ├── udp/                           # UDP 会话管理与转发
+│   ├── upstream.rs                    # 上游评分与选择
+│   ├── state.rs                       # 全局状态与生命周期
+│   └── util.rs                        # 工具函数
 ├── Cargo.toml
 └── README.md
 ```
@@ -239,26 +317,33 @@ cargo test
 - [tokio](https://tokio.rs/) – 异步运行时
 - [maxminddb](https://github.com/oschwald/maxminddb-rust) – GeoIP2 解析
 - [iptrie](https://crates.io/crates/iptrie) – IP 前缀匹配
-- [geosite-rs](https://crates.io/crates/geosite-rs) – Geosite 解析
+- [geosite-rs](https://github.com/hrimfaxi/geosite-rs) – Geosite 解析
+- [socket2](https://github.com/rust-lang/socket2) – 底层 socket 操作
 
 ---
 
 ## ⚠️ 注意事项
 
 1. **权限要求**  
-   透明代理需要 root 权限（或 `CAP_NET_ADMIN`+`CAP_NET_RAW`）。
+   透明代理需要 root 权限（或 `CAP_NET_ADMIN`+`CAP_NET_RAW`+`CAP_NET_BIND_SERVICE`）。
 
 2. **splice 零拷贝**  
    若系统启用了 IP 转发（`net.ipv4.ip_forward=1`），使用 `splice` 可能导致性能下降，参见 [splice 与转发路径的注意事项](https://github.com/XTLS/Xray-core/discussions/59)。建议保持默认 `splice = false`。
 
 3. **QUIC SNI 嗅探**  
-   实验性功能，默认关闭。开启后会尝试解析 UDP 数据包的 QUIC Initial，可能增加 CPU 开销。
+   默认启用，会尝试解析 UDP 数据包的 QUIC Initial，可能增加 CPU 开销。可在配置中关闭。
 
 4. **配置文件路径**  
-   默认读取当前工作目录下的 `config.toml`，可通过 `-c` 参数指定。脚本中未强制配置路径，请自行管理。
+   默认读取当前工作目录下的 `config.toml`，可通过 `-c` 参数指定。
 
 5. **热重载限制**  
    `SIGHUP` 重载时，端口转发监听地址若发生改变，旧地址上的监听 socket 会被关闭，新地址重新绑定。若新旧地址冲突可能导致短暂失败，建议设计时避免频繁变动。
+
+6. **客户端路由**  
+   使用 `client_routes` 和 `client_domain_routes` 时，确保引用的 upstream 分组已在 `[[upstream]]` 中配置。未配置 `groups` 的 upstream 默认属于 `default` 组。
+
+7. **OpenWrt 部署**  
+   使用 `contrib/etc/init.d/xtp-rs` 脚本可集成到 OpenWrt 的 procd 服务管理，支持ujail 沙箱和 capabilities 限制。
 
 ---
 

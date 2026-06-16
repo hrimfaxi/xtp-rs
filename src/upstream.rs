@@ -26,6 +26,7 @@ pub struct Upstream {
     pub id: String,
     pub addr: SocketAddr,
     pub groups: Vec<String>,
+    pub gain: f64,
 
     registry: tokio::sync::Mutex<Vec<(Weak<()>, std::os::fd::RawFd)>>,
 
@@ -45,13 +46,14 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn new(id: impl Into<String>, addr: SocketAddr, groups: Vec<String>) -> Arc<Self> {
+    pub fn new(id: impl Into<String>, addr: SocketAddr, groups: Vec<String>, gain: f64) -> Arc<Self> {
         Arc::new(Self {
             id: id.into(),
             registry: tokio::sync::Mutex::new(Vec::new()),
             addr,
             groups,
-            tcp_score: AtomicU32::new(500),
+            gain,
+            tcp_score: AtomicU32::new(UNINITIALIZED_SCORE),
             quic_uplink_score: AtomicU32::new(500),
             quic_downlink_score: AtomicU32::new(500),
             quic_uplink_last_update_secs: AtomicU64::new(0),
@@ -167,6 +169,23 @@ impl Upstream {
             (true, false) => tcp,
             (false, false) => 500,
         }
+    }
+
+    /// 有效分数 = 原始动态分数 × gain，用于选路权重和 tolerance 比较。
+    pub fn effective_score(&self) -> u64 {
+        let raw = self.score() as f64;
+        let eff = raw * self.gain;
+        let clamped = eff.clamp(1.0, 10_000_000.0) as u64;
+        if eff > 10_000_000.0 {
+            warn!(
+                id = %self.id,
+                raw_score = self.score(),
+                gain = self.gain,
+                effective_score = clamped,
+                "effective score clamped to upper bound"
+            );
+        }
+        clamped
     }
 
     /// 更新上行 QUIC 分数（冷却 5 秒）
@@ -311,9 +330,9 @@ impl UpstreamSet {
             _ => {}
         }
 
-        // 1. 候选里的最高分
-        let best = items.iter().max_by_key(|u| u.score())?;
-        let best_score = best.score();
+        // 1. 候选里的最高有效分数
+        let best = items.iter().max_by_key(|u| u.effective_score())?;
+        let best_eff = best.effective_score();
 
         // 2. 检查 sticky：仅当 tolerance > 0 时启用
         if self.tolerance > 0 {
@@ -326,15 +345,15 @@ impl UpstreamSet {
             };
 
             if let Some(ref cur) = sticky {
-                let cur_score = cur.score();
-                if best.id != cur.id && best_score > cur_score + self.tolerance {
+                let cur_eff = cur.effective_score();
+                if best.id != cur.id && best_eff > cur_eff + self.tolerance as u64 {
                     debug!(
                         group = %group,
                         exclude_ctx = ?exclude_ctx,
                         from_upstream_id = %cur.id,
-                        from_score = cur_score,
+                        from_score = cur_eff,
                         to_upstream_id = %best.id,
-                        to_score = best_score,
+                        to_score = best_eff,
                         tolerance = self.tolerance,
                         "pick: switch upstream"
                     );
@@ -344,9 +363,9 @@ impl UpstreamSet {
                         group = %group,
                         exclude_ctx = ?exclude_ctx,
                         upstream_id = %cur.id,
-                        score = cur_score,
+                        score = cur_eff,
                         best_upstream_id = %best.id,
-                        best_score = best_score,
+                        best_score = best_eff,
                         tolerance = self.tolerance,
                         "pick: keep sticky upstream"
                     );
@@ -360,9 +379,9 @@ impl UpstreamSet {
         let weights: Vec<u64> = items
             .iter()
             .map(|u| {
-                let s = u.score();
+                let s = u.effective_score();
                 candidate_scores.push((u.id.clone(), s));
-                (s as u64) * (s as u64) // 平方加权：高分优势放大
+                s * s // 平方加权：高分优势放大
             })
             .collect();
 
@@ -373,7 +392,7 @@ impl UpstreamSet {
             exclude_ctx = ?exclude_ctx,
             upstream_count = items.len(),
             best_upstream_id = %best.id,
-            best_score = best_score,
+            best_score = best_eff,
             total_weight = total_weight,
             candidate_scores = ?candidate_scores,
             "pick: candidate set"
@@ -386,7 +405,7 @@ impl UpstreamSet {
                 group = %group,
                 exclude_ctx = ?exclude_ctx,
                 upstream_id = %chosen.id,
-                score = chosen.score(),
+                score = chosen.effective_score(),
                 index = idx,
                 "pick: random pick upstream"
             );
@@ -403,7 +422,7 @@ impl UpstreamSet {
                         group = %group,
                         exclude_ctx = ?exclude_ctx,
                         upstream_id = %chosen.id,
-                        score = chosen.score(),
+                        score = chosen.effective_score(),
                         weight = *w,
                         rand = pick_r,
                         total_weight = total_weight,
@@ -421,7 +440,7 @@ impl UpstreamSet {
                     group = %group,
                     exclude_ctx = ?exclude_ctx,
                     upstream_id = %chosen.id,
-                    score = chosen.score(),
+                    score = chosen.effective_score(),
                     "pick: fallback to first upstream"
                 );
                 chosen
@@ -824,6 +843,7 @@ mod tests {
             id,
             "127.0.0.1:1080".parse().unwrap(),
             vec!["default".to_string()],
+            1.0,
         )
     }
 
@@ -880,6 +900,7 @@ mod tests {
             id,
             "127.0.0.1:1080".parse().unwrap(),
             vec!["default".to_string()],
+            1.0,
         )
     }
 
@@ -988,7 +1009,7 @@ mod tests {
     }
 
     fn upstream_with_groups(id: &str, groups: Vec<String>) -> Arc<Upstream> {
-        Upstream::new(id, "127.0.0.1:1080".parse().unwrap(), groups)
+        Upstream::new(id, "127.0.0.1:1080".parse().unwrap(), groups, 1.0)
     }
 
     #[test]
@@ -1019,5 +1040,184 @@ mod tests {
 
         let picked_office = set.pick_from_group("office").unwrap();
         assert_eq!(picked_office.id, "c");
+    }
+
+    // ---------- effective_score ----------
+
+    #[test]
+    fn effective_score_default_gain() {
+        let up = make_upstream("a");
+        up.tcp_score.store(500, Ordering::Relaxed);
+        // gain=1.0, effective = 500 * 1.0 = 500
+        assert_eq!(up.effective_score(), 500);
+    }
+
+    #[test]
+    fn effective_score_with_gain_2x() {
+        let up = Upstream::new(
+            "b",
+            "127.0.0.1:1080".parse().unwrap(),
+            vec!["default".to_string()],
+            2.0,
+        );
+        up.tcp_score.store(500, Ordering::Relaxed);
+        assert_eq!(up.effective_score(), 1000);
+    }
+
+    #[test]
+    fn effective_score_with_gain_half() {
+        let up = Upstream::new(
+            "c",
+            "127.0.0.1:1080".parse().unwrap(),
+            vec!["default".to_string()],
+            0.5,
+        );
+        up.tcp_score.store(1000, Ordering::Relaxed);
+        assert_eq!(up.effective_score(), 500);
+    }
+
+    #[test]
+    fn effective_score_clamped_lower_bound() {
+        let up = Upstream::new(
+            "d",
+            "127.0.0.1:1080".parse().unwrap(),
+            vec!["default".to_string()],
+            0.001,
+        );
+        up.tcp_score.store(1, Ordering::Relaxed);
+        // 1 * 0.001 = 0.001, clamped to 1
+        assert_eq!(up.effective_score(), 1);
+    }
+
+    #[test]
+    fn effective_score_clamped_upper_bound() {
+        let up = Upstream::new(
+            "e",
+            "127.0.0.1:1080".parse().unwrap(),
+            vec!["default".to_string()],
+            100_000.0,
+        );
+        up.tcp_score.store(1000, Ordering::Relaxed);
+        // 1000 * 100000 = 100_000_000, clamped to 10_000_000
+        assert_eq!(up.effective_score(), 10_000_000);
+    }
+
+    #[test]
+    fn effective_score_raw_score_unchanged() {
+        let up = Upstream::new(
+            "f",
+            "127.0.0.1:1080".parse().unwrap(),
+            vec!["default".to_string()],
+            3.0,
+        );
+        up.tcp_score.store(500, Ordering::Relaxed);
+        assert_eq!(up.effective_score(), 1500);
+        // raw score unchanged
+        assert_eq!(up.score(), 500);
+    }
+
+    // ---------- gain selection influence ----------
+
+    #[test]
+    fn gain_affects_weighted_selection() {
+        fastrand::seed(42);
+        let items = vec![
+            Upstream::new(
+                "high",
+                "127.0.0.1:1080".parse().unwrap(),
+                vec!["default".to_string()],
+                2.0,
+            ),
+            Upstream::new(
+                "low",
+                "127.0.0.1:1080".parse().unwrap(),
+                vec!["default".to_string()],
+                0.5,
+            ),
+        ];
+        // same raw score
+        for u in &items {
+            u.tcp_score.store(500, Ordering::Relaxed);
+        }
+        let set = UpstreamSet::new(items, 0, 70).unwrap();
+
+        // effective: high=1000, low=250
+        // weight: high=1000000, low=62500, ratio ~16:1
+        let mut high_count = 0u32;
+        let mut low_count = 0u32;
+        for _ in 0..1000 {
+            let picked = set.pick().unwrap();
+            if picked.id == "high" {
+                high_count += 1;
+            } else {
+                low_count += 1;
+            }
+        }
+        // high should be picked much more often than low
+        assert!(
+            high_count > low_count * 5,
+            "high gain should be picked much more often: high={}, low={}",
+            high_count,
+            low_count
+        );
+    }
+
+    #[test]
+    fn gain_affects_tolerance_comparison() {
+        fastrand::seed(42);
+        let items = vec![
+            Upstream::new(
+                "a",
+                "127.0.0.1:1080".parse().unwrap(),
+                vec!["default".to_string()],
+                1.0,
+            ),
+            Upstream::new(
+                "b",
+                "127.0.0.1:1080".parse().unwrap(),
+                vec!["default".to_string()],
+                1.0,
+            ),
+        ];
+        for u in &items {
+            u.tcp_score.store(500, Ordering::Relaxed);
+            set_quic_uplink(u, 500);
+        }
+        let set = UpstreamSet::new(items, 50, 70).unwrap();
+
+        // sticky to "a"
+        {
+            let mut cur = set.current.lock().unwrap();
+            cur.insert("default".to_string(), Some("a".to_string()));
+        }
+
+        // Set "b" gain=3.0 so effective=1500, "a" gain=1.0 effective=500
+        // diff=1000 > tolerance=50, should switch
+        let items2 = vec![
+            Upstream::new(
+                "a",
+                "127.0.0.1:1080".parse().unwrap(),
+                vec!["default".to_string()],
+                1.0,
+            ),
+            Upstream::new(
+                "b",
+                "127.0.0.1:1080".parse().unwrap(),
+                vec!["default".to_string()],
+                3.0,
+            ),
+        ];
+        for u in &items2 {
+            u.tcp_score.store(500, Ordering::Relaxed);
+            set_quic_uplink(u, 500);
+        }
+        let set2 = UpstreamSet::new(items2, 50, 70).unwrap();
+        {
+            let mut cur = set2.current.lock().unwrap();
+            cur.insert("default".to_string(), Some("a".to_string()));
+        }
+        // a effective=500, b effective=1500, diff=1000 > 50
+        let picked = set2.pick().unwrap();
+        assert_eq!(picked.id, "b", "should switch due to higher gain");
     }
 }
