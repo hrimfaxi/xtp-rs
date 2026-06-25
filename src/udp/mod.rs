@@ -4,6 +4,7 @@ mod session;
 mod tproxy;
 
 use anyhow::{Context, Result, anyhow};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,8 +35,8 @@ use crate::util::{
 // 每个 UdpSessionKey 的串行锁：空 Mutex 只用于互斥，不存数据。
 type UdpKeyLock = Arc<tokio::sync::Mutex<()>>;
 
-// 当前 UDP loop 的 key_lock 表。
-type UdpKeyLocks = Arc<tokio::sync::Mutex<HashMap<UdpSessionKey, UdpKeyLock>>>;
+// 当前 UDP loop 的 key_lock 表。DashMap 分片锁，减少高并发下的竞争。
+type UdpKeyLocks = Arc<DashMap<UdpSessionKey, UdpKeyLock>>;
 
 pub struct UdpRuntime {
     sessions: Mutex<HashMap<UdpSessionKey, UdpSessionEntry>>,
@@ -167,7 +168,7 @@ impl UdpRuntime {
                 .collect()
         };
 
-        let mut expired = Vec::new();
+        let mut expired = Vec::with_capacity(snapshot.len());
 
         for (key, session) in snapshot {
             let last_seen = session
@@ -183,7 +184,7 @@ impl UdpRuntime {
             return;
         }
 
-        let mut expired_sessions = Vec::new();
+        let mut expired_sessions = Vec::with_capacity(expired.len());
         let mut sessions = self.sessions.lock().await;
 
         for (key, session) in expired {
@@ -233,7 +234,7 @@ impl UdpRuntime {
     pub async fn shutdown(&self, timeout: Duration) -> bool {
         self.closed.store(true, Ordering::SeqCst);
         let mut sessions = self.sessions.lock().await;
-        let mut ready_sessions = Vec::new();
+        let mut ready_sessions = Vec::with_capacity(sessions.len());
         for (_, entry) in sessions.iter() {
             match entry {
                 UdpSessionEntry::Ready(session) => {
@@ -247,7 +248,7 @@ impl UdpRuntime {
         drop(sessions);
 
         // sessions 锁已释放，再拿每个 session 的 recv_task 锁
-        let mut handles = Vec::new();
+        let mut handles = Vec::with_capacity(ready_sessions.len());
         for session in ready_sessions {
             if let Some(h) = session.recv_task.lock().await.take() {
                 handles.push(h);
@@ -681,9 +682,8 @@ pub async fn run_udp_gc_loop(state: Arc<AppState>, cancel: CancellationToken) {
 // 如果该 key 之前没有锁，就新建一个插入全局表并返回；
 // 如果已有，直接返回已有的。这样同一个 key 的所有 UDP 包
 // 共享同一把 Mutex，自然串行。
-async fn get_udp_key_lock(key_locks: &UdpKeyLocks, key: UdpSessionKey) -> UdpKeyLock {
-    let mut guard = key_locks.lock().await;
-    guard
+fn get_udp_key_lock(key_locks: &UdpKeyLocks, key: UdpSessionKey) -> UdpKeyLock {
+    key_locks
         .entry(key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -692,10 +692,9 @@ async fn get_udp_key_lock(key_locks: &UdpKeyLocks, key: UdpSessionKey) -> UdpKey
 // 清理 key_lock 表中已经空闲的锁。
 // Arc::strong_count(lock) == 1 表示只有 map 自己持有这把锁，
 // 没有任何活跃或排队的 packet task 在使用它，可以安全删除。
-async fn reap_idle_udp_key_locks(key_locks: &UdpKeyLocks) {
-    let mut guard = key_locks.lock().await;
+fn reap_idle_udp_key_locks(key_locks: &UdpKeyLocks) {
     // strong_count == 1 表示只有 map 持有，没有活跃 task 在等待或使用
-    guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+    key_locks.retain(|_, lock| Arc::strong_count(lock) > 1);
 }
 
 pub async fn run_udp_loop(
@@ -712,9 +711,9 @@ pub async fn run_udp_loop(
     let packet_sem = Arc::new(tokio::sync::Semaphore::new(UDP_PACKET_TASK_LIMIT));
 
     // 防同 key 并发
-    let key_locks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let key_locks: UdpKeyLocks = Arc::new(DashMap::new());
     // 共享 sniff 状态
-    let pending_sniff = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_sniff = Arc::new(DashMap::new());
     let mut last_pending_reap_secs = now_secs();
 
     loop {
@@ -741,7 +740,7 @@ pub async fn run_udp_loop(
             last_pending_reap_secs = now;
             reap_pending_udp_sniff(state.clone(), pending_sniff.clone()).await;
             // 顺带清理无 task 使用的 idle key_lock，防内存泄漏
-            reap_idle_udp_key_locks(&key_locks).await;
+            reap_idle_udp_key_locks(&key_locks);
         }
 
         if packet.len == 0 {
@@ -782,8 +781,8 @@ pub async fn run_udp_port_forward(
     let mut buf = new_udp_buf();
     const UDP_PACKET_TASK_LIMIT: usize = 4096;
     let packet_sem = Arc::new(tokio::sync::Semaphore::new(UDP_PACKET_TASK_LIMIT));
-    let key_locks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let pending_sniff = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let key_locks: UdpKeyLocks = Arc::new(DashMap::new());
+    let pending_sniff = Arc::new(DashMap::new());
     let mut last_pending_reap_secs = now_secs();
 
     loop {
@@ -808,7 +807,7 @@ pub async fn run_udp_port_forward(
         if now.saturating_sub(last_pending_reap_secs) >= UDP_SNIFF_REAP_INTERVAL_SECS {
             last_pending_reap_secs = now;
             reap_pending_udp_sniff(state.clone(), pending_sniff.clone()).await;
-            reap_idle_udp_key_locks(&key_locks).await;
+            reap_idle_udp_key_locks(&key_locks);
         }
 
         if n == 0 {
@@ -856,7 +855,7 @@ async fn spawn_udp_packet_handler(
     };
 
     // 2. 获取该 key 的串行锁。没有就新建，有就复用。
-    let key_lock = get_udp_key_lock(&key_locks, spec.key).await;
+    let key_lock = get_udp_key_lock(&key_locks, spec.key);
 
     // 3.  spawn 后台 task。_permit 和 _key_guard 随 task 结束自动释放。
     // 直接使用 payload，无需拷贝；内部函数如果期望 &[u8]，传 &payload
@@ -890,5 +889,82 @@ fn connected_udp_recv_result(
             Ok(None)
         }
         Err(e) => Err(e).with_context(|| format!("{direction} UDP recv failed")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use session::UdpSessionKind;
+
+    #[test]
+    fn same_key_returns_same_lock() {
+        let key_locks: UdpKeyLocks = Arc::new(DashMap::new());
+        let key = UdpSessionKey {
+            kind: UdpSessionKind::Tproxy,
+            client_addr: "127.0.0.1:1000".parse().unwrap(),
+            target_addr: "10.0.0.1:53".parse().unwrap(),
+        };
+
+        let l1 = get_udp_key_lock(&key_locks, key);
+        let l2 = get_udp_key_lock(&key_locks, key);
+
+        assert!(Arc::ptr_eq(&l1, &l2));
+    }
+
+    #[test]
+    fn different_keys_return_different_locks() {
+        let key_locks: UdpKeyLocks = Arc::new(DashMap::new());
+        let key_a = UdpSessionKey {
+            kind: UdpSessionKind::Tproxy,
+            client_addr: "127.0.0.1:1000".parse().unwrap(),
+            target_addr: "10.0.0.1:53".parse().unwrap(),
+        };
+        let key_b = UdpSessionKey {
+            kind: UdpSessionKind::Tproxy,
+            client_addr: "127.0.0.1:2000".parse().unwrap(),
+            target_addr: "10.0.0.1:53".parse().unwrap(),
+        };
+
+        let l1 = get_udp_key_lock(&key_locks, key_a);
+        let l2 = get_udp_key_lock(&key_locks, key_b);
+
+        assert!(!Arc::ptr_eq(&l1, &l2));
+    }
+
+    #[test]
+    fn reap_keeps_referenced_lock() {
+        let key_locks: UdpKeyLocks = Arc::new(DashMap::new());
+        let key = UdpSessionKey {
+            kind: UdpSessionKind::Tproxy,
+            client_addr: "127.0.0.1:1000".parse().unwrap(),
+            target_addr: "10.0.0.1:53".parse().unwrap(),
+        };
+
+        let lock = get_udp_key_lock(&key_locks, key);
+        reap_idle_udp_key_locks(&key_locks);
+
+        // 外部仍持有 lock 的 Arc，strong_count > 1，不应被 reap
+        assert!(key_locks.contains_key(&key));
+        assert!(Arc::ptr_eq(&lock, &get_udp_key_lock(&key_locks, key)));
+    }
+
+    #[test]
+    fn reap_removes_idle_lock() {
+        let key_locks: UdpKeyLocks = Arc::new(DashMap::new());
+        let key = UdpSessionKey {
+            kind: UdpSessionKind::Tproxy,
+            client_addr: "127.0.0.1:1000".parse().unwrap(),
+            target_addr: "10.0.0.1:53".parse().unwrap(),
+        };
+
+        // 创建 lock 后立刻 drop，只剩 map 自身持有
+        drop(get_udp_key_lock(&key_locks, key));
+        assert!(key_locks.contains_key(&key));
+
+        reap_idle_udp_key_locks(&key_locks);
+
+        // strong_count == 1 的空闲 lock 应被清除
+        assert!(!key_locks.contains_key(&key));
     }
 }

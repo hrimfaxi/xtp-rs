@@ -397,8 +397,13 @@ impl AppState {
         }
 
         let cache_active = !self.route_cache_ttl.is_zero();
+        let normalized = if cache_active {
+            normalize_domain(domain)
+        } else {
+            None
+        };
         if cache_active {
-            let key = (ip, normalize_domain(domain));
+            let key = (ip, normalized.clone());
             if let Some(entry) = self.direct_cache.get(&key) {
                 if entry.1.elapsed() < self.route_cache_ttl {
                     return entry.0;
@@ -420,7 +425,7 @@ impl AppState {
                 if compiled_geosite_contains(compiled, tag, domain) {
                     debug!(%domain, %tag, "force proxy (geosite)");
                     if cache_active {
-                        self.direct_cache_insert(ip, Some(domain), false);
+                        self.direct_cache_insert_with_key(ip, normalized, false);
                     }
                     return false;
                 }
@@ -429,7 +434,7 @@ impl AppState {
                 if compiled_geosite_contains(compiled, tag, domain) {
                     debug!(%domain, %tag, "force direct (geosite)");
                     if cache_active {
-                        self.direct_cache_insert(ip, Some(domain), true);
+                        self.direct_cache_insert_with_key(ip, normalized, true);
                     }
                     return true;
                 }
@@ -460,18 +465,18 @@ impl AppState {
         };
 
         if cache_active {
-            self.direct_cache_insert(ip, domain, result);
+            self.direct_cache_insert_with_key(ip, normalized, result);
         }
         result
     }
 
-    fn direct_cache_insert(&self, ip: IpAddr, domain: Option<&str>, direct: bool) {
+    fn direct_cache_insert_with_key(&self, ip: IpAddr, normalized: Option<String>, direct: bool) {
         if self.direct_cache.len() >= self.config.route_cache_max {
             let ttl = self.route_cache_ttl;
             self.direct_cache.retain(|_, v| v.1.elapsed() < ttl);
         }
         self.direct_cache
-            .insert((ip, normalize_domain(domain)), (direct, Instant::now()));
+            .insert((ip, normalized), (direct, Instant::now()));
     }
 
     pub fn get_cached_upstream(
@@ -753,7 +758,7 @@ impl AppState {
                 })?;
 
                 let mut exact = HashMap::new();
-                let mut suffixes = Vec::new();
+                let mut suffixes = Vec::with_capacity(domain_map.len());
                 for (domain_key, group) in domain_map {
                     if let Some(stripped) = domain_key.strip_prefix('.') {
                         let suffix_norm = canonical_domain(stripped);
@@ -821,7 +826,7 @@ impl AppState {
         })
     }
 
-    /// 使用 &Arc<Self> 保证 self 就是任务所属的 generation
+    /// 使用 `&Arc<Self>` 保证 self 就是任务所属的 generation
     pub async fn spawn_all_tasks(self: &Arc<Self>) -> Result<()> {
         self.spawn_listener_tasks()?;
         self.spawn_port_forward_tasks().await?;

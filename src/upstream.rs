@@ -384,28 +384,33 @@ impl UpstreamSet {
         }
 
         // 3. 重新选：平方加权随机
-        let mut candidate_scores = Vec::with_capacity(items.len());
         let weights: Vec<u64> = items
             .iter()
             .map(|u| {
                 let s = u.effective_score();
-                candidate_scores.push((u.id.clone(), s));
                 s * s // 平方加权：高分优势放大
             })
             .collect();
 
         let total_weight: u64 = weights.iter().sum();
 
-        debug!(
-            group = %group,
-            exclude_ctx = ?exclude_ctx,
-            upstream_count = items.len(),
-            best_upstream_id = %best.id,
-            best_score = best_eff,
-            total_weight = total_weight,
-            candidate_scores = ?candidate_scores,
-            "pick: candidate set"
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let candidate_scores: Vec<(&str, u64)> = items
+                .iter()
+                .zip(weights.iter())
+                .map(|(u, w)| (u.id.as_str(), *w))
+                .collect();
+            debug!(
+                group = %group,
+                exclude_ctx = ?exclude_ctx,
+                upstream_count = items.len(),
+                best_upstream_id = %best.id,
+                best_score = best_eff,
+                total_weight = total_weight,
+                candidate_scores = ?candidate_scores,
+                "pick: candidate set"
+            );
+        }
 
         let chosen = if total_weight == 0 {
             let idx = fastrand::usize(..items.len());

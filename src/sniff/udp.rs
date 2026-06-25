@@ -3,7 +3,7 @@ pub trait UdpSnifferEngine: Send + Sync {
     fn new_session(&self) -> Box<dyn UdpSnifferSessionEngine>;
 }
 
-pub trait UdpSnifferSessionEngine: Send {
+pub trait UdpSnifferSessionEngine: Send + Sync {
     fn feed(&mut self, payload: &[u8]) -> UdpSniffOutcome;
 }
 
