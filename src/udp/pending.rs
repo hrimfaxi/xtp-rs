@@ -100,6 +100,33 @@ pub(crate) const UDP_SNIFF_MAX_CACHED_BYTES: usize = 64 * 1024;
 pub(crate) const UDP_SNIFF_MAX_PENDING_SESSIONS: usize = 4096;
 pub(crate) const UDP_SNIFF_REAP_INTERVAL_SECS: u64 = 1;
 
+async fn send_udp_payload(session: &UdpSession, payload: &[u8]) {
+    let key = session.key();
+    session.touch();
+
+    match session.send_payload(payload).await {
+        Ok(sent) => {
+            trace!(
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                payload_len = payload.len(),
+                sent = sent,
+                "UDP packet forwarded"
+            );
+        }
+        Err(e) => {
+            warn!(
+                kind = ?key.kind,
+                client = %key.client_addr,
+                target = %key.target_addr,
+                error = format!("{:#}", e),
+                "failed to forward UDP packet"
+            );
+        }
+    }
+}
+
 pub(crate) async fn forward_udp_payload(
     state: Arc<AppState>,
     spec: UdpSessionSpec,
@@ -126,57 +153,11 @@ pub(crate) async fn forward_udp_payload(
         }
     };
 
-    session.touch();
-
-    match session.send_payload(payload).await {
-        Ok(sent) => {
-            trace!(
-                kind = ?key.kind,
-                client = %key.client_addr,
-                target = %key.target_addr,
-                payload_len = payload.len(),
-                sent = sent,
-                "UDP packet forwarded"
-            );
-        }
-        Err(e) => {
-            warn!(
-                kind = ?key.kind,
-                client = %key.client_addr,
-                target = %key.target_addr,
-                error = format!("{:#}", e),
-                "failed to forward UDP packet"
-            );
-        }
-    }
+    send_udp_payload(&session, payload).await;
 }
 
 pub(crate) async fn forward_udp_payload_to_session(session: Arc<UdpSession>, payload: &[u8]) {
-    let key = session.key();
-
-    session.touch();
-
-    match session.send_payload(payload).await {
-        Ok(sent) => {
-            trace!(
-                kind = ?key.kind,
-                client = %key.client_addr,
-                target = %key.target_addr,
-                payload_len = payload.len(),
-                sent = sent,
-                "UDP packet forwarded (session)"
-            );
-        }
-        Err(e) => {
-            warn!(
-                kind = ?key.kind,
-                client = %key.client_addr,
-                target = %key.target_addr,
-                error = format!("{:#}", e),
-                "failed to forward UDP packet (session)"
-            );
-        }
-    }
+    send_udp_payload(&session, payload).await;
 }
 
 pub(crate) async fn flush_pending_udp_sniff(state: Arc<AppState>, pending: PendingUdpSniff) {
@@ -590,5 +571,46 @@ mod tests {
         )
         .key;
         assert!(!guard.contains_key(&oldest_key));
+    }
+
+    // ---- sniffed_host 传播 ----
+    #[test]
+    fn pending_sniff_created_with_none_host() {
+        let spec = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        );
+        let sniffer = Box::new(DummySniffer);
+        let pending = PendingUdpSniff::new(spec, sniffer, b"data");
+        assert!(pending.spec.sniffed_host.is_none());
+    }
+
+    #[test]
+    fn pending_sniff_host_set_on_match() {
+        let spec = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        );
+        let sniffer = Box::new(DummySniffer);
+        let mut pending = PendingUdpSniff::new(spec, sniffer, b"data");
+
+        // 模拟 sniff 成功后设置 host（与 handle_pending_udp_sniff 的 Matched 路径一致）
+        pending.spec.sniffed_host = Some("example.com".to_string());
+        assert_eq!(pending.spec.sniffed_host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn pending_sniff_host_none_on_expire() {
+        let spec = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        );
+        let sniffer = Box::new(DummySniffer);
+        let mut pending = PendingUdpSniff::new(spec, sniffer, b"data");
+        pending.started_secs = 0;
+
+        // 过期时 host 仍为 None — flush 路径不带 host 创建 session
+        assert!(pending.expired());
+        assert!(pending.spec.sniffed_host.is_none());
     }
 }

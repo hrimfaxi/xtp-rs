@@ -22,7 +22,7 @@ pub(crate) use session::{
 };
 
 use crate::socket_factory::create_direct_udp_socket;
-use crate::socks5::socks5_udp_associate_for_client;
+use crate::socks5::{Socks5UdpAssoc, socks5_udp_associate_for_client};
 use crate::state::AppState;
 use crate::udp::fake::FakeUdpManager;
 use crate::udp::pending::{PendingSniffMap, handle_udp_client_payload, reap_pending_udp_sniff};
@@ -376,78 +376,55 @@ impl UdpSession {
     }
 }
 
+async fn connect_socks5_udp(state: &AppState, spec: &UdpSessionSpec) -> Result<Socks5UdpAssoc> {
+    let key = spec.key;
+    let group = state.lookup_upstream_group(key.client_addr.ip(), spec.sniffed_host.as_deref());
+    let up = state
+        .upstreams
+        .pick_from_group(group)
+        .or_else(|| state.upstreams.pick())
+        .ok_or_else(|| anyhow::anyhow!("no upstream available for group '{}'", group))?;
+    debug!(
+        upstream_id = %up.id,
+        upstream_addr = %up.addr,
+        score = up.score(),
+        kind = ?key.kind,
+        client = %key.client_addr,
+        target = %key.target_addr,
+        sniffed_host = ?spec.sniffed_host,
+        "selected upstream for UDP"
+    );
+
+    let assoc = tokio::time::timeout(
+        std::time::Duration::from_secs(state.config.connect_timeout_secs),
+        socks5_udp_associate_for_client(up.addr, state.config.fwmark, state.socks5_credentials()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("SOCKS5 UDP ASSOCIATE timeout"))??;
+    Ok(assoc)
+}
+
 async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Result<Arc<UdpSession>> {
     let key = spec.key;
     let outbound = match spec.routing {
         UdpRoutingMode::Auto => {
-            if state.should_direct(key.target_addr.ip(), None) {
-                let socket = create_direct_udp_socket(key.target_addr, state.config.fwmark)?;
-                UdpOutbound::Direct { socket }
-            } else {
-                let group = state
-                    .runtime
-                    .client_routes
-                    .lookup(key.client_addr.ip())
-                    .map_or("default", |s| s.as_str());
-                let up = state
-                    .upstreams
-                    .pick_from_group(group)
-                    .or_else(|| state.upstreams.pick())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("no upstream available for group '{}'", group)
-                    })?;
+            if state.should_direct(key.target_addr.ip(), spec.sniffed_host.as_deref()) {
                 debug!(
-                    upstream_id = %up.id,
-                    upstream_addr = %up.addr,
-                    score = up.score(),
                     kind = ?key.kind,
                     client = %key.client_addr,
                     target = %key.target_addr,
-                    "selected upstream for UDP"
+                    sniffed_host = ?spec.sniffed_host,
+                    "UDP session direct"
                 );
-
-                let assoc = tokio::time::timeout(
-                    std::time::Duration::from_secs(state.config.connect_timeout_secs),
-                    socks5_udp_associate_for_client(
-                        up.addr,
-                        state.config.fwmark,
-                        state.socks5_credentials(),
-                    ),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("SOCKS5 UDP ASSOCIATE timeout"))??;
+                let socket = create_direct_udp_socket(key.target_addr, state.config.fwmark)?;
+                UdpOutbound::Direct { socket }
+            } else {
+                let assoc = connect_socks5_udp(&state, &spec).await?;
                 UdpOutbound::Socks5 { assoc }
             }
         }
         UdpRoutingMode::ForceSocks5 => {
-            let group = state
-                .runtime
-                .client_routes
-                .lookup(key.client_addr.ip())
-                .map_or("default", |s| s.as_str());
-            let up = state
-                .upstreams
-                .pick_from_group(group)
-                .or_else(|| state.upstreams.pick())
-                .ok_or_else(|| anyhow::anyhow!("no upstream available for group '{}'", group))?;
-            debug!(
-                upstream_id = %up.id,
-                upstream_addr = %up.addr,
-                score = up.score(),
-                key = ?key,
-                "selected upstream for UDP"
-            );
-
-            let assoc = tokio::time::timeout(
-                std::time::Duration::from_secs(state.config.connect_timeout_secs),
-                socks5_udp_associate_for_client(
-                    up.addr,
-                    state.config.fwmark,
-                    state.socks5_credentials(),
-                ),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("SOCKS5 UDP ASSOCIATE timeout"))??;
+            let assoc = connect_socks5_udp(&state, &spec).await?;
             UdpOutbound::Socks5 { assoc }
         }
     };

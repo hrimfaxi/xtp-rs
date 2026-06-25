@@ -145,6 +145,25 @@ struct MinimalCountry<'a> {
     iso_code: Option<&'a str>,
 }
 
+async fn load_ip_list_from_file(
+    base: Vec<String>,
+    path: Option<&str>,
+    field_name: &str,
+) -> Result<Vec<String>> {
+    let Some(p) = path else { return Ok(base) };
+    let content = tokio::fs::read_to_string(p)
+        .await
+        .with_context(|| format!("failed to read {field_name} '{p}'"))?;
+    let mut list = base;
+    list.extend(
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string()),
+    );
+    Ok(list)
+}
+
 fn normalize_domain(domain: Option<&str>) -> Option<String> {
     domain.map(|d| canonical_domain(d))
 }
@@ -331,6 +350,31 @@ impl AppState {
                 .client_domain_routes
                 .lookup(client_ip)
                 .is_some()
+    }
+
+    /// 根据客户端 IP 和可选域名查找 upstream group。
+    ///
+    /// 优先按域名匹配 client_domain_routes，fallback 到 IP 匹配 client_routes。
+    /// 两者都未命中时返回 "default"。
+    pub fn lookup_upstream_group(&self, client_ip: IpAddr, domain: Option<&str>) -> &str {
+        if let Some(domain_str) = domain {
+            self.runtime
+                .client_domain_routes
+                .lookup(client_ip)
+                .and_then(|t| t.lookup(domain_str))
+                .or_else(|| {
+                    self.runtime
+                        .client_routes
+                        .lookup(client_ip)
+                        .map(|s| s.as_str())
+                })
+                .unwrap_or("default")
+        } else {
+            self.runtime
+                .client_routes
+                .lookup(client_ip)
+                .map_or("default", |s| s.as_str())
+        }
     }
 
     /// 判断目标 IP 是否应直连。
@@ -572,31 +616,18 @@ impl AppState {
             }
         };
 
-        let mut direct_list = config.force_direct_ips.clone();
-        if let Some(ref p) = config.force_direct_ips_file {
-            let content = tokio::fs::read_to_string(p)
-                .await
-                .with_context(|| format!("failed to read force_direct_ips_file '{}'", p))?;
-            direct_list.extend(
-                content
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(|l| l.trim().to_string()),
-            );
-        }
-
-        let mut socks5_list = config.force_socks5_ips.clone();
-        if let Some(ref p) = config.force_socks5_ips_file {
-            let content = tokio::fs::read_to_string(p)
-                .await
-                .with_context(|| format!("failed to read force_socks5_ips_file '{}'", p))?;
-            socks5_list.extend(
-                content
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(|l| l.trim().to_string()),
-            );
-        }
+        let direct_list = load_ip_list_from_file(
+            config.force_direct_ips.clone(),
+            config.force_direct_ips_file.as_deref(),
+            "force_direct_ips_file",
+        )
+        .await?;
+        let socks5_list = load_ip_list_from_file(
+            config.force_socks5_ips.clone(),
+            config.force_socks5_ips_file.as_deref(),
+            "force_socks5_ips_file",
+        )
+        .await?;
 
         let direct_nets =
             parse_ip_net_list(&direct_list).context("failed to parse force_direct_ips")?;

@@ -243,4 +243,37 @@ mod tests {
         assert!(matches!(spec.routing, UdpRoutingMode::ForceSocks5));
         assert!(matches!(spec.reply_path, UdpReplyPath::PortForward { .. }));
     }
+
+    #[test]
+    fn sniffed_host_none_by_default() {
+        let spec = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        );
+        assert!(spec.sniffed_host.is_none());
+    }
+
+    #[test]
+    fn sniffed_host_can_be_set_after_creation() {
+        let mut spec = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        );
+        assert!(spec.sniffed_host.is_none());
+
+        spec.sniffed_host = Some("example.com".to_string());
+        assert_eq!(spec.sniffed_host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn sniffed_host_preserved_through_clone() {
+        let mut spec = UdpSessionSpec::for_tproxy(
+            "127.0.0.1:1000".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
+        );
+        spec.sniffed_host = Some("google.com".to_string());
+
+        let cloned = spec.clone();
+        assert_eq!(cloned.sniffed_host.as_deref(), Some("google.com"));
+    }
 }

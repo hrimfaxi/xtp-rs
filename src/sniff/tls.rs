@@ -175,44 +175,7 @@ pub fn sniff_tls_sni_from_prefix(
 mod tests {
     use super::*;
     use crate::sniff::tls_common::TlsSniffError;
-
-    // 复用 tls_common 测试中的 client_hello_body
-    fn client_hello_body(sni: Option<&str>, ech: bool) -> Vec<u8> {
-        // 直接借用 crate::sniff::tls_common::tests::client_hello_body（若可见）
-        // 若无法访问则重复实现（为保证独立性，这里复制一份）
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x03, 0x03]);
-        body.extend_from_slice(&[0u8; 32]);
-        body.push(0);
-        body.extend_from_slice(&[0x00, 0x02, 0x00, 0xff]);
-        body.extend_from_slice(&[0x01, 0x00]);
-        let mut exts = Vec::new();
-        if let Some(host) = sni {
-            let host_bytes = host.as_bytes();
-            let name_len = host_bytes.len();
-            let sni_list_len = 3 + name_len;
-            let ext_data_len = 2 + sni_list_len;
-            let mut sni_ext = Vec::new();
-            sni_ext.extend_from_slice(&[0x00, 0x00]);
-            sni_ext.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
-            sni_ext.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
-            sni_ext.push(0x00);
-            sni_ext.extend_from_slice(&(name_len as u16).to_be_bytes());
-            sni_ext.extend_from_slice(host_bytes);
-            exts.extend_from_slice(&sni_ext);
-        }
-        if ech {
-            let mut ech_ext = Vec::new();
-            ech_ext.extend_from_slice(&[0xfe, 0x0d]);
-            ech_ext.extend_from_slice(&[0x00, 0x00]);
-            exts.extend_from_slice(&ech_ext);
-        }
-        if !exts.is_empty() {
-            body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
-            body.extend_from_slice(&exts);
-        }
-        body
-    }
+    use crate::sniff::tls_common::tests::client_hello_body;
 
     fn make_tls_record(content_type: u8, major: u8, minor: u8, payload: &[u8]) -> Vec<u8> {
         let mut rec = vec![content_type, major, minor];

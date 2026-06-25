@@ -57,26 +57,7 @@ fn hkdf_expand_label(
     out: &mut [u8],
 ) -> Result<(), UdpSniffError> {
     let hk = Hkdf::<Sha256>::from_prk(secret).map_err(|_| UdpSniffError::ParseError)?;
-
-    let full_label = {
-        let mut v = Vec::with_capacity("tls13 ".len() + label.len());
-        v.extend_from_slice(b"tls13 ");
-        v.extend_from_slice(label.as_bytes());
-        v
-    };
-
-    if full_label.len() > u8::MAX as usize || context.len() > u8::MAX as usize {
-        return Err(UdpSniffError::ParseError);
-    }
-
-    let mut info = Vec::with_capacity(2 + 1 + full_label.len() + 1 + context.len());
-    info.extend_from_slice(&(out.len() as u16).to_be_bytes());
-    info.push(full_label.len() as u8);
-    info.extend_from_slice(&full_label);
-    info.push(context.len() as u8);
-    info.extend_from_slice(context);
-
-    hk.expand(&info, out).map_err(|_| UdpSniffError::ParseError)
+    hkdf_expand_label_from_hkdf(&hk, label, context, out)
 }
 
 fn hkdf_expand_label_from_hkdf(

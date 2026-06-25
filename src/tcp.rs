@@ -28,8 +28,12 @@ async fn try_connect_socks5_group(
     target: &TcpUpstreamTarget,
     state: &Arc<AppState>,
     mut group: &str,
+    exclude: Option<&str>,
 ) -> Result<(TcpStream, Arc<Upstream>)> {
     let mut failed: HashSet<String> = HashSet::new();
+    if let Some(id) = exclude {
+        failed.insert(id.to_string());
+    }
 
     loop {
         let up = if failed.is_empty() {
@@ -208,6 +212,7 @@ async fn pick_and_connect(
     client_addr: &SocketAddr,
     orig_dst: SocketAddr,
     domain: Option<&str>,
+    exclude: Option<&str>,
 ) -> Result<(TcpStream, Arc<Upstream>)> {
     trace!(
         client = %client_addr,
@@ -216,39 +221,7 @@ async fn pick_and_connect(
         "tcp upstream select"
     );
 
-    let group = if let Some(domain_str) = domain {
-        let domain_group = state
-            .runtime
-            .client_domain_routes
-            .lookup(client_addr.ip())
-            .and_then(|t| t.lookup(domain_str));
-        trace!(
-            client_ip = %client_addr.ip(),
-            domain = %domain_str,
-            domain_result = %domain_group.unwrap_or("None"),
-            "tcp client_domain_routes lookup"
-        );
-
-        let ip_group = state.runtime.client_routes.lookup(client_addr.ip());
-        trace!(
-            client_ip = %client_addr.ip(),
-            ip_result = %ip_group.map(|s| s.as_str()).unwrap_or("None"),
-            "tcp client_routes lookup"
-        );
-
-        domain_group
-            .or_else(|| ip_group.map(|s| s.as_str()))
-            .unwrap_or("default")
-    } else {
-        let ip_group = state.runtime.client_routes.lookup(client_addr.ip());
-        trace!(
-            client_ip = %client_addr.ip(),
-            ip_result = %ip_group.map(|s| s.as_str()).unwrap_or("None"),
-            "tcp client_routes lookup (no domain)"
-        );
-
-        ip_group.map_or("default", |s| s.as_str())
-    };
+    let group = state.lookup_upstream_group(client_addr.ip(), domain);
 
     trace!(
         client = %client_addr,
@@ -256,7 +229,7 @@ async fn pick_and_connect(
         "tcp selected group"
     );
 
-    let (s, up) = try_connect_socks5_group(target, state, group).await?;
+    let (s, up) = try_connect_socks5_group(target, state, group, exclude).await?;
     debug!(
         upstream_id = %up.id,
         upstream_addr = %up.addr,
@@ -378,15 +351,22 @@ pub async fn handle_tcp_connection(
                             &client_addr,
                             orig_dst,
                             domain.as_deref(),
+                            Some(&cached_up.id),
                         )
                         .await?;
                         (s, Some(up))
                     }
                 }
             } else {
-                let (s, up) =
-                    pick_and_connect(&target, &state, &client_addr, orig_dst, domain.as_deref())
-                        .await?;
+                let (s, up) = pick_and_connect(
+                    &target,
+                    &state,
+                    &client_addr,
+                    orig_dst,
+                    domain.as_deref(),
+                    None,
+                )
+                .await?;
                 (s, Some(up))
             }
         }
@@ -464,7 +444,7 @@ pub async fn run_tcp_port_forward(
                             debug!(peer = %peer_addr, remote = %remote, "port-forward TCP via SOCKS5");
 
                             let target = TcpUpstreamTarget::Socks5Ip(remote);
-                            let (mut upstream, up) = match try_connect_socks5_group(&target, &state, "default").await {
+                            let (mut upstream, up) = match try_connect_socks5_group(&target, &state, "default", None).await {
                                 Ok((s, up)) => {
                                     debug!(
                                         upstream_id = %up.id,

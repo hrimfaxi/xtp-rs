@@ -619,7 +619,7 @@ fn calc_quic_score(rtt_ms: f64, loss_rate: f64, mtu: u16) -> Option<u32> {
 
     let base = 1000u32;
 
-    let loss_penalty = match (loss_rate * 100.0) as u32 {
+    let loss_penalty = match (loss_rate * 100.0).round() as u32 {
         0 => 0,
         1..=2 => 60,
         3..=5 => 200,
