@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use dashmap::DashMap;
+use portable_atomic::AtomicU64;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::{debug, trace};
@@ -149,8 +150,24 @@ mod tests {
         let addr = "127.0.0.1:10000".parse().unwrap();
 
         insert_entry(&mgr, addr, 0);
-        let s1 = mgr.sockets.get(&FakeUdpKey { src_addr: addr, fwmark: 0 }).unwrap().socket.clone();
-        let s2 = mgr.sockets.get(&FakeUdpKey { src_addr: addr, fwmark: 0 }).unwrap().socket.clone();
+        let s1 = mgr
+            .sockets
+            .get(&FakeUdpKey {
+                src_addr: addr,
+                fwmark: 0,
+            })
+            .unwrap()
+            .socket
+            .clone();
+        let s2 = mgr
+            .sockets
+            .get(&FakeUdpKey {
+                src_addr: addr,
+                fwmark: 0,
+            })
+            .unwrap()
+            .socket
+            .clone();
 
         assert!(Arc::ptr_eq(&s1, &s2));
     }
@@ -164,8 +181,24 @@ mod tests {
         insert_entry(&mgr, a1, 0);
         insert_entry(&mgr, a2, 0);
 
-        let s1 = mgr.sockets.get(&FakeUdpKey { src_addr: a1, fwmark: 0 }).unwrap().socket.clone();
-        let s2 = mgr.sockets.get(&FakeUdpKey { src_addr: a2, fwmark: 0 }).unwrap().socket.clone();
+        let s1 = mgr
+            .sockets
+            .get(&FakeUdpKey {
+                src_addr: a1,
+                fwmark: 0,
+            })
+            .unwrap()
+            .socket
+            .clone();
+        let s2 = mgr
+            .sockets
+            .get(&FakeUdpKey {
+                src_addr: a2,
+                fwmark: 0,
+            })
+            .unwrap()
+            .socket
+            .clone();
 
         assert!(!Arc::ptr_eq(&s1, &s2));
     }
@@ -200,7 +233,15 @@ mod tests {
         let addr = "127.0.0.1:10004".parse().unwrap();
 
         insert_entry(&mgr, addr, 0);
-        let socket = mgr.sockets.get(&FakeUdpKey { src_addr: addr, fwmark: 0 }).unwrap().socket.clone();
+        let socket = mgr
+            .sockets
+            .get(&FakeUdpKey {
+                src_addr: addr,
+                fwmark: 0,
+            })
+            .unwrap()
+            .socket
+            .clone();
 
         // 同步版 retain：timeout 600s，刚插入的 entry 不会被清理
         let now = now_secs();
@@ -210,7 +251,15 @@ mod tests {
             now.saturating_sub(last) < timeout_secs
         });
 
-        let s2 = mgr.sockets.get(&FakeUdpKey { src_addr: addr, fwmark: 0 }).unwrap().socket.clone();
+        let s2 = mgr
+            .sockets
+            .get(&FakeUdpKey {
+                src_addr: addr,
+                fwmark: 0,
+            })
+            .unwrap()
+            .socket
+            .clone();
         assert!(Arc::ptr_eq(&socket, &s2));
     }
 
@@ -218,13 +267,20 @@ mod tests {
     async fn cleanup_removes_expired_entries() {
         let mgr = FakeUdpManager::new();
         let addr = "127.0.0.1:10005".parse().unwrap();
-        let key = FakeUdpKey { src_addr: addr, fwmark: 0 };
+        let key = FakeUdpKey {
+            src_addr: addr,
+            fwmark: 0,
+        };
 
         insert_entry(&mgr, addr, 0);
         let old_socket = mgr.sockets.get(&key).unwrap().socket.clone();
 
         // 把 last_used_secs 改到很久以前，模拟过期
-        mgr.sockets.get(&key).unwrap().last_used_secs.store(1, Ordering::Relaxed);
+        mgr.sockets
+            .get(&key)
+            .unwrap()
+            .last_used_secs
+            .store(1, Ordering::Relaxed);
 
         let now = now_secs();
         let timeout_secs = 10u64;

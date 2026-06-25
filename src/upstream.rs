@@ -1,12 +1,13 @@
 use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
+use portable_atomic::AtomicU64;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixDatagram;

@@ -40,6 +40,7 @@ arc-swap = "1.9.1"
 geosite-rs = { git = "https://github.com/hrimfaxi/geosite-rs.git", branch = "main", optional = true }
 prost = { version = "0.14", optional = true }
 dashmap = "6.2.1"
+portable-atomic = { version = "1", features = ["fallback"] }
 
 [profile.release]
 opt-level = "z"      # 比 "s" 更激进的体积优化

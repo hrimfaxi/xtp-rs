@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
+use portable_atomic::AtomicU64;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;

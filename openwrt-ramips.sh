@@ -1,7 +1,11 @@
 #!/bin/bash
 
 export PATH=$PATH:~/.cargo/bin
-cross +nightly build --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort --release
+
+cross +nightly build \
+  --target mipsel-unknown-linux-musl \
+  -Z build-std=std,panic_abort \
+  --release
 
 BIN=target/mipsel-unknown-linux-musl/release/xtp-rs
 # Strip 符号表（减小体积）
@@ -16,5 +20,5 @@ else
 fi
 
 # 上传并重启
-#rsync -avrPzz $BIN zdxlz:/usr/bin
-#ssh zdxlz service xtp-rs restart
+#rsync -avrPzz $BIN zengl:/usr/bin
+#ssh zengl service xtp-rs restart

@@ -5,6 +5,7 @@ mod tproxy;
 
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -433,7 +434,7 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
     let session = Arc::new(UdpSession {
         spec,
         outbound,
-        last_seen_secs: std::sync::atomic::AtomicU64::new(now_secs()),
+        last_seen_secs: AtomicU64::new(now_secs()),
         cancel: tokio_util::sync::CancellationToken::new(),
         recv_task: Mutex::new(None),
     });

@@ -428,7 +428,7 @@ pub struct Config {
     /// 缓存 `should_direct` 判定结果和 upstream 选择结果。
     /// - `0`：禁用缓存（每次路由决策都完整计算）
     /// - `>0`：相同 key 的结果在 TTL 内直接复用
-    /// 默认 5 秒。
+    ///   默认 5 秒。
     pub route_cache_ttl_secs: u64,
 
     #[serde(default = "default_route_cache_max")]

@@ -165,7 +165,7 @@ async fn load_ip_list_from_file(
 }
 
 fn normalize_domain(domain: Option<&str>) -> Option<String> {
-    domain.map(|d| canonical_domain(d))
+    domain.map(canonical_domain)
 }
 
 /// Key = (目标 IP, 规范化域名)。域名为 None 表示 IP-only 判定（sniff 前）。
