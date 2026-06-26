@@ -176,6 +176,8 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 | `udp_session_timeout_secs` | u64 | `60` | UDP 会话空闲超时时间（秒） |
 | `connect_timeout_secs` | u64 | `20` | 上游连接超时时间（秒） |
 | `splice` | bool | `false` | TCP 转发是否优先使用 splice 零拷贝 |
+| `route_cache_ttl_secs` | u64 | `5` | 路由结果缓存 TTL（秒），0 禁用缓存 |
+| `route_cache_max` | usize | `4096` | 路由结果缓存最大条目数 |
 
 ### 上游动态评分参数
 
@@ -245,10 +247,17 @@ addr = "192.168.1.100:1080"   # SOCKS5 地址
 "192.168.2.0/24" = "group_b"
 
 # 按客户端源 IP + 域名模式分配 upstream 分组
+# 支持两种域名匹配模式：
+#   - ".example.com"：后缀匹配，匹配 example.com 及其所有子域名
+#   - "example.com"：精确匹配，仅匹配 example.com
 [client_domain_routes."192.168.1.100"]
 ".google.com" = "proxy_group"    # 后缀匹配
 "example.com" = "direct_group"   # 精确匹配
 ```
+
+- `client_routes`：按客户端源 IP 分配 upstream 分组，支持单 IP 和 CIDR。
+- `client_domain_routes`：按客户端源 IP + 域名模式分配 upstream 分组，优先级高于 `client_routes`。
+- 域名匹配按后缀长度降序优先匹配，确保最长匹配优先。
 
 ### 端口转发
 

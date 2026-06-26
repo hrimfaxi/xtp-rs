@@ -109,6 +109,31 @@ tcp_peek_buffer_size = 32768
 # log_level = "info"
 
 # -------------------------------
+# 连接超时
+# -------------------------------
+
+# 上游连接超时时间（秒）
+# 用于 TCP direct/SOCKS5 连接和 UDP SOCKS5 ASSOCIATE 的超时
+# 默认值：20
+connect_timeout_secs = 20
+
+# -------------------------------
+# 路由缓存
+# -------------------------------
+
+# 路由结果缓存 TTL（秒）
+# 缓存 should_direct 判定结果和 upstream 选择结果
+# - 0：禁用缓存（每次路由决策都完整计算）
+# - >0：相同 key 的结果在 TTL 内直接复用
+# 默认值：5
+route_cache_ttl_secs = 5
+
+# 路由结果缓存最大条目数
+# direct cache 和 upstream cache 各自独立上限
+# 默认值：4096
+route_cache_max = 4096
+
+# -------------------------------
 # 分流规则
 # -------------------------------
 
@@ -202,3 +227,21 @@ quic_weight = 70
 # bind = "127.0.0.1:5353"
 # remote = "8.8.8.8:53"
 # network = "both"   # tcp / udp / both
+
+# ==================================================
+# 客户端路由配置（可选）
+# ==================================================
+
+# 按客户端源 IP 分配 upstream 分组
+# 格式：客户端 IP/CIDR = upstream 分组名
+# [client_routes]
+# "192.168.1.100" = "group_a"
+# "192.168.2.0/24" = "group_b"
+
+# 按客户端源 IP + 域名模式分配 upstream 分组
+# 优先级高于 client_routes，支持两种域名匹配模式：
+#   - ".example.com"：后缀匹配，匹配 example.com 及其所有子域名
+#   - "example.com"：精确匹配，仅匹配 example.com
+# [client_domain_routes."192.168.1.100"]
+# ".google.com" = "proxy_group"
+# "example.com" = "direct_group"

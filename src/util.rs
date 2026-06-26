@@ -306,7 +306,7 @@ impl TaskGuard {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let token = self.child_token();
-        let mut handles = self.handles.lock().expect("bad taskguard lock");
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         // 自动清理已结束任务，避免动态 spawn 场景下无限增长
         handles.retain(|h| !h.is_finished());
         handles.push(tokio::spawn(build(token)));
@@ -317,7 +317,7 @@ impl TaskGuard {
         self.cancel.cancel();
 
         let handles: Vec<_> = {
-            let mut h = self.handles.lock().expect("bad taskguard lock");
+            let mut h = self.handles.lock().unwrap_or_else(|e| e.into_inner());
             h.drain(..).collect()
         };
 

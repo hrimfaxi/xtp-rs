@@ -314,13 +314,17 @@ fn quic_skip_ack_frame(
 fn quic_skip_connection_close_frame(frames: &[u8], off: &mut usize) -> Result<(), UdpSniffError> {
     let _error_code = quic_read_varint(frames, off)?;
     let _frame_type = quic_read_varint(frames, off)?;
-    let reason_len = quic_read_varint(frames, off)? as usize;
+    let reason_len = usize::try_from(quic_read_varint(frames, off)?)
+        .map_err(|_| UdpSniffError::TooLarge)?;
 
-    if *off + reason_len > frames.len() {
+    let end = (*off)
+        .checked_add(reason_len)
+        .ok_or(UdpSniffError::TooLarge)?;
+    if end > frames.len() {
         return Err(UdpSniffError::InsufficientPrefix);
     }
 
-    *off += reason_len;
+    *off = end;
 
     Ok(())
 }
@@ -341,15 +345,20 @@ fn quic_parse_initial_frames(
                 quic_skip_ack_frame(frame_type, frames, &mut off)?;
             }
             0x06 => {
-                let crypto_offset = quic_read_varint(frames, &mut off)? as usize;
-                let crypto_len = quic_read_varint(frames, &mut off)? as usize;
+                let crypto_offset = usize::try_from(quic_read_varint(frames, &mut off)?)
+                    .map_err(|_| UdpSniffError::TooLarge)?;
+                let crypto_len = usize::try_from(quic_read_varint(frames, &mut off)?)
+                    .map_err(|_| UdpSniffError::TooLarge)?;
 
-                if off + crypto_len > frames.len() {
+                let crypto_end = off
+                    .checked_add(crypto_len)
+                    .ok_or(UdpSniffError::TooLarge)?;
+                if crypto_end > frames.len() {
                     return Err(UdpSniffError::InsufficientPrefix);
                 }
 
-                crypto.write(crypto_offset, &frames[off..off + crypto_len])?;
-                off += crypto_len;
+                crypto.write(crypto_offset, &frames[off..crypto_end])?;
+                off = crypto_end;
             }
             0x1c => {
                 quic_skip_connection_close_frame(frames, &mut off)?;
@@ -433,13 +442,17 @@ fn quic_parse_one_initial_packet(
 
     off += scid_len;
 
-    let token_len = quic_read_varint(datagram, &mut off)? as usize;
+    let token_len = usize::try_from(quic_read_varint(datagram, &mut off)?)
+        .map_err(|_| UdpSniffError::TooLarge)?;
 
-    if off + token_len > datagram.len() {
+    let token_end = off
+        .checked_add(token_len)
+        .ok_or(UdpSniffError::TooLarge)?;
+    if token_end > datagram.len() {
         return Err(UdpSniffError::InsufficientPrefix);
     }
 
-    off += token_len;
+    off = token_end;
 
     let protected_len = quic_read_varint(datagram, &mut off)? as usize;
 

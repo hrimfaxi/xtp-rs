@@ -347,7 +347,7 @@ impl UpstreamSet {
         // 2. 检查 sticky：仅当 tolerance > 0 时启用
         if self.tolerance > 0 {
             let sticky = {
-                let guard = self.current.lock().expect("bad current lock");
+                let guard = self.current.lock().unwrap_or_else(|e| e.into_inner());
                 guard
                     .get(group)
                     .and_then(|id| id.as_ref())
@@ -398,8 +398,7 @@ impl UpstreamSet {
         if tracing::enabled!(tracing::Level::DEBUG) {
             let candidate_scores: Vec<(&str, u64)> = items
                 .iter()
-                .zip(weights.iter())
-                .map(|(u, w)| (u.id.as_str(), *w))
+                .map(|u| (u.id.as_str(), u.effective_score()))
                 .collect();
             debug!(
                 group = %group,
@@ -465,7 +464,7 @@ impl UpstreamSet {
         // 4. 更新 current
         self.current
             .lock()
-            .expect("bad current lock")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(group.to_string(), Some(chosen.id.clone()));
 
         Some(chosen)

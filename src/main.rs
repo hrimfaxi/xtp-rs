@@ -82,7 +82,13 @@ async fn main() -> Result<()> {
     let sighup_guard = TaskGuard::new();
     let state_for_sighup = Arc::clone(&state);
     sighup_guard.spawn(move |cancel| async move {
-        let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP handler install failed");
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = format!("{:#}", e), "SIGHUP handler install failed");
+                return;
+            }
+        };
         loop {
             tokio::select! {
                 biased;

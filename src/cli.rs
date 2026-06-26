@@ -620,6 +620,10 @@ impl Config {
             bail!("connect_timeout_secs must be > 0");
         }
 
+        if self.health_check_interval_secs > 0 && self.health_check_fail_threshold == 0 {
+            bail!("health_check_fail_threshold must be > 0 when health_check is enabled");
+        }
+
         for u in &self.upstream {
             if !u.gain.is_finite() || u.gain <= 0.0 {
                 bail!(

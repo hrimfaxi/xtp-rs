@@ -99,7 +99,19 @@ impl UdpRuntime {
             }
         };
 
-        let created = create_udp_session(state.clone(), spec.clone()).await;
+        let created = match tokio::spawn(create_udp_session(state.clone(), spec.clone())).await {
+            Ok(result) => result,
+            Err(join_err) => {
+                let mut sessions = self.sessions.lock().await;
+                sessions.remove(&key);
+                drop(sessions);
+                creating_notify.notify_waiters();
+                if join_err.is_panic() {
+                    return Err(anyhow!("UDP session creation panicked"));
+                }
+                return Err(anyhow!("UDP session creation task failed: {join_err}"));
+            }
+        };
 
         let mut sessions = self.sessions.lock().await;
 
