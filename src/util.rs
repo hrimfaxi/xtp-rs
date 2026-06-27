@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use ipnet::IpNet;
 use iptrie::{Ipv4Prefix, Ipv4RTrieSet, Ipv6Prefix, Ipv6RTrieSet};
 use nix::errno::Errno;
@@ -80,7 +80,7 @@ where
     if splice {
         tokio_splice::zero_copy_bidirectional(client, upstream)
             .await
-            .map_err(|e| anyhow::anyhow!("splice error: {}", e))
+            .map_err(|e| anyhow!("splice error: {}", e))
     } else {
         tokio::io::copy_bidirectional(client, upstream)
             .await

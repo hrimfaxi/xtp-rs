@@ -577,7 +577,7 @@ pub fn parse_listen_addr(listen: &str) -> Result<(IpAddr, u16)> {
 impl Config {
     pub fn build_upstream_set(&self) -> anyhow::Result<UpstreamSet> {
         if self.upstream.is_empty() {
-            anyhow::bail!("upstream array must not be empty");
+            bail!("upstream array must not be empty");
         }
 
         let mut ids = std::collections::HashSet::new();
@@ -585,10 +585,10 @@ impl Config {
         for u in &self.upstream {
             let trimmed = u.id.trim();
             if trimmed.is_empty() {
-                anyhow::bail!("upstream id must not be empty");
+                bail!("upstream id must not be empty");
             }
             if !ids.insert(trimmed) {
-                anyhow::bail!("duplicate upstream id: {}", trimmed);
+                bail!("duplicate upstream id: {}", trimmed);
             }
         }
 

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use portable_atomic::AtomicU64;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -114,7 +114,7 @@ impl UdpSession {
 
     pub(crate) async fn send_payload(&self, payload: &[u8]) -> Result<usize> {
         if self.cancel.is_cancelled() {
-            anyhow::bail!("UDP session cancelled");
+            bail!("UDP session cancelled");
         }
 
         let key = self.key();

@@ -397,7 +397,7 @@ async fn connect_socks5_udp(state: &AppState, spec: &UdpSessionSpec) -> Result<S
         .upstreams
         .pick_from_group(group)
         .or_else(|| state.upstreams.pick())
-        .ok_or_else(|| anyhow::anyhow!("no upstream available for group '{}'", group))?;
+        .ok_or_else(|| anyhow!("no upstream available for group '{}'", group))?;
     debug!(
         upstream_id = %up.id,
         upstream_addr = %up.addr,
@@ -414,7 +414,7 @@ async fn connect_socks5_udp(state: &AppState, spec: &UdpSessionSpec) -> Result<S
         socks5_udp_associate_for_client(up.addr, state.config.fwmark, state.socks5_credentials()),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("SOCKS5 UDP ASSOCIATE timeout"))??;
+    .map_err(|_| anyhow!("SOCKS5 UDP ASSOCIATE timeout"))??;
     Ok(assoc)
 }
 

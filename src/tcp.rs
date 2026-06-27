@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -115,7 +115,7 @@ pub async fn connect_tcp_upstream(
             debug!(addr = %addr, "direct connect");
             tokio::time::timeout(timeout, direct_connect(*addr, fwmark))
                 .await
-                .map_err(|_| anyhow::anyhow!("direct connect timeout"))?
+                .map_err(|_| anyhow!("direct connect timeout"))?
         }
         TcpUpstreamTarget::Socks5Ip(addr) => {
             debug!(addr = %addr, "proxy connect by ip");
@@ -124,7 +124,7 @@ pub async fn connect_tcp_upstream(
                 socks5_connect(Socks5Target::Ip(*addr), socks5_addr, fwmark, creds),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("SOCKS5 connect timeout"))?
+            .map_err(|_| anyhow!("SOCKS5 connect timeout"))?
         }
         TcpUpstreamTarget::Socks5Domain { host, port } => {
             debug!(host = %host, port = port, "proxy connect by hostname");
@@ -138,7 +138,7 @@ pub async fn connect_tcp_upstream(
                 ),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("SOCKS5 connect timeout"))?
+            .map_err(|_| anyhow!("SOCKS5 connect timeout"))?
         }
     }
 }
@@ -265,7 +265,7 @@ pub async fn handle_tcp_connection(
             let mut upstream =
                 tokio::time::timeout(timeout, direct_connect(target_addr, state.config.fwmark))
                     .await
-                    .map_err(|_| anyhow::anyhow!("direct connect timeout"))??;
+                    .map_err(|_| anyhow!("direct connect timeout"))??;
             return relay_tcp(
                 &mut client,
                 &mut upstream,
@@ -303,7 +303,7 @@ pub async fn handle_tcp_connection(
             let timeout = std::time::Duration::from_secs(state.config.connect_timeout_secs);
             let s = tokio::time::timeout(timeout, direct_connect(target_addr, state.config.fwmark))
                 .await
-                .map_err(|_| anyhow::anyhow!("direct connect timeout"))??;
+                .map_err(|_| anyhow!("direct connect timeout"))??;
             (s, None)
         }
         _ => {

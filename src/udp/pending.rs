@@ -1,3 +1,17 @@
+//! UDP 嗅探的 pending 状态管理。
+//!
+//! QUIC 等 UDP 协议的首个数据包可能不足以提取域名（SNI），需要等待更多包。
+//! 本模块维护一个 `PendingSniffMap`：当嗅探返回 `NeedMore` 时创建 pending 条目，
+//! 后续到达的包继续喂给 sniffer，直到成功匹配、超时或容量溢出。
+//!
+//! 嗅探期间收到的包缓存在 `PendingReplayBuffer` 中，嗅探完成后一次性 flush
+//! （带或不带 sniffed_host）到真正的 UDP session。
+//!
+//! 关键常量：
+//! - 超时 5 秒，每会话最多缓存 8 包 / 64KB
+//! - 全局上限 4096 个 pending，溢出时淘汰最老条目
+//! - 主循环每秒调用 `reap_pending_udp_sniff` 清理过期条目
+
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
