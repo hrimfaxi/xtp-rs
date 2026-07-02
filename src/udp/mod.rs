@@ -74,6 +74,13 @@ impl UdpRuntime {
 
             match sessions.get(&key) {
                 Some(UdpSessionEntry::Ready(session)) => {
+                    trace!(
+                        session_id = session.session_id,
+                        kind = ?key.kind,
+                        client = %key.client_addr,
+                        target = %key.target_addr,
+                        "UDP session reuse"
+                    );
                     return Ok(session.clone());
                 }
                 Some(UdpSessionEntry::Creating(notify)) => {
@@ -149,6 +156,7 @@ impl UdpRuntime {
                 creating_notify.notify_waiters();
 
                 debug!(
+                    session_id = session.session_id,
                     kind = ?key.kind,
                     client = %key.client_addr,
                     target = %key.target_addr,
@@ -210,16 +218,16 @@ impl UdpRuntime {
             };
 
             if should_remove {
-                sessions.remove(&key);
-                session.cancel.cancel();
-                expired_sessions.push(session);
-
                 debug!(
+                    session_id = session.session_id,
                     kind = ?key.kind,
                     client = %key.client_addr,
                     target = %key.target_addr,
                     "UDP session expired and cancelled"
                 );
+                sessions.remove(&key);
+                session.cancel.cancel();
+                expired_sessions.push(session);
             }
         }
 
@@ -443,7 +451,23 @@ async fn create_udp_session(state: Arc<AppState>, spec: UdpSessionSpec) -> Resul
         }
     };
 
+    let session_id = crate::udp::session::UDP_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let outbound_desc = match &outbound {
+        UdpOutbound::Direct { .. } => "direct",
+        UdpOutbound::Socks5 { .. } => "socks5",
+    };
+    debug!(
+        session_id = session_id,
+        kind = ?spec.key.kind,
+        client = %spec.key.client_addr,
+        target = %spec.key.target_addr,
+        sniffed_host = ?spec.sniffed_host,
+        outbound = outbound_desc,
+        "UDP session creating"
+    );
+
     let session = Arc::new(UdpSession {
+        session_id,
         spec,
         outbound,
         last_seen_secs: AtomicU64::new(now_secs()),
@@ -528,6 +552,11 @@ async fn run_direct_udp_recv_loop(
     let mut buf = new_udp_buf();
     let _ = ready_tx.send(());
 
+    let idle_timeout_secs = state.config.udp_session_idle_timeout_secs;
+    let mut got_first_response = false;
+    let initial_idle_deadline = wait_initial_idle_timeout(idle_timeout_secs);
+    tokio::pin!(initial_idle_deadline);
+
     loop {
         reset_udp_buf(&mut buf);
         tokio::select! {
@@ -538,6 +567,16 @@ async fn run_direct_udp_recv_loop(
                     client = %key.client_addr,
                     target = %key.target_addr,
                     "direct UDP recv loop cancelled"
+                );
+                return Ok(());
+            }
+            _ = &mut initial_idle_deadline, if !got_first_response => {
+                warn!(
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    timeout_secs = idle_timeout_secs,
+                    "direct UDP session no response, cancelling"
                 );
                 return Ok(());
             }
@@ -553,6 +592,9 @@ async fn run_direct_udp_recv_loop(
                 };
 
                 session.touch();
+                if !got_first_response {
+                    got_first_response = true;
+                }
 
                 let payload = &buf[..n];
 
@@ -583,16 +625,41 @@ async fn run_socks5_udp_recv_loop(
 
     let _ = ready_tx.send(());
 
+    // 首包空闲超时：session 建立后，如果在指定时间内没收到任何回包，
+    // 说明 SOCKS5 UDP relay 可能失效，主动取消 session 以便客户端快速重试。
+    let idle_timeout_secs = state.config.udp_session_idle_timeout_secs;
+    let mut got_first_response = false;
+    let initial_idle_deadline = wait_initial_idle_timeout(idle_timeout_secs);
+    tokio::pin!(initial_idle_deadline);
+    let mut recv_count: u64 = 0;
+    let mut inject_ok_count: u64 = 0;
+
     loop {
         reset_udp_buf(&mut buf);
         tokio::select! {
             biased;
             _ = session.cancel.cancelled() => {
                 debug!(
+                    session_id = session.session_id,
                     kind = ?key.kind,
                     client = %key.client_addr,
                     target = %key.target_addr,
+                    recv_count = recv_count,
+                    inject_count = inject_ok_count,
                     "SOCKS5 UDP recv loop cancelled"
+                );
+                return Ok(());
+            }
+
+            _ = &mut initial_idle_deadline, if !got_first_response => {
+                warn!(
+                    session_id = session.session_id,
+                    kind = ?key.kind,
+                    client = %key.client_addr,
+                    target = %key.target_addr,
+                    relay = %relay_addr,
+                    timeout_secs = idle_timeout_secs,
+                    "SOCKS5 UDP session no response, cancelling"
                 );
                 return Ok(());
             }
@@ -609,6 +676,18 @@ async fn run_socks5_udp_recv_loop(
                 };
 
                 session.touch();
+                recv_count += 1;
+                if !got_first_response {
+                    got_first_response = true;
+                    debug!(
+                        session_id = session.session_id,
+                        kind = ?key.kind,
+                        client = %key.client_addr,
+                        target = %key.target_addr,
+                        relay = %relay_addr,
+                        "SOCKS5 UDP session first response received"
+                    );
+                }
 
                 if tracing::enabled!(tracing::Level::TRACE) {
                     trace!(
@@ -663,6 +742,7 @@ async fn run_socks5_udp_recv_loop(
                         Some(relay_addr),
                     )
                     .await;
+                inject_ok_count += 1;
             }
         }
     }
@@ -877,6 +957,15 @@ async fn spawn_udp_packet_handler(
         let _key_guard = key_lock.lock().await;
         handle_udp_client_payload(state, pending_sniff, spec, &payload).await;
     });
+}
+
+/// 等待首包空闲超时。idle_timeout_secs > 0 时正常 sleep，否则永不触发。
+async fn wait_initial_idle_timeout(idle_timeout_secs: u64) {
+    if idle_timeout_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(idle_timeout_secs)).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 fn connected_udp_recv_result(

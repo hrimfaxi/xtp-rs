@@ -193,6 +193,25 @@ pub struct Config {
     /// 默认关闭，避免在路由器/嵌入式平台产生额外 CPU 开销。
     pub sniff_quic_sni: bool,
 
+    #[serde(default = "default_quic_sniff_forward_first")]
+    /// QUIC sniff 遇到 NeedMore 时，是否立即转发首包而不是阻塞等待。
+    ///
+    /// - `true`（默认）：首包立即转发（无 sniffed_host，走 IP 路由），
+    ///   pending 只缓存后续包。sniff 成功后后续包带 sniffed_host 转发。
+    ///   优点：QUIC 握手零延迟，避免 PTO 重传等待。
+    ///   缺点：首包走 IP 路由，若域名路由与 IP 路由不一致可能走错路径（罕见）。
+    ///
+    /// - `false`：首包缓存在 pending 中，等 sniff 完成后一起 flush。
+    ///   所有包都带 sniffed_host，路由完全准确，但 ClientHello 跨包时会阻塞 ~1s。
+    pub quic_sniff_forward_first: bool,
+
+    #[serde(default = "default_udp_session_idle_timeout_secs")]
+    /// UDP session 建立后，如果在此时间内没收到任何回包，主动取消 session。
+    ///
+    /// 用于检测 SOCKS5 UDP relay 失效的僵尸 session。
+    /// 设为 0 则禁用此超时（仅依赖 udp_session_timeout_secs 清理）。
+    pub udp_session_idle_timeout_secs: u64,
+
     #[serde(default = "default_tcp_peek_buffer_size")]
     /// TCP 首包 sniff 使用的全局 peek 缓冲区上限。
     ///
@@ -479,6 +498,14 @@ pub fn default_sniff_quic_sni() -> bool {
     false
 }
 
+pub fn default_quic_sniff_forward_first() -> bool {
+    true
+}
+
+pub fn default_udp_session_idle_timeout_secs() -> u64 {
+    5
+}
+
 pub fn default_tcp_peek_buffer_size() -> usize {
     32 * 1024
 }
@@ -746,6 +773,8 @@ mod tests {
             sniff_tls_sni: false,
             sniff_http_host: false,
             sniff_quic_sni: false,
+            quic_sniff_forward_first: true,
+            udp_session_idle_timeout_secs: 5,
             tcp_peek_buffer_size: 32 * 1024,
             tls_sniff_peek_len: 2048,
             tls_sniff_max_len: 32 * 1024,

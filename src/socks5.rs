@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::socket_factory::SocketFactory;
 use crate::util::hex_encode;
@@ -398,11 +398,19 @@ pub async fn socks5_udp_associate_for_client(
     };
 
     // SOCKS5 服务器返回 0.0.0.0 / [::] 时，应 fallback 到 socks5 server 本身的地址
+    let raw_relay_addr = relay_addr;
     let relay_addr = if relay_addr.ip().is_unspecified() {
         SocketAddr::new(socks5_addr.ip(), relay_addr.port())
     } else {
         relay_addr
     };
+
+    debug!(
+        proxy = %socks5_addr,
+        raw_relay = %raw_relay_addr,
+        effective_relay = %relay_addr,
+        "SOCKS5 UDP ASSOCIATE resolved relay address"
+    );
 
     let udp_socket = SocketFactory::new()
         .connect_direct_udp(relay_addr, fwmark)

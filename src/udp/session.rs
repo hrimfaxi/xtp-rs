@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use portable_atomic::AtomicU64;
+use portable_atomic::{AtomicU64, AtomicUsize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -8,6 +8,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
+
+pub(crate) static UDP_SESSION_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 use crate::socks5::{Socks5UdpAssoc, Socks5UdpTarget, build_socks5_udp_packet};
 use crate::util::{is_io_emsgsize, now_secs};
@@ -84,6 +86,7 @@ pub(crate) enum UdpSessionEntry {
 }
 
 pub(crate) struct UdpSession {
+    pub(crate) session_id: usize,
     pub(crate) spec: UdpSessionSpec,
     pub(crate) outbound: UdpOutbound,
     pub(crate) last_seen_secs: AtomicU64,

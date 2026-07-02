@@ -1181,6 +1181,8 @@ mod tests {
             sniff_tls_sni: false,
             sniff_http_host: false,
             sniff_quic_sni: false,
+            quic_sniff_forward_first: true,
+            udp_session_idle_timeout_secs: 5,
             tcp_peek_buffer_size: 32 * 1024,
             tls_sniff_peek_len: 2048,
             tls_sniff_max_len: 32 * 1024,

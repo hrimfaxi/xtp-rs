@@ -93,6 +93,22 @@ http_sniff_timeout_ms = 1000
 # 这是一个总开关：开启后可以解析 QUIC 连接的 SNI 用于分流/日志
 sniff_quic_sni = false
 
+# QUIC sniff 遇到 NeedMore（ClientHello 跨多个包）时，是否立即转发首包。
+#
+# - true（默认）：首包立即转发（无 sniffed_host，走 IP 路由），pending 只缓存后续包。
+#   优点：QUIC 握手零延迟，避免 PTO 重传等待（~1s）。
+#   缺点：首包走 IP 路由，若域名路由与 IP 路由不一致可能走错路径（罕见）。
+#
+# - false：首包缓存在 pending 中，等 sniff 完成后一起 flush。
+#   所有包都带 sniffed_host，路由完全准确，但 ClientHello 跨包时会阻塞 ~1s。
+#
+# quic_sniff_forward_first = true
+
+# UDP session 建立后，如果在此时间内没收到任何回包，主动取消 session。
+# 用于检测 SOCKS5 UDP relay 失效的僵尸 session，避免等待整个 udp_session_timeout。
+# 设为 0 则禁用（仅依赖 udp_session_timeout_secs 清理）。
+# udp_session_idle_timeout_secs = 5
+
 # -------------------------------
 # 全局 peek 缓冲区
 # -------------------------------

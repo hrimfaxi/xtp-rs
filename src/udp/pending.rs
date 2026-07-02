@@ -42,6 +42,14 @@ impl PendingReplayBuffer {
         }
     }
 
+    // 空缓冲：首包已立即转发，pending 只缓存后续包
+    pub(crate) fn new_empty() -> Self {
+        Self {
+            datagrams: Vec::new(),
+            cached_bytes: 0,
+        }
+    }
+
     // 接受 &[u8]，内部复制为 Bytes
     pub(crate) fn push_datagram(&mut self, payload: &[u8]) -> bool {
         let next_bytes = self.cached_bytes.saturating_add(payload.len());
@@ -87,6 +95,20 @@ impl PendingUdpSniff {
             spec,
             sniffer,
             replay: PendingReplayBuffer::new(first_payload),
+        }
+    }
+
+    // 首包已立即转发，pending 从空缓冲开始，只缓存后续包
+    pub(crate) fn new_forwarded(
+        spec: UdpSessionSpec,
+        sniffer: Box<dyn UdpSnifferSessionEngine>,
+    ) -> Self {
+        use crate::util::now_secs;
+        Self {
+            started_secs: now_secs(),
+            spec,
+            sniffer,
+            replay: PendingReplayBuffer::new_empty(),
         }
     }
 
@@ -177,6 +199,13 @@ pub(crate) async fn forward_udp_payload_to_session(session: Arc<UdpSession>, pay
 pub(crate) async fn flush_pending_udp_sniff(state: Arc<AppState>, pending: PendingUdpSniff) {
     let datagrams = pending.replay.into_datagrams();
     let spec = pending.spec;
+
+    // 注意：不更新已有 session 的 sniffed_host。
+    // 首包已按 IP 路由建立 session 并发送了首个 SOCKS5 包（target=IP），
+    // 如果中途改成域名 target，SOCKS5 relay 可能把域名解析到不同 IP，
+    // 导致 QUIC 客户端跟不同服务器通信，握手失败。
+    // 整条连接保持首包建立时的 target 语义（IP）一致性。
+
     for payload in datagrams {
         forward_udp_payload(state.clone(), spec.clone(), &payload).await;
     }
@@ -356,18 +385,37 @@ pub(crate) async fn handle_new_udp_sniff(
                 return true;
             }
             UdpSniffOutcome::NeedMore { protocol } => {
-                debug!(
-                    sniffer = sniffer.name(),
-                    protocol = udp_sniff_protocol_name(protocol),
-                    kind = ?key.kind,
-                    client = %key.client_addr,
-                    target = %key.target_addr,
-                    payload_len = payload.len(),
-                    "UDP sniff need more, pending created"
-                );
+                if state.config.quic_sniff_forward_first {
+                    debug!(
+                        sniffer = sniffer.name(),
+                        protocol = udp_sniff_protocol_name(protocol),
+                        kind = ?key.kind,
+                        client = %key.client_addr,
+                        target = %key.target_addr,
+                        payload_len = payload.len(),
+                        "UDP sniff need more, forwarding first packet immediately"
+                    );
 
-                let pending = PendingUdpSniff::new(spec, sniff_session, payload);
-                pending_sniff.insert(key, pending);
+                    // 首包立即转发，不阻塞 QUIC 握手启动。
+                    // pending 只缓存后续包，等 sniff 成功后带 sniffed_host 转发。
+                    forward_udp_payload(state.clone(), spec.clone(), payload).await;
+
+                    let pending = PendingUdpSniff::new_forwarded(spec, sniff_session);
+                    pending_sniff.insert(key, pending);
+                } else {
+                    debug!(
+                        sniffer = sniffer.name(),
+                        protocol = udp_sniff_protocol_name(protocol),
+                        kind = ?key.kind,
+                        client = %key.client_addr,
+                        target = %key.target_addr,
+                        payload_len = payload.len(),
+                        "UDP sniff need more, pending created"
+                    );
+
+                    let pending = PendingUdpSniff::new(spec, sniff_session, payload);
+                    pending_sniff.insert(key, pending);
+                }
                 enforce_pending_udp_sniff_capacity(pending_sniff).await;
                 return true;
             }

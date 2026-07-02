@@ -7,11 +7,45 @@ set -eu
 . "$(dirname "$0")/common.sh"
 
 # -------------------------------------------------------------------------
-# 0. 获取路由器本机 IPv4 地址
+# 0. 获取代理入口接口名和本机 IPv4 地址
 # -------------------------------------------------------------------------
+# TPROXY 仅应在指定入口接口上拦截流量，避免非预期接口（如 WAN、VPN、
+# Docker bridge）的流量被误截获。可通过环境变量 XTP_PROXY_INGRESS_IFACES
+# 指定多个接口（空格分隔），未设置时自动从 uci 获取 network.lan.device，
+# 最终 fallback 到 br-lan。
+# -------------------------------------------------------------------------
+XTP_PROXY_INGRESS_IFACES="${XTP_PROXY_INGRESS_IFACES:-}"
+if [ -z "$XTP_PROXY_INGRESS_IFACES" ]; then
+  XTP_PROXY_INGRESS_IFACES="$(uci -q get network.lan.device || true)"
+fi
+: "${XTP_PROXY_INGRESS_IFACES:=br-lan}"
+
+# 关闭 glob 展开，防止变量中的通配符被误展开为文件名
+set -f
+
+# 校验接口名称合法性，生成 nft 集合格式："br-lan", "br-guest"
+XTP_PROXY_INGRESS_IFACES_NFT=""
+for _iface in $XTP_PROXY_INGRESS_IFACES; do
+  case "$_iface" in
+    *[![:alnum:]_.:-]*|'')
+      echo "xtp-rs: invalid ingress interface name: $_iface" >&2
+      exit 1
+      ;;
+  esac
+  # 接口可能尚未创建（VPN、动态 bridge 等），仅警告不阻断
+  if ! ip_cmd link show dev "$_iface" >/dev/null 2>&1; then
+    echo "xtp-rs: warning: ingress interface not present yet: $_iface" >&2
+  fi
+  if [ -n "$XTP_PROXY_INGRESS_IFACES_NFT" ]; then
+    XTP_PROXY_INGRESS_IFACES_NFT="${XTP_PROXY_INGRESS_IFACES_NFT}, "
+  fi
+  XTP_PROXY_INGRESS_IFACES_NFT="${XTP_PROXY_INGRESS_IFACES_NFT}\"${_iface}\""
+done
+
+set +f
+
 # 自动收集当前系统上所有非回环、非链路本地的 IPv4 地址，并将其加入
 # local_ip，避免发往路由器本机服务的流量再次进入透明代理路径。
-# -------------------------------------------------------------------------
 LOCAL_IPV4_ENTRIES="$(
   ip_cmd -4 -o addr show 2>/dev/null \
     | awk '
@@ -80,7 +114,7 @@ load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 #   随后该包命中 ip rule → 表 100 → local route → 被 TPROXY 截获到
 #   127.0.0.1:10810 或 [::1]:10810。
 #
-# prerouting 链（filter hook）：
+# prerouting 链（mangle hook）：
 #   对于作为网关时转发的流量（或外部进入本机的流量），同样将 TCP
 #   80/443 标记 fwmark=1 并 TPROXY 到本地端口。
 #
@@ -93,13 +127,14 @@ load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 # 发出的请求再次被自身拦截，形成无限代理环路。
 #
 # -------------------------------------------------------------------------
-# 【divert 链 —— 短路径优化（可选）】
+# 【divert —— 短路径优化（可选）】
 # -------------------------------------------------------------------------
 # 已被 TPROXY 接管的连接，内核会为其关联一个 "transparent" 状态的
-# socket。divert 链在 mangle 优先级提前检查：
-#   socket transparent 1 meta mark set 1 accept
+# socket。prerouting 链中优先检查：
+#   socket transparent 1 socket wildcard 0 meta mark set 1 accept
 # 若匹配，说明该连接已在代理中，直接标记并放行，跳过后面复杂的规则
 # 匹配，降低 CPU 开销。OpenWrt 需安装 kmod-nf-socket / kmod-nft-socket。
+# socket wildcard 0 避免误匹配绑定 0.0.0.0/:: 的通配监听 socket。
 #
 # -------------------------------------------------------------------------
 # 【保留地址（reserved_ip / reserved_ip6）】
@@ -166,7 +201,24 @@ ${LOCAL_IPV4_ENTRIES}
   }
 
   chain prerouting {
-    type filter hook prerouting priority filter; policy accept;
+    type filter hook prerouting priority mangle; policy accept;
+
+    # 仅代理明确配置的入口接口；未列入集合的 WAN、VPN、Docker 等接口均不进入 TPROXY。
+    # 多接口示例：XTP_PROXY_INGRESS_IFACES="br-lan br-guest"
+    # lo 必须放行：xtp-rs 出站到本地 SOCKS5（127.0.0.1:20808 等）的包经 output 链
+    # 标记 mark 2 后走策略路由表 100 从 lo 回环，响应包从 lo 入站经过此 hook，
+    # 若 lo 不在白名单中会被丢弃，导致 xtp-rs 无法连接本地 upstream。
+    iifname != { ${XTP_PROXY_INGRESS_IFACES_NFT}, "lo" } return
+
+    # 已被 transparent socket 接管的 TCP 连接：恢复策略路由 mark，不重复 TPROXY
+    # openwrt: 需要 kmod-nf-socket 和 kmod-nft-socket 包支持
+    meta l4proto tcp socket transparent 1 socket wildcard 0 meta mark set 1 accept
+
+    # xtp-rs 自身发起真实上游连接时设置 mark 2，防止再次进入 TPROXY。
+    # 注意：不能在此 return mark 1；本机 output 链标记为 mark 1 的首包
+    # 需要继续命中后面的 TPROXY 规则。
+    meta mark 2 return
+
     # 可选：根据源 IP 跳过代理（如内网管理段）
     # ip saddr 10.2.1.0/24 return
     ip daddr @local_ip return
@@ -176,7 +228,7 @@ ${LOCAL_IPV4_ENTRIES}
     ip6 daddr @reserved_ip6 return
     meta l4proto tcp ip6 daddr fd00::/8 return
     ip6 daddr fd00::/8 udp dport != 53 return
-    meta mark 2 return
+
     meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
     meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
     meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
@@ -197,13 +249,6 @@ ${LOCAL_IPV4_ENTRIES}
     meta mark 2 counter return
     meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 accept
     meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 accept
-  }
-
-  # divert表用于避免已有连接的包二次通过TPROXY，理论上有一定的性能提升
-  # openwrt: 需要kmod-nf-socket和kmod-nft-socket包支持
-  chain divert {
-    type filter hook prerouting priority mangle; policy accept;
-    meta l4proto tcp socket transparent 1 meta mark set 1 accept
   }
 }
 NFTABLES
