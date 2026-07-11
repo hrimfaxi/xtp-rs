@@ -203,6 +203,12 @@ ${LOCAL_IPV4_ENTRIES}
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
 
+    # xtp-rs 自身发起真实上游连接时设置 mark 2，防止再次进入 TPROXY。
+    # 注意：不能在此 return mark 1；本机 output 链标记为 mark 1 的首包
+    # 需要继续命中后面的 TPROXY 规则。
+    # 放在最前面：mark 是整数比较，比 iifname 字符串匹配更快。
+    meta mark 2 return
+
     # 仅代理明确配置的入口接口；未列入集合的 WAN、VPN、Docker 等接口均不进入 TPROXY。
     # 多接口示例：XTP_PROXY_INGRESS_IFACES="br-lan br-guest"
     # lo 必须放行：xtp-rs 出站到本地 SOCKS5（127.0.0.1:20808 等）的包经 output 链
@@ -213,11 +219,6 @@ ${LOCAL_IPV4_ENTRIES}
     # 已被 transparent socket 接管的 TCP 连接：恢复策略路由 mark，不重复 TPROXY
     # openwrt: 需要 kmod-nf-socket 和 kmod-nft-socket 包支持
     meta l4proto tcp socket transparent 1 socket wildcard 0 meta mark set 1 accept
-
-    # xtp-rs 自身发起真实上游连接时设置 mark 2，防止再次进入 TPROXY。
-    # 注意：不能在此 return mark 1；本机 output 链标记为 mark 1 的首包
-    # 需要继续命中后面的 TPROXY 规则。
-    meta mark 2 return
 
     # 可选：根据源 IP 跳过代理（如内网管理段）
     # ip saddr 10.2.1.0/24 return
@@ -237,6 +238,7 @@ ${LOCAL_IPV4_ENTRIES}
 
   chain output {
     type route hook output priority filter; policy accept;
+    meta mark 2 counter return
     # 如需要使用uid xtp-rs来标记进程的包，解除以下注释
     # meta skuid xtp-rs counter return
     ip daddr @local_ip return
@@ -246,7 +248,6 @@ ${LOCAL_IPV4_ENTRIES}
     ip6 daddr @reserved_ip6 return
     meta l4proto tcp ip6 daddr fd00::/8 return
     ip6 daddr fd00::/8 udp dport != 53 return
-    meta mark 2 counter return
     meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 accept
     meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 accept
   }

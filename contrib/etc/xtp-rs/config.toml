@@ -169,6 +169,17 @@ direct_countries = ["CN"]
 # force_direct_ips_file = "/path/to/direct.txt"
 # force_socks5_ips_file = "/path/to/proxy.txt"
 
+# 强制直连域名（优先级高于 geosite 规则，低于 force_socks5_domains）
+# 格式：
+#   ".example.com" → 后缀匹配（匹配 example.com 及所有子域名）
+#   "example.com"  → 精确匹配
+# 典型用途：排除特定域名使其不走代理
+# force_direct_domains = []
+
+# 强制走 SOCKS5 的域名（最高优先级域名规则）
+# 格式同 force_direct_domains
+# force_socks5_domains = []
+
 # 是否将本地/回环/链路本地 IP 强制视为直连
 # 默认值：true
 direct_local_ip = true

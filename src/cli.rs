@@ -324,6 +324,22 @@ pub struct Config {
     pub direct_countries: Vec<String>,
 
     #[serde(default)]
+    /// 强制直连的域名列表（优先级高于 geosite，但低于 force_socks5_domains）。
+    ///
+    /// 支持两种格式：
+    /// - `.example.com`：后缀匹配，匹配 example.com 及其所有子域名
+    /// - `example.com`：精确匹配，仅匹配 example.com
+    ///
+    /// 典型用途：排除特定域名使其不走代理，即使它们在 proxy_geosite_tags 命中的分类中。
+    pub force_direct_domains: Vec<String>,
+
+    #[serde(default)]
+    /// 强制走 SOCKS5 的域名列表（域名规则中优先级最高，高于 geosite 和 force_direct_domains）。
+    ///
+    /// 格式同 `force_direct_domains`。
+    pub force_socks5_domains: Vec<String>,
+
+    #[serde(default)]
     /// 强制直连的 IP / CIDR 列表。
     ///
     /// 优先级低于 `force_socks5_ips`，高于 MMDB 国家判定。
@@ -788,6 +804,8 @@ mod tests {
             http_sniff_timeout_ms: 1000,
             log_level: None,
             direct_countries: vec![],
+            force_direct_domains: vec![],
+            force_socks5_domains: vec![],
             force_direct_ips: vec![],
             force_socks5_ips: vec![],
             force_direct_ips_file: None,

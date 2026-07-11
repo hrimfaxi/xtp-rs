@@ -112,6 +112,63 @@ pub type ClientIpRoutes = ClientCidrRoutes<String>;
 /// 客户端域名路由表：基于 CIDR 最长前缀匹配，映射到域名路由表。
 pub type ClientDomainRoutes = ClientCidrRoutes<DomainRouteTable>;
 
+/// 编译后的域名集合，支持精确匹配和后缀匹配。
+/// 配置格式：
+/// - `.example.com` → 后缀匹配（匹配 example.com 及所有子域名）
+/// - `example.com` → 精确匹配
+///
+/// 内部使用两个 HashSet，后缀匹配通过逐标签迭代实现，天然去重。
+#[derive(Default)]
+struct DomainSet {
+    exact: HashSet<String>,
+    suffixes: HashSet<String>,
+}
+
+impl DomainSet {
+    fn compile(domains: &[String]) -> Self {
+        let mut exact = HashSet::new();
+        let mut suffixes = HashSet::new();
+        for raw in domains {
+            if let Some(stripped) = raw.strip_prefix('.') {
+                let norm = canonical_domain(stripped);
+                if norm.is_empty() {
+                    warn!(raw = %raw, "invalid suffix domain pattern, skipping");
+                    continue;
+                }
+                suffixes.insert(norm);
+            } else {
+                let norm = canonical_domain(raw);
+                if norm.is_empty() {
+                    warn!(raw = %raw, "invalid exact domain pattern, skipping");
+                    continue;
+                }
+                exact.insert(norm);
+            }
+        }
+        DomainSet { exact, suffixes }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.suffixes.is_empty()
+    }
+
+    fn matches_canonical(&self, domain: &str) -> bool {
+        if self.exact.contains(domain) {
+            return true;
+        }
+        let mut candidate = domain;
+        loop {
+            if self.suffixes.contains(candidate) {
+                return true;
+            }
+            match candidate.find('.') {
+                Some(pos) => candidate = &candidate[pos + 1..],
+                None => return false,
+            }
+        }
+    }
+}
+
 pub struct AppRuntime {
     pub proxy_mode: AtomicU8,
     pub udp: Arc<UdpRuntime>,
@@ -168,7 +225,10 @@ fn normalize_domain(domain: Option<&str>) -> Option<String> {
     domain.map(canonical_domain)
 }
 
-/// Key = (目标 IP, 规范化域名)。域名为 None 表示 IP-only 判定（sniff 前）。
+/// Key = (目标 IP, 规范化域名)。域名为 None 表示 sniff 前的 IP-only 判定。
+/// 仅缓存由 IP 规则（force_socks5_ips / force_direct_ips / direct_countries）和
+/// GeoIP 得出的结果；key 仍包含规范化域名以区分不同调用上下文。
+/// 域名规则（force_*_domains / geosite）在 cache 之前执行且不写缓存。
 /// Value = (是否直连, 写入时间)。
 type DirectCache = DashMap<(IpAddr, Option<String>), (bool, Instant)>;
 
@@ -185,6 +245,8 @@ pub struct AppState {
     pub force_direct_v6: Ipv6RTrieSet,
     pub force_socks5_v4: Ipv4RTrieSet,
     pub force_socks5_v6: Ipv6RTrieSet,
+    force_direct_domains: DomainSet,
+    force_socks5_domains: DomainSet,
     pub sniffers: Vec<Arc<dyn Sniffer>>,
     pub udp_sniffers: Vec<Arc<dyn UdpSnifferEngine>>,
     pub upstreams: UpstreamSet,
@@ -328,6 +390,11 @@ fn compiled_geosite_contains(compiled: &CompiledGeosite, tag: &str, domain: &str
 impl AppState {
     /// geosite 是否需要域名 sniff
     pub fn need_geosite_sniff(&self) -> bool {
+        // force_direct_domains / force_socks5_domains 也需要域名才能匹配
+        if !self.force_direct_domains.is_empty() || !self.force_socks5_domains.is_empty() {
+            return true;
+        }
+
         #[cfg(feature = "geosite")]
         if self.compiled_geosite.is_some()
             && (!self.config.proxy_geosite_tags.is_empty()
@@ -402,20 +469,20 @@ impl AppState {
         } else {
             None
         };
-        if cache_active {
-            let key = (ip, normalized.clone());
-            if let Some(entry) = self.direct_cache.get(&key) {
-                if entry.1.elapsed() < self.route_cache_ttl {
-                    return entry.0;
-                }
-                drop(entry);
-                self.direct_cache.remove(&key);
-            }
-        }
 
-        #[cfg(not(feature = "geosite"))]
-        {
-            _ = domain;
+        // 域名规则：force_socks5_domains > force_direct_domains > geosite
+        // 不经过 cache，每次请求都完整执行
+
+        if let Some(domain) = domain {
+            let canonical = canonical_domain(domain);
+            if self.force_socks5_domains.matches_canonical(&canonical) {
+                debug!(%domain, "force proxy (force_socks5_domains)");
+                return false;
+            }
+            if self.force_direct_domains.matches_canonical(&canonical) {
+                debug!(%domain, "force direct (force_direct_domains)");
+                return true;
+            }
         }
 
         // 域名规则优先
@@ -424,20 +491,26 @@ impl AppState {
             for tag in &self.config.proxy_geosite_tags {
                 if compiled_geosite_contains(compiled, tag, domain) {
                     debug!(%domain, %tag, "force proxy (geosite)");
-                    if cache_active {
-                        self.direct_cache_insert_with_key(ip, normalized, false);
-                    }
                     return false;
                 }
             }
             for tag in &self.config.direct_geosite_tags {
                 if compiled_geosite_contains(compiled, tag, domain) {
                     debug!(%domain, %tag, "force direct (geosite)");
-                    if cache_active {
-                        self.direct_cache_insert_with_key(ip, normalized, true);
-                    }
                     return true;
                 }
+            }
+        }
+
+        // IP 规则：先查 cache（缓存 IP-only 决策），再执行显式 IP 规则
+        if cache_active {
+            let key = (ip, normalized.clone());
+            if let Some(entry) = self.direct_cache.get(&key) {
+                if entry.1.elapsed() < self.route_cache_ttl {
+                    return entry.0;
+                }
+                drop(entry);
+                self.direct_cache.remove(&key);
             }
         }
 
@@ -643,6 +716,9 @@ impl AppState {
         let (force_socks5_v4, force_socks5_v6) =
             build_ip_tries(&socks5_nets).context("failed to build force_socks5 tries")?;
 
+        let force_direct_domains = DomainSet::compile(&config.force_direct_domains);
+        let force_socks5_domains = DomainSet::compile(&config.force_socks5_domains);
+
         let sniffers = build_sniffers(&config);
         let udp_sniffers = build_udp_sniffers(&config);
         let upstreams = config.build_upstream_set()?;
@@ -800,6 +876,8 @@ impl AppState {
             force_direct_v6,
             force_socks5_v4,
             force_socks5_v6,
+            force_direct_domains,
+            force_socks5_domains,
             sniffers,
             udp_sniffers,
             upstreams,
@@ -1142,6 +1220,8 @@ mod tests {
             force_direct_v6: Ipv6RTrieSet::new(),
             force_socks5_v4: Ipv4RTrieSet::new(),
             force_socks5_v6: Ipv6RTrieSet::new(),
+            force_direct_domains: DomainSet::default(),
+            force_socks5_domains: DomainSet::default(),
             sniffers: vec![],
             udp_sniffers: vec![],
             upstreams,
@@ -1196,6 +1276,8 @@ mod tests {
             http_sniff_timeout_ms: 1000,
             log_level: None,
             direct_countries: vec![],
+            force_direct_domains: vec![],
+            force_socks5_domains: vec![],
             force_direct_ips: vec![],
             force_socks5_ips: vec![],
             force_direct_ips_file: None,
@@ -1529,5 +1611,159 @@ mod tests {
                 .and_then(|t| t.lookup("test.com")),
             None
         );
+    }
+
+    #[test]
+    fn domain_set_suffix_match() {
+        let set = DomainSet::compile(&[".example.com".to_string()]);
+        assert!(set.matches_canonical("example.com"));
+        assert!(set.matches_canonical("www.example.com"));
+        assert!(set.matches_canonical("deep.sub.example.com"));
+        assert!(!set.matches_canonical("notexample.com"));
+        assert!(!set.matches_canonical("example.org"));
+    }
+
+    #[test]
+    fn domain_set_exact_match() {
+        let set = DomainSet::compile(&["exact.org".to_string()]);
+        assert!(set.matches_canonical("exact.org"));
+        assert!(!set.matches_canonical("sub.exact.org"));
+        assert!(!set.matches_canonical("notexact.org"));
+    }
+
+    #[test]
+    fn domain_set_mixed() {
+        let set =
+            DomainSet::compile(&[".playstation.com".to_string(), "standalone.net".to_string()]);
+        assert!(set.matches_canonical("store.playstation.com"));
+        assert!(set.matches_canonical("playstation.com"));
+        assert!(!set.matches_canonical("playstation.com.net"));
+        assert!(set.matches_canonical("standalone.net"));
+        assert!(!set.matches_canonical("sub.standalone.net"));
+    }
+
+    #[test]
+    fn domain_set_empty() {
+        let set = DomainSet::compile(&[]);
+        assert!(!set.matches_canonical("anything.com"));
+    }
+
+    #[test]
+    fn domain_set_dedup_suffixes() {
+        let set = DomainSet::compile(&[
+            ".foo.com".to_string(),
+            ".bar.com".to_string(),
+            ".foo.com".to_string(),
+        ]);
+        assert_eq!(set.suffixes.len(), 2);
+        assert!(set.matches_canonical("foo.com"));
+        assert!(set.matches_canonical("bar.com"));
+    }
+
+    #[test]
+    fn domain_set_suffix_label_boundary() {
+        let set = DomainSet::compile(&[".example.com".to_string()]);
+        assert!(set.matches_canonical("example.com"));
+        assert!(!set.matches_canonical("notexample.com"));
+        assert!(!set.matches_canonical("xample.com"));
+    }
+
+    #[test]
+    fn force_direct_domains_provides_direct() {
+        let mut state = minimal_app_state();
+        state.force_direct_domains = DomainSet::compile(&[".psn.com".to_string()]);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(state.should_direct(ip, Some("store.psn.com")));
+        assert!(!state.should_direct(ip, Some("other.com")));
+    }
+
+    #[test]
+    fn force_socks5_domains_overrides_force_direct_domains() {
+        let mut state = minimal_app_state();
+        state.force_socks5_domains = DomainSet::compile(&[".psn.com".to_string()]);
+        state.force_direct_domains = DomainSet::compile(&[".psn.com".to_string()]);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(!state.should_direct(ip, Some("store.psn.com")));
+    }
+
+    #[test]
+    fn domain_rules_not_polluted_by_ip_cache() {
+        let mut state = minimal_app_state();
+        state.force_direct_domains = DomainSet::compile(&[".direct.example".to_string()]);
+        state.force_socks5_domains = DomainSet::compile(&[".proxy.example".to_string()]);
+        let shared_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(!state.should_direct(shared_ip, Some("a.proxy.example")));
+        assert!(state.should_direct(shared_ip, Some("b.direct.example")));
+        assert!(!state.should_direct(shared_ip, Some("c.proxy.example")));
+    }
+
+    #[test]
+    fn force_direct_domain_overrides_force_socks5_ip() {
+        let nets = parse_ip_net_list(&["1.2.3.4".to_string()]).unwrap();
+        let (v4, v6) = build_ip_tries(&nets).unwrap();
+        let mut state = minimal_app_state();
+        state.force_socks5_v4 = v4;
+        state.force_socks5_v6 = v6;
+        state.force_direct_domains = DomainSet::compile(&[".direct.example".to_string()]);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(state.should_direct(ip, Some("a.direct.example")));
+    }
+
+    #[test]
+    fn force_socks5_domain_overrides_force_direct_ip() {
+        let nets = parse_ip_net_list(&["1.2.3.4".to_string()]).unwrap();
+        let (v4, v6) = build_ip_tries(&nets).unwrap();
+        let mut state = minimal_app_state();
+        state.force_direct_v4 = v4;
+        state.force_direct_v6 = v6;
+        state.force_socks5_domains = DomainSet::compile(&[".proxy.example".to_string()]);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(!state.should_direct(ip, Some("a.proxy.example")));
+    }
+
+    #[test]
+    fn domain_rules_do_not_write_direct_cache() {
+        let mut state = minimal_app_state();
+        state.route_cache_ttl = Duration::from_secs(5);
+        state.force_socks5_domains = DomainSet::compile(&[".proxy.example".to_string()]);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        state.should_direct(ip, Some("a.proxy.example"));
+        assert!(
+            state
+                .direct_cache
+                .get(&(ip, Some("a.proxy.example".to_string())))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn domain_rules_override_conflicting_cache() {
+        let mut state = minimal_app_state();
+        state.route_cache_ttl = Duration::from_secs(5);
+        state.force_direct_domains = DomainSet::compile(&[".direct.example".to_string()]);
+
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        // 人为注入与域名规则冲突的缓存条目（缓存说代理，域名规则说直连）
+        state.direct_cache.insert(
+            (ip, Some("a.direct.example".to_string())),
+            (false, Instant::now()),
+        );
+        // 域名规则在 cache 之前执行，应返回直连
+        assert!(state.should_direct(ip, Some("a.direct.example")));
+    }
+
+    #[test]
+    fn force_socks5_domain_overrides_conflicting_cache() {
+        let mut state = minimal_app_state();
+        state.route_cache_ttl = Duration::from_secs(5);
+        state.force_socks5_domains = DomainSet::compile(&[".proxy.example".to_string()]);
+
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        // 缓存认为直连，但域名规则要求代理
+        state.direct_cache.insert(
+            (ip, Some("a.proxy.example".to_string())),
+            (true, Instant::now()),
+        );
+        assert!(!state.should_direct(ip, Some("a.proxy.example")));
     }
 }

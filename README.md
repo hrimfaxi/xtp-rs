@@ -1,46 +1,47 @@
 # xtp-rs
 
-**xtp-rs** 是一个基于 **TPROXY** 的高性能透明代理 / 端口转发工具，可将所有入站 TCP/UDP 流量通过一个或多个 **SOCKS5** 上游服务器转发，并支持基于 IP 归属地（MaxMind GeoIP2）、geosite 域名列表、自定义 CIDR 以及本地地址的智能分流。  
+**xtp-rs** 是一个基于 **TPROXY** 的高性能透明代理 / 端口转发工具，可将所有入站 TCP/UDP 流量通过一个或多个 **SOCKS5** 上游服务器转发，并支持基于 IP 归属地（MaxMind GeoIP2）、geosite 域名列表、自定义 CIDR 以及本地地址的智能分流。
 同时提供动态上游评分、TLS/HTTP/QUIC 域名嗅探、热重载等功能。
 
 ---
 
 ## ✨ 特性
 
-- 🔁 **透明代理 (TPROXY)**  
+- 🔁 **透明代理 (TPROXY)**
   支持 IPv4/IPv6 的 TCP 和 UDP 流量拦截与转发，无需修改客户端配置。
 
-- 🧭 **智能路由**  
-  根据目标 IP 的国家/地区（MaxMind MMDB）、geosite 域名分类、自定义 CIDR 列表、本地地址类型判断选择直连或走代理。  
+- 🧭 **智能路由**
+  根据目标 IP 的国家/地区（MaxMind MMDB）、geosite 域名分类、自定义 CIDR 列表、本地地址类型判断选择直连或走代理。
+  支持通过域名规则（`force_direct_domains` / `force_socks5_domains`）覆盖 geosite 和 IP 规则的路由决策。
   支持运行时通过 `SIGUSR1` 在 `smart` / `global` / `bypass` 模式间动态切换。
 
-- 📡 **多 SOCKS5 上游**  
+- 📡 **多 SOCKS5 上游**
   支持配置多个上游 SOCKS5 服务器，支持用户名/密码认证、分组路由和增益系数。
 
-- 📈 **动态上游评分**  
+- 📈 **动态上游评分**
   实时监控 TCP 吞吐量（通过 `TCP_INFO`），并接收 QUIC 探针（RTT/丢包率/MTU）报告，采用平方加权随机算法自动选择最优上游。支持粘性切换容忍度避免频繁切换。
 
-- 👃 **域名嗅探**  
-  - **TLS SNI**：从 TLS ClientHello 中提取域名（用于 HTTPS）。  
-  - **HTTP Host**：从 HTTP/1.x 请求头中提取域名（用于明文 HTTP）。  
-  - **QUIC SNI**：从 QUIC Initial 包中解析域名（默认启用）。  
+- 👃 **域名嗅探**
+  - **TLS SNI**：从 TLS ClientHello 中提取域名（用于 HTTPS）。
+  - **HTTP Host**：从 HTTP/1.x 请求头中提取域名（用于明文 HTTP）。
+  - **QUIC SNI**：从 QUIC Initial 包中解析域名（默认启用）。
 
   > 注意：上述嗅探功能在配置文件中默认均为 **关闭**，需手动设置 `sniff_tls_sni = true` 等开启。编译时默认包含所有嗅探代码。
 
-- ⚙️ **端口转发**  
+- ⚙️ **端口转发**
   将本地 TCP/UDP 端口强制通过 SOCKS5 转发到指定目标（可用于 DNS over SOCKS5、远程访问等）。
 
-- 🔄 **热重载**  
-  发送 `SIGHUP` 重新加载配置文件，无需重启进程。  
+- 🔄 **热重载**
+  发送 `SIGHUP` 重新加载配置文件，无需重启进程。
   发送 `SIGUSR1` 循环切换代理模式（smart → global → bypass → smart）。
 
-- 🧹 **健康检查**  
+- 🧹 **健康检查**
   可选的主动健康检查（HTTP HEAD），结合被动性能监控，自动隔离故障上游。
 
-- 📦 **一键部署脚本**  
+- 📦 **一键部署脚本**
   提供 `setup-xtp-rs.sh` / `unsetup-xtp-rs.sh` 脚本，快速配置 nftables + 策略路由，实现透明代理环境搭建。
 
-- 🔀 **客户端路由**  
+- 🔀 **客户端路由**
   支持按客户端源 IP 分配不同 upstream 分组，实现精细化流量管理。
 
 ---
@@ -110,7 +111,7 @@ sudo ./unsetup-xtp-rs.sh
 
 ### 2. 编写配置文件
 
-默认配置文件路径为 **`config.toml`**（可通过 `-c` 参数指定）。  
+默认配置文件路径为 **`config.toml`**（可通过 `-c` 参数指定）。
 以下是一个最小化配置示例：
 
 ```toml
@@ -164,6 +165,8 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 | `force_socks5_ips` | [string] | `[]` | 强制走代理的 IP/CIDR（最高优先级） |
 | `force_direct_ips_file` | string | 无 | 额外的强制直连 IP/CIDR 文件路径（每行一个） |
 | `force_socks5_ips_file` | string | 无 | 额外的强制 SOCKS5 IP/CIDR 文件路径（每行一个） |
+| `force_direct_domains` | [string] | `[]` | 强制直连的域名（优先级高于 geosite，低于 force_socks5_domains） |
+| `force_socks5_domains` | [string] | `[]` | 强制走代理的域名（域名规则中优先级最高） |
 | `direct_local_ip` | bool | `true` | 回环/链路本地地址是否强制直连 |
 | `sniff_tls_sni` | bool | `false` | 是否启用 TLS SNI 嗅探（仅非直连 TCP） |
 | `sniff_http_host` | bool | `false` | 是否启用 HTTP Host 嗅探 |
@@ -178,6 +181,26 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 | `splice` | bool | `false` | TCP 转发是否优先使用 splice 零拷贝 |
 | `route_cache_ttl_secs` | u64 | `5` | 路由结果缓存 TTL（秒），0 禁用缓存 |
 | `route_cache_max` | usize | `4096` | 路由结果缓存最大条目数 |
+
+### 路由优先级
+
+在 `smart` 模式下，路由决策按以下优先级从高到低执行（命中即返回）：
+
+1. **域名强制规则** — `force_socks5_domains` → `force_direct_domains`
+2. **geosite 域名分类** — `proxy_geosite_tags` → `direct_geosite_tags`
+3. **路由缓存** — 缓存由 IP 规则和 GeoIP 得出的结果（域名规则不写缓存）
+4. **IP 强制规则** — `force_socks5_ips` → `force_direct_ips`
+5. **本地地址** — `direct_local_ip` 控制的回环/链路本地地址
+6. **GeoIP 国家判定** — `direct_countries` 中的国家代码
+
+域名规则支持两种格式：
+- `.example.com` — 后缀匹配，匹配 example.com 及其所有子域名
+- `example.com` — 精确匹配，仅匹配 example.com
+
+> 示例：排除 PlayStation 流量不走代理
+> ```toml
+> force_direct_domains = [".playstation.com", ".sony.com", ".playstation.net"]
+> ```
 
 ### 上游动态评分参数
 
@@ -217,7 +240,7 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 | `http_sniff_wait_more_ms` | u64 | `100` | HTTP sniff 等待更多数据时间（毫秒） |
 | `http_sniff_timeout_ms` | u64 | `1000` | HTTP sniff 总超时时间（毫秒） |
 
-> **重要**：  
+> **重要**：
 > - XTP_FWMARK=1：用于标记入站需要代理的流量（由 nftables 规则设置）。
 > - XTP_BYPASS_MARK=2：用于标记已代理/直连的出站流量（xtp-rs 程序设置）。
 因此配置文件中的 fwmark 必须设为 2，不能为 1，否则代理程序自己的请求会被再次劫持。
@@ -333,25 +356,25 @@ cargo test
 
 ## ⚠️ 注意事项
 
-1. **权限要求**  
+1. **权限要求**
    透明代理需要 root 权限（或 `CAP_NET_ADMIN`+`CAP_NET_RAW`+`CAP_NET_BIND_SERVICE`）。
 
-2. **splice 零拷贝**  
+2. **splice 零拷贝**
    若系统启用了 IP 转发（`net.ipv4.ip_forward=1`），使用 `splice` 可能导致性能下降，参见 [splice 与转发路径的注意事项](https://github.com/XTLS/Xray-core/discussions/59)。建议保持默认 `splice = false`。
 
-3. **QUIC SNI 嗅探**  
+3. **QUIC SNI 嗅探**
    默认启用，会尝试解析 UDP 数据包的 QUIC Initial，可能增加 CPU 开销。可在配置中关闭。
 
-4. **配置文件路径**  
+4. **配置文件路径**
    默认读取当前工作目录下的 `config.toml`，可通过 `-c` 参数指定。
 
-5. **热重载限制**  
+5. **热重载限制**
    `SIGHUP` 重载时，端口转发监听地址若发生改变，旧地址上的监听 socket 会被关闭，新地址重新绑定。若新旧地址冲突可能导致短暂失败，建议设计时避免频繁变动。
 
-6. **客户端路由**  
+6. **客户端路由**
    使用 `client_routes` 和 `client_domain_routes` 时，确保引用的 upstream 分组已在 `[[upstream]]` 中配置。未配置 `groups` 的 upstream 默认属于 `default` 组。
 
-7. **OpenWrt 部署**  
+7. **OpenWrt 部署**
    使用 `contrib/etc/init.d/xtp-rs` 脚本可集成到 OpenWrt 的 procd 服务管理，支持ujail 沙箱和 capabilities 限制。
 
 ---
