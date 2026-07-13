@@ -12,11 +12,20 @@ set -eu
 # TPROXY 仅应在指定入口接口上拦截流量，避免非预期接口（如 WAN、VPN、
 # Docker bridge）的流量被误截获。可通过环境变量 XTP_PROXY_INGRESS_IFACES
 # 指定多个接口（空格分隔），未设置时自动从 uci 获取 network.lan.device，
-# 最终 fallback 到 br-lan。
+# 最终 fallback 到自动检测第一个物理网络接口。
 # -------------------------------------------------------------------------
 XTP_PROXY_INGRESS_IFACES="${XTP_PROXY_INGRESS_IFACES:-}"
-if [ -z "$XTP_PROXY_INGRESS_IFACES" ]; then
+if [ -z "$XTP_PROXY_INGRESS_IFACES" ] && command -v uci >/dev/null 2>&1; then
   XTP_PROXY_INGRESS_IFACES="$(uci -q get network.lan.device || true)"
+fi
+# 自动检测：排除回环、VPN、Docker、虚拟网桥等非物理接口
+if [ -z "$XTP_PROXY_INGRESS_IFACES" ]; then
+  XTP_PROXY_INGRESS_IFACES="$(
+    ip_cmd -o link show up 2>/dev/null \
+      | awk '{print $2}' | sed 's/://' \
+      | grep -vE '^(lo|docker|virbr|br-|veth|tun|tap|wg|tailscale)' \
+      | head -1
+  )"
 fi
 : "${XTP_PROXY_INGRESS_IFACES:=br-lan}"
 

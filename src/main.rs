@@ -49,6 +49,14 @@ async fn main() -> Result<()> {
     config.normalize_geosite_tags();
     config.validate()?;
 
+    // --check / -T: 打印生效配置后退出，不启动服务
+    if cli.check {
+        let output = toml::to_string_pretty(&config)
+            .context("failed to serialize config")?;
+        print!("{}", output);
+        return Ok(());
+    }
+
     let env_filter = build_env_filter(&config)?;
     let (reload_layer, reload_handle) = reload::Layer::new(env_filter);
 

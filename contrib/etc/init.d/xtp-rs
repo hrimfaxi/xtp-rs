@@ -5,12 +5,19 @@ STOP=10
 USE_PROCD=1
 STARTUP_DELAY=10
 
+XTP_BIN="/usr/bin/xtp-rs"
 XTP_DIR="/usr/libexec/xtp-rs"
 XTP_SETUP="$XTP_DIR/setup-xtp-rs.sh"
 XTP_UNSETUP="$XTP_DIR/unsetup-xtp-rs.sh"
 
 start_service() {
-  # 1. 先启动主进程（procd 管理）
+  # 0. 先检查配置文件，避免带错配置 respawn
+  if ! $XTP_BIN --check -c /etc/xtp-rs/config.toml > /dev/null; then
+    logger -t "xtp-rs" "ERROR: config check failed, aborting start"
+    return 1
+  fi
+
+  # 1. 启动主进程（procd 管理）
   procd_open_instance
 
   if [ -x /sbin/ujail ] && [ -e /etc/capabilities/xtp-rs.json ]; then
@@ -26,7 +33,7 @@ start_service() {
   fi
 
   procd_set_param limits nofile="1024768 1024768"
-  procd_set_param command /usr/bin/xtp-rs -c /etc/xtp-rs/config.toml
+  procd_set_param command $XTP_BIN -c /etc/xtp-rs/config.toml
   procd_set_param respawn 3600 5 0 # 设置自动重启
   procd_set_param stdout 1 # 启用日志输出
   procd_set_param stderr 1

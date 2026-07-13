@@ -17,9 +17,13 @@ pub struct Cli {
     /// 配置文件路径
     #[arg(short = 'c', long, default_value = "config.toml")]
     pub config: String,
+
+    /// 检查配置文件并打印生效配置（类似 sshd -T），然后退出
+    #[arg(short = 'T', long = "check")]
+    pub check: bool,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum PortForwardProto {
     /// 转发 TCP
@@ -30,7 +34,7 @@ pub enum PortForwardProto {
     Both,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PortForward {
     /// 规则名称，仅用于日志输出。
     pub name: Option<String>,
@@ -63,7 +67,7 @@ pub struct UpstreamConfig {
     pub gain: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyMode {
     #[default]
@@ -107,7 +111,7 @@ impl std::fmt::Display for ProxyMode {
         })
     }
 }
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     #[serde(default = "default_listen")]
     /// 监听地址。
