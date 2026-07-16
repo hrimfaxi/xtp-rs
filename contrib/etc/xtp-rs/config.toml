@@ -239,9 +239,9 @@ quic_weight = 70
 # ==================================================
 
 # 示例（请根据实际修改）：
-# [[upstream]]
-# id = "default-upstream"
-# addr = "127.0.0.1:1080"
+[[upstream]]
+id = "default-upstream"
+addr = "127.0.0.1:20808"
 
 # 注意：upstream 列表不能为空，否则程序启动失败！
 
