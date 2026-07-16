@@ -13,6 +13,20 @@ GEOSITE_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/dow
 LOCK="/tmp/update_xtp_contrib.lock"
 UPDATED=0
 
+# 下载辅助函数：检查退出码 + 文件非空
+download() {
+  _url="$1"
+  _dst="$2"
+  if ! wget -q -O "$_dst" "$_url"; then
+    echo "[x] download failed: $_url"
+    return 1
+  fi
+  if [ ! -s "$_dst" ]; then
+    echo "[x] downloaded file is empty: $_url"
+    return 1
+  fi
+}
+
 # -----------------------
 # 防并发锁
 # -----------------------
@@ -47,7 +61,7 @@ echo "[*] updating mmdb..."
 MMDB_TMP="$(mktemp /tmp/mmdb.XXXXXX)"
 MMDB_SHA_TMP="$(mktemp /tmp/mmdb-sha.XXXXXX)"
 
-wget -q -O "$MMDB_SHA_TMP" "$MMDB_SHA_URL"
+download "$MMDB_SHA_URL" "$MMDB_SHA_TMP"
 REMOTE_SHA="$(awk '{print $1}' "$MMDB_SHA_TMP")"
 
 if [ -f "$MMDB_PATH" ]; then
@@ -59,7 +73,7 @@ fi
 if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
   echo "[!] mmdb changed"
 
-  wget -q -O "$MMDB_TMP" "$MMDB_URL"
+  download "$MMDB_URL" "$MMDB_TMP"
   DOWNLOADED_SHA="$(sha256sum "$MMDB_TMP" | awk '{print $1}')"
 
   if [ "$DOWNLOADED_SHA" = "$REMOTE_SHA" ]; then
@@ -86,10 +100,11 @@ echo "[*] updating geosite..."
 
 GEOSITE_TMP="$(mktemp /tmp/geosite.XXXXXX)"
 
-wget -q -O "$GEOSITE_TMP" "$GEOSITE_URL"
+download "$GEOSITE_URL" "$GEOSITE_TMP"
 
-if [ ! -s "$GEOSITE_TMP" ]; then
-  echo "[x] geosite download failed"
+# 排除 GitHub 返回的错误页面（HTML）混入
+if head -c 4 "$GEOSITE_TMP" | grep -q '<!DO'; then
+  echo "[x] geosite download returned HTML (likely GitHub error page)"
   exit 1
 fi
 
