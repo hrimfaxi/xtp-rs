@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGE: "xtp-rs"
+  RUST_TOOLCHAIN: "stable"
+
+jobs:
+  compile:
+    name: ${{ matrix.release-name }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 软路由 / 通用服务器（宿主架构，无需 cross）
+          - target: x86_64-unknown-linux-musl
+            release-name: x86_64-linux-musl
+            tool: cargo
+
+          # aarch64 ARM64 路由器 (OpenWrt R2S/R4S, 树莓派等)
+          - target: aarch64-unknown-linux-musl
+            release-name: aarch64-linux-musl
+            tool: cross
+
+          # armv7 ARM32 路由器
+          - target: armv7-unknown-linux-musleabihf
+            release-name: armv7-linux-musl
+            tool: cross
+
+          # mipsel OpenWrt 路由器 (MT7621, AR9341 等)
+          - target: mipsel-unknown-linux-musl
+            release-name: mipsel-linux-musl
+            tool: cross
+            toolchain: nightly
+            install-target: false
+            components: rust-src,rustfmt,clippy
+            extra-args: "-Z build-std=std,panic_abort"
+
+          # mips 老款路由器
+          - target: mips-unknown-linux-musl
+            release-name: mips-linux-musl
+            tool: cross
+            toolchain: nightly
+            install-target: false
+            components: rust-src,rustfmt,clippy
+            extra-args: "-Z build-std=std,panic_abort"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ matrix.release-name }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ matrix.release-name }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain || env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.install-target != false && matrix.target || '' }}
+          components: ${{ matrix.components || 'rustfmt, clippy' }}
+
+      - name: Install target and musl-tools
+        if: matrix.tool == 'cargo'
+        run: |
+          rustup target add ${{ matrix.target }}
+          sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.tool == 'cross'
+        run: |
+          if [ "${{ matrix.install-target }}" != "false" ]; then
+            rustup target add ${{ matrix.target }}
+          fi
+          rm -f ~/.cargo/bin/cross*
+          RUSTUP_TOOLCHAIN=stable cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        uses: clechasseur/rs-cargo@v4
+        with:
+          tool: ${{ matrix.tool }}
+          command: clippy
+          args: --all --target ${{ matrix.target }} ${{ matrix.extra-args }} -- -D warnings
+
+      - name: Cargo build
+        uses: clechasseur/rs-cargo@v4
+        with:
+          tool: ${{ matrix.tool }}
+          command: build
+          args: --release --target ${{ matrix.target }} ${{ matrix.extra-args }}
+        env:
+          RUSTFLAGS: "-C link-arg=-s"
+
+      - name: Rename binary
+        run: |
+          mv target/${{ matrix.target }}/release/${{ env.PACKAGE }} \
+             ${{ env.PACKAGE }}-${{ matrix.release-name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}-${{ matrix.release-name }}
+          path: ${{ env.PACKAGE }}-${{ matrix.release-name }}
+
+  release:
+    name: Release
+    needs: [compile]
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/master')
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Merge binaries
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: binaries
+          pattern: '*'
+          retention-days: 1
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: ./packages
+
+      - name: List packages
+        run: |
+          find ./packages -type f | sort
+
+      # main 分支：删除旧 latest release，发布新的预发布
+      - name: Clean old latest release
+        if: startsWith(github.ref, 'refs/heads/master')
+        run: |
+          gh release delete latest --cleanup-tag --yes --repo $GITHUB_REPOSITORY || true
+          git tag -d latest || true
+          git tag latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release (main → latest prerelease)
+        if: startsWith(github.ref, 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: true
+          tag_name: "latest"
+          generate_release_notes: true
+          files: packages/**/*
+
+      - name: Release (tag → stable)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: false
+          generate_release_notes: true
+          files: packages/**/*

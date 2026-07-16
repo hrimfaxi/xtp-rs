@@ -1,2 +1,5 @@
 [target.mipsel-unknown-linux-musl]
 linker = "mipsel-unknown-linux-musl-gcc"
+
+[target.mips-unknown-linux-musl]
+linker = "mips-unknown-linux-musl-gcc"
