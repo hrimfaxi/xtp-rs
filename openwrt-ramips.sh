@@ -18,7 +18,3 @@ if command -v upx &>/dev/null; then
 else
   echo "upx not found, skipping compression"
 fi
-
-# 上传并重启
-#rsync -avrPzz $BIN zengl:/usr/bin
-#ssh zengl service xtp-rs restart

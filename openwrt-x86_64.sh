@@ -11,5 +11,3 @@ export AR_X86_64_UNKNOWN_LINUX_MUSL=$TOOLCHAIN/x86_64-openwrt-linux-musl-ar
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$TOOLCHAIN/x86_64-openwrt-linux-musl-gcc
 
 cargo build --release --target x86_64-unknown-linux-musl
-rsync -avrPzz target/x86_64-unknown-linux-musl/release/xtp-rs n6000:/usr/bin/
-ssh n6000 service xtp-rs restart
