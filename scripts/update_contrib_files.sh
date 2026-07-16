@@ -8,7 +8,7 @@ MMDB_URL="https://raw.githubusercontent.com/kkkgo/Country-only-cn-private.mmdb/m
 MMDB_SHA_URL="https://raw.githubusercontent.com/kkkgo/Country-only-cn-private.mmdb/main/Country-only-cn-private.mmdb.sha256sum"
 
 GEOSITE_PATH="$CONTRIB_DIR/geosite.dat"
-GEOSITE_URL="https://github.com/v2ray/domain-list-community/releases/latest/download/dlc.dat"
+GEOSITE_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 
 LOCK="/tmp/update_xtp_contrib.lock"
 UPDATED=0
