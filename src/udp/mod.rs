@@ -256,7 +256,7 @@ impl UdpRuntime {
         self.closed.store(true, Ordering::SeqCst);
         let mut sessions = self.sessions.lock().await;
         let mut ready_sessions = Vec::with_capacity(sessions.len());
-        for (_, entry) in sessions.iter() {
+        for entry in sessions.values() {
             match entry {
                 UdpSessionEntry::Ready(session) => {
                     session.cancel.cancel();
