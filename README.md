@@ -202,6 +202,85 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 > force_direct_domains = [".playstation.com", ".sony.com", ".playstation.net"]
 > ```
 
+### 找路流程
+
+以下是单条连接从接收到转发的完整路由决策流程。
+
+#### TCP 连接
+
+```
+客户端 ──(TPROXY)──▶ xtp-rs ──▶ 目标地址
+                         │
+                    ① IP-only 初判
+                    ② 是否需要嗅探域名？
+                    ③ 条件嗅探 (TLS → HTTP)
+                    ④ 最终直连/代理判定
+                    ⑤ 选择上游并转发
+```
+
+1. **代理模式检查** — `proxy_mode` 为 `global` 时一律走代理，`bypass` 时一律直连，`smart` 进入后续规则匹配。
+
+2. **IP-only 初判** — 仅凭目标 IP 查询路由规则（不涉及域名）：
+   - `force_socks5_ips` 命中 → 走代理
+   - `force_direct_ips` 命中 → 直连
+   - 本地地址（回环/链路本地，`direct_local_ip` 控制）→ 直连
+   - GeoIP 国家判定（`direct_countries`）→ 按结果决定
+   - 均未命中 → 默认走代理
+
+3. **判断是否需要域名嗅探** — 满足以下任一条件则需要：
+   - 配置了域名强制规则（`force_direct_domains` 或 `force_socks5_domains` 非空）
+   - 配置了 geosite 且处于 `smart` 模式
+   - 配置了 `client_domain_routes` 且当前客户端 IP 匹配其中的 CIDR
+
+4. **快速路径** — 若 IP 初判为直连 **且** 不需要嗅探，直接建立直连并转发，跳过后续步骤。
+
+5. **条件嗅探** — 仅在需要时执行，按顺序尝试：
+   - **TLS SNI**（`sniff_tls_sni`）— 解析 TLS ClientHello 提取 SNI
+   - **HTTP Host**（`sniff_http_host`）— 解析 HTTP/1.x 请求头的 `Host` 字段
+   - 任一嗅探成功即停止；全部失败则域名为空
+
+6. **最终路由判定** — 若配置了 geosite 规则，用嗅探到的域名重新执行 `should_direct()`（域名规则优先级高于 IP 规则）；否则沿用 IP-only 结果。
+
+7. **构建转发目标**：
+   - 直连 → 直接连接原始目标 IP:Port
+   - 走代理 + 嗅探成功 → SOCKS5 CONNECT 使用**域名**（让上游代理解析）
+   - 走代理 + 嗅探失败 → SOCKS5 CONNECT 使用原始目标 IP
+
+8. **上游选择**（仅走代理时）：
+   - 查 `client_domain_routes`（客户端 IP + 域名 → 分组）
+   - 查 `client_routes`（客户端 IP → 分组）
+   - 未配置或未命中则使用 `"default"` 分组
+   - 在分组内按动态评分做平方加权随机选择
+   - 连接失败则尝试同组其他上游，全部失败则回退到 `"default"` 分组
+
+9. **缓存** — 路由结果和上游选择写入缓存（`route_cache_ttl_secs` 控制 TTL），后续相同目标的连接直接复用。
+
+#### UDP 数据包
+
+```
+客户端 ──(TPROXY)──▶ xtp-rs ──▶ 目标地址
+                         │
+                    ① 已有会话？→ 直接转发
+                    ② 条件嗅探 QUIC SNI
+                    ③ 创建/复用会话
+                    ④ 转发数据包
+```
+
+1. **已有会话** — 若目标已有活跃的 UDP 会话，直接转发，不重新路由。
+
+2. **条件嗅探**（QUIC SNI）— 仅在目标 IP 判定为**非直连**时执行：
+   - `quic_sniff_forward_first = true`（默认）：首个数据包立即转发（不携带域名），同时后台启动嗅探；后续数据包使用嗅探到的域名。
+   - `quic_sniff_forward_first = false`：缓存数据包直到嗅探完成。
+   - 若 IP 判定为直连，跳过嗅探，直接转发。
+
+3. **会话出站方式**：
+   - 直连 → 本地 UDP socket 直接发送
+   - 走代理 → SOCKS5 UDP ASSOCIATE
+
+4. **上游选择** — 与 TCP 相同的分组查找 + 动态评分逻辑。
+
+> **TCP 与 UDP 嗅探的关键差异**：TCP 嗅探结果会参与**直连/代理决策**（通过 geosite/域名规则）；UDP 嗅探结果仅影响**上游分组选择**，直连/代理判定始终基于 IP-only 结果。
+
 ### 上游动态评分参数
 
 | 参数 | 类型 | 默认值 | 说明 |
