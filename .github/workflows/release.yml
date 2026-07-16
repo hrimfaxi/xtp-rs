@@ -17,80 +17,121 @@ env:
 
 jobs:
   compile:
-    name: ${{ matrix.release-name }}
+    name: ${{ matrix.release-name || matrix.target || 'Unknown' }}
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # x86_64 软路由 / 通用服务器（宿主架构，无需 cross）
-          - target: x86_64-unknown-linux-musl
-            release-name: x86_64-linux-musl
-            tool: cargo
+          # Example
+          # when not set, default will be used (except target, cross)
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-gnu
+          #   release-name: x86_64-linux
+          #   toolchain: stable
+          #   tool: cross
+          #   postfix: ""
+          #   extra-args: ""
+          #   components: ""
+          #   rustflags: ""
 
-          # aarch64 ARM64 路由器 (OpenWrt R2S/R4S, 树莓派等)
-          - target: aarch64-unknown-linux-musl
+          # Linux x86
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            release-name: x86_64-linux
+            tool: cross
+          - os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            release-name: i686-linux
+            tool: cross
+          # Linux x86 musl
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            release-name: x86_64-linux-musl
+            tool: cross
+          - os: ubuntu-latest
+            target: i686-unknown-linux-musl
+            release-name: i686-linux-musl
+            tool: cross
+          # Linux arm
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            release-name: aarch64-linux
+            tool: cross
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabi
+            release-name: armv7-linux
+            tool: cross
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            release-name: armv7-linux-hf
+            tool: cross
+          # Linux arm musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
             release-name: aarch64-linux-musl
             tool: cross
-
-          # armv7 ARM32 路由器
-          - target: armv7-unknown-linux-musleabihf
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabi
             release-name: armv7-linux-musl
             tool: cross
-
-          # mipsel OpenWrt 路由器 hard-float (带 FPU 的设备)
-          - target: mipsel-unknown-linux-musl
-            release-name: mipsel-linux-musl
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            release-name: armv7-linux-muslhf
             tool: cross
-            toolchain: nightly
-            install-target: false
-            components: rust-src,rustfmt,clippy
-            extra-args: "-Z build-std=std,panic_abort"
-            extra-rustflags: "-C target-feature=+crt-static"
-
-          # mipsel OpenWrt 路由器 soft-float (无 FPU / soft-float ABI 的设备)
-          - target: mipsel-unknown-linux-musl
-            release-name: mipsel-sf-linux-musl
-            tool: cross
-            toolchain: nightly
-            install-target: false
-            components: rust-src,rustfmt,clippy
-            extra-args: "-Z build-std=std,panic_abort"
-            extra-rustflags: "-C target-feature=+crt-static,-hard-float -C link-arg=-msoft-float"
-
-          # mips 老款路由器 hard-float
-          - target: mips-unknown-linux-musl
+          # Linux mips
+          - os: ubuntu-latest
+            target: mips-unknown-linux-musl
             release-name: mips-linux-musl
             tool: cross
             toolchain: nightly
             install-target: false
-            components: rust-src,rustfmt,clippy
+            components: rust-src, rustfmt, clippy
             extra-args: "-Z build-std=std,panic_abort"
-            extra-rustflags: "-C target-feature=+crt-static"
-
-          # mips 老款路由器 soft-float
-          - target: mips-unknown-linux-musl
-            release-name: mips-sf-linux-musl
+            skip-test: true
+          - os: ubuntu-latest
+            target: mipsel-unknown-linux-musl
+            release-name: mipsel-linux-musl
             tool: cross
             toolchain: nightly
             install-target: false
-            components: rust-src,rustfmt,clippy
+            components: rust-src, rustfmt, clippy
             extra-args: "-Z build-std=std,panic_abort"
-            extra-rustflags: "-C target-feature=+crt-static,-hard-float -C link-arg=-msoft-float"
+            skip-test: true
+          - os: ubuntu-latest
+            target: mips64-unknown-linux-muslabi64
+            release-name: mips64-linux-musl
+            tool: cross
+            toolchain: nightly
+            install-target: false
+            components: rust-src, rustfmt, clippy
+            extra-args: "-Z build-std=std,panic_abort"
+            skip-test: true
+          - os: ubuntu-latest
+            target: mips64el-unknown-linux-muslabi64
+            release-name: mips64el-linux-musl
+            tool: cross
+            toolchain: nightly
+            install-target: false
+            components: rust-src, rustfmt, clippy
+            extra-args: "-Z build-std=std,panic_abort"
+            skip-test: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ matrix.release-name }}-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ matrix.release-name || matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
-            ${{ matrix.release-name }}
+            ${{ matrix.release-name || matrix.target }}
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -98,23 +139,22 @@ jobs:
           targets: ${{ matrix.install-target != false && matrix.target || '' }}
           components: ${{ matrix.components || 'rustfmt, clippy' }}
 
-      - name: Install target and musl-tools
-        if: matrix.tool == 'cargo'
-        run: |
-          rustup target add ${{ matrix.target }}
-          sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Install cross
+      - name: Install rust targets & cross
         if: matrix.tool == 'cross'
         run: |
           if [ "${{ matrix.install-target }}" != "false" ]; then
-            rustup target add ${{ matrix.target }}
+            rustup target add ${TARGET}
           fi
           rm -f ~/.cargo/bin/cross*
-          RUSTUP_TOOLCHAIN=stable cargo install cross --git https://github.com/cross-rs/cross
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cross-rs/cross/main/install.sh | sh
+        env:
+          TARGET: ${{ matrix.target }}
 
       - name: Cargo fmt
-        run: cargo fmt --all -- --check
+        uses: clechasseur/rs-cargo@v4
+        with:
+          command: fmt
+          args: --all -- --check
 
       - name: Cargo clippy
         uses: clechasseur/rs-cargo@v4
@@ -122,78 +162,109 @@ jobs:
           tool: ${{ matrix.tool }}
           command: clippy
           args: --all --target ${{ matrix.target }} ${{ matrix.extra-args }} -- -D warnings
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Cargo test
+        uses: clechasseur/rs-cargo@v4
+        if: ${{ !matrix.skip-test }}
+        with:
+          tool: ${{ matrix.tool }}
+          command: test
+          args: --all --release --target ${{ matrix.target }} ${{ matrix.extra-args }}
+        env:
+          CROSS_CONTAINER_OPTS: "--network host"
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Cargo build
         uses: clechasseur/rs-cargo@v4
         with:
           tool: ${{ matrix.tool }}
           command: build
-          args: --release --target ${{ matrix.target }} ${{ matrix.extra-args }}
+          args: --workspace --release --target ${{ matrix.target }} ${{ matrix.extra-args }}
         env:
-          RUSTFLAGS: "-C link-arg=-s ${{ matrix.extra-rustflags }}"
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Rename binary
-        run: |
-          mv target/${{ matrix.target }}/release/${{ env.PACKAGE }} \
-             ${{ env.PACKAGE }}-${{ matrix.release-name }}
+        run: mv target/${{ matrix.target }}/release/${{ env.PACKAGE }}${{ matrix.postfix }} ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.PACKAGE }}-${{ matrix.release-name }}
-          path: ${{ env.PACKAGE }}-${{ matrix.release-name }}
+          name: ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}
+          path: ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
+
 
   release:
     name: Release
     needs: [compile]
-    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/master')
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Merge binaries
-        uses: actions/upload-artifact/merge@v4
+        uses: actions/upload-artifact/merge@v7
         with:
           name: binaries
           pattern: '*'
           retention-days: 1
 
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: binaries
           path: ./packages
 
-      - name: List packages
-        run: |
-          find ./packages -type f | sort
-
-      # main 分支：删除旧 latest release，发布新的预发布
-      - name: Clean old latest release
+      - name: Clean git tag & release
         if: startsWith(github.ref, 'refs/heads/master')
         run: |
           gh release delete latest --cleanup-tag --yes --repo $GITHUB_REPOSITORY || true
+          # Move latest tag to current commit locally
           git tag -d latest || true
+          # Create local tag
           git tag latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Release (main → latest prerelease)
-        if: startsWith(github.ref, 'refs/heads/master')
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          prerelease: true
-          tag_name: "latest"
-          generate_release_notes: true
-          files: packages/**/*
-
-      - name: Release (tag → stable)
+      - name: Clean git tag
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        run: |
+          # Delete latest tag locally (for git-cliff)
+          git tag -d latest || true
+
+      - name: Generate a changelog
+        uses: orhun/git-cliff-action@main
+        id: git-cliff
+        with:
+          args: --latest --strip header
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Github stable release
+        uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           prerelease: false
-          generate_release_notes: true
-          files: packages/**/*
+          generate_release_notes: false
+          body: ${{ steps.git-cliff.outputs.content }}
+          files: |
+            packages/*
+            LICENSE
+
+      - name: Github nightly release
+        uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/heads/master')
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: true
+          generate_release_notes: false
+          body: ${{ steps.git-cliff.outputs.content }}
+          tag_name: "latest"
+          files: |
+            packages/*
+            LICENSE

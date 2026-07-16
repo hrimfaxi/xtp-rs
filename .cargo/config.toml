@@ -1,5 +1,11 @@
 [target.mipsel-unknown-linux-musl]
-linker = "mipsel-unknown-linux-musl-gcc"
+linker = "mipsel-linux-muslsf-gcc"
 
 [target.mips-unknown-linux-musl]
-linker = "mips-unknown-linux-musl-gcc"
+linker = "mips-linux-muslsf-gcc"
+
+[target.mips64-unknown-linux-muslabi64]
+linker = "mips64-linux-muslsf-gcc"
+
+[target.mips64el-unknown-linux-muslabi64]
+linker = "mips64el-linux-muslsf-gcc"
