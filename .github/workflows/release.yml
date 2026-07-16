@@ -40,7 +40,7 @@ jobs:
             release-name: armv7-linux-musl
             tool: cross
 
-          # mipsel OpenWrt 路由器 (MT7621, AR9341 等)
+          # mipsel OpenWrt 路由器 hard-float (带 FPU 的设备)
           - target: mipsel-unknown-linux-musl
             release-name: mipsel-linux-musl
             tool: cross
@@ -50,7 +50,17 @@ jobs:
             extra-args: "-Z build-std=std,panic_abort"
             extra-rustflags: "-C target-feature=+crt-static"
 
-          # mips 老款路由器
+          # mipsel OpenWrt 路由器 soft-float (无 FPU / soft-float ABI 的设备)
+          - target: mipsel-unknown-linux-musl
+            release-name: mipsel-sf-linux-musl
+            tool: cross
+            toolchain: nightly
+            install-target: false
+            components: rust-src,rustfmt,clippy
+            extra-args: "-Z build-std=std,panic_abort"
+            extra-rustflags: "-C target-feature=+crt-static,-hard-float -C link-arg=-msoft-float"
+
+          # mips 老款路由器 hard-float
           - target: mips-unknown-linux-musl
             release-name: mips-linux-musl
             tool: cross
@@ -59,6 +69,16 @@ jobs:
             components: rust-src,rustfmt,clippy
             extra-args: "-Z build-std=std,panic_abort"
             extra-rustflags: "-C target-feature=+crt-static"
+
+          # mips 老款路由器 soft-float
+          - target: mips-unknown-linux-musl
+            release-name: mips-sf-linux-musl
+            tool: cross
+            toolchain: nightly
+            install-target: false
+            components: rust-src,rustfmt,clippy
+            extra-args: "-Z build-std=std,panic_abort"
+            extra-rustflags: "-C target-feature=+crt-static,-hard-float -C link-arg=-msoft-float"
 
     steps:
       - uses: actions/checkout@v4
