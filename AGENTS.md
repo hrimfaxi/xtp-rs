@@ -75,6 +75,11 @@ cross build --release --target mipsel-unknown-linux-musl
 - UDP 使用 `BytesMut::split_to().freeze()` 零拷贝传递载荷给 spawn 的 task。
 - `TaskGuard`（`util.rs`）管理 spawn task 的生命周期和优雅退出。
 
+## Git 规范
+
+- 禁止使用 `git commit -A`，必须明确 `git add` 每个文件。
+- 禁止使用 `git rebase -i`（交互式 rebase），因为无法在自动化环境中交互。
+
 ## 配置参考
 
 完整配置模板：`contrib/etc/xtp-rs/config.toml`。配置结构体定义：`src/cli.rs`（`Config`）。
