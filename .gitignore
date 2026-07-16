@@ -1,1 +1,6 @@
 target
+.mimocode/
+*.py
+my-mailmap
+session-*.md
+to_llm_sh.sh

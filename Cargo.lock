@@ -336,14 +336,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c39754e157331b013978ec91992bde1ac089843443c49cbc7f46150b0fad0893"
 
 [[package]]
-name = "geosite-rs"
-version = "0.1.6"
-source = "git+https://github.com/hrimfaxi/geosite-rs.git?branch=main#7d6827d3883fd3d2de9dd269ddc295ef98d00c23"
-dependencies = [
- "prost",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1096,7 +1088,6 @@ dependencies = [
  "clap",
  "dashmap",
  "fastrand",
- "geosite-rs",
  "hkdf",
  "ipnet",
  "iptrie",

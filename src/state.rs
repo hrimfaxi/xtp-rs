@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "geosite")]
-use geosite_rs::{GeoSite, GeoSiteList};
+use crate::geosite::{GeoSite, GeoSiteList};
 #[cfg(feature = "geosite")]
 use prost::Message;
 
@@ -177,7 +177,7 @@ pub struct AppRuntime {
 }
 
 #[cfg(feature = "geosite")]
-type GeositeIndex = HashMap<String, Vec<geosite_rs::Domain>>;
+type GeositeIndex = HashMap<String, Vec<crate::geosite::Domain>>;
 
 #[cfg(feature = "geosite")]
 struct CompiledGeositeTag {
@@ -301,7 +301,7 @@ impl From<i32> for GeositeDomainType {
 
 #[cfg(feature = "geosite")]
 #[allow(dead_code)]
-fn geosite_domain_match(rule: &geosite_rs::Domain, domain: &str) -> bool {
+fn geosite_domain_match(rule: &crate::geosite::Domain, domain: &str) -> bool {
     let domain = canonical_domain(domain);
     let value = canonical_domain(&rule.value);
 

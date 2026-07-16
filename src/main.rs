@@ -1,4 +1,6 @@
 mod cli;
+#[cfg(feature = "geosite")]
+mod geosite;
 mod sniff;
 mod socket_factory;
 mod socks5;
