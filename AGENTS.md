@@ -77,6 +77,7 @@ cross build --release --target mipsel-unknown-linux-musl
 
 ## Git 规范
 
+- 提交前必须运行 `cargo fmt` 格式化代码。
 - 禁止使用 `git commit -A`，必须明确 `git add` 每个文件。
 - 禁止使用 `git rebase -i`（交互式 rebase），因为无法在自动化环境中交互。
 

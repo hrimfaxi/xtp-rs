@@ -53,8 +53,7 @@ async fn main() -> Result<()> {
 
     // --check / -T: 打印生效配置后退出，不启动服务
     if cli.check {
-        let output = toml::to_string_pretty(&config)
-            .context("failed to serialize config")?;
+        let output = toml::to_string_pretty(&config).context("failed to serialize config")?;
         print!("{}", output);
         return Ok(());
     }
