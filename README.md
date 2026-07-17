@@ -13,6 +13,8 @@
 支持 **GeoIP2 / geosite / 自定义 CIDR / 本地地址** 智能分流、
 **TLS · HTTP · QUIC 域名嗅探**、**动态上游评分** 与 **热重载**。
 
+📖 **[xtp-rs 实战教程](./xtp-rs实战教程.md)** — 从零到生产的完整指南：透明代理部署、GeoIP/geosite 分流、域名嗅探、多上游动态竞争（BBR vs Brutal）、YouTube/Poe 专线、IPv4/IPv6 双栈全覆盖
+
 </div>
 
 ---
