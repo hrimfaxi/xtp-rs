@@ -75,6 +75,10 @@ cargo build --release
 cargo build --release --no-default-features --features "sniff-tls,sniff-http,geosite"
 ```
 
+### 方式三：OpenWrt 编译安装
+
+OpenWrt 软件包 Makefile 仓库：[openwrt-xtp-rs](https://github.com/hrimfaxi/openwrt-xtp-rs)
+
 ### 编译 Features
 
 | Feature | 说明 |
