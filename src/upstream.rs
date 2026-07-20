@@ -29,7 +29,7 @@ pub struct Upstream {
     pub groups: Vec<String>,
     pub gain: f64,
 
-    registry: tokio::sync::Mutex<Vec<(Weak<()>, std::os::fd::RawFd)>>,
+    registry: std::sync::Mutex<Vec<(Weak<()>, std::os::fd::RawFd)>>,
 
     tcp_score: AtomicU32,
     tcp_score_initialized: AtomicBool,
@@ -56,7 +56,7 @@ impl Upstream {
     ) -> Arc<Self> {
         Arc::new(Self {
             id: id.into(),
-            registry: tokio::sync::Mutex::new(Vec::new()),
+            registry: std::sync::Mutex::new(Vec::new()),
             addr,
             groups,
             gain,
@@ -79,10 +79,14 @@ impl Upstream {
         self.quic_weight.store(w.clamp(0, 100), Ordering::Relaxed);
     }
 
-    pub async fn track(&self, fd: std::os::fd::RawFd) -> Arc<()> {
+    fn lock_registry(&self) -> std::sync::MutexGuard<'_, Vec<(Weak<()>, std::os::fd::RawFd)>> {
+        self.registry.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn track(&self, fd: std::os::fd::RawFd) -> Arc<()> {
         let token = Arc::new(());
         let weak = Arc::downgrade(&token);
-        self.registry.lock().await.push((weak, fd));
+        self.lock_registry().push((weak, fd));
         token
     }
 
@@ -95,13 +99,27 @@ impl Upstream {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {},
             }
+            // 1. 锁内：清理失效条目并收集快照
+            let entries: Vec<_> = {
+                let mut reg = self.lock_registry();
+                let mut entries = Vec::with_capacity(reg.len());
+                reg.retain(|(weak, fd)| {
+                    if let Some(token) = weak.upgrade() {
+                        entries.push((token, *fd));
+                        true
+                    } else {
+                        false
+                    }
+                });
+                entries
+            };
+
+            // 2. 锁外：对快照中的 fd 做 getsockopt（best-effort，fd 可能已被复用）
             let (recv, sent, alive) = {
-                let mut reg = self.registry.lock().await;
-                reg.retain(|(w, _)| w.strong_count() > 0);
                 let mut r = 0u64;
                 let mut s = 0u64;
                 let mut n = 0usize;
-                for (_, fd) in reg.iter() {
+                for (_token, fd) in &entries {
                     if let Some(info) = get_tcp_info_ext_raw(*fd) {
                         r += info.tcpi_bytes_received;
                         s += info.tcpi_bytes_acked;
