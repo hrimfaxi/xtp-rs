@@ -314,6 +314,61 @@ flowchart TD
 | `upstream_switch_tolerance` | u32 | `0` | 粘性切换容忍度（分），0 表示不启用粘性 |
 | `quic_weight` | u32 | `70` | QUIC 探针在选路分数中的权重（0-100） |
 
+### xtp-stats-reporter（ShadowQUIC 性能上报 daemon）
+
+`xtp-stats-reporter` 是一个 **ShadowQUIC 专用**的性能上报 daemon，运行在 OpenWrt 路由器上。ShadowQUIC 原生支持将链路质量（RTT、丢包率、MTU）输出到 syslog，xtp-stats-reporter 从 syslog 中实时捕获这些日志，解析后通过本地 Unix 数据报 socket（`/tmp/xtp-rs-report.sock`）以 JSON 格式上报给 xtp-rs，供上游动态评分使用。无需对 ShadowQUIC 做任何修改。
+
+**工作流程**：
+
+```mermaid
+flowchart LR
+    SQ["ShadowQUIC 隧道客户端"] -->|"syslog: rtt=152ms<br/>packet_loss_rate=37%<br/>mtu=1280"| LOG["logd (syslog)"]
+    LOG -->|"logread -f"| R["xtp-stats-reporter<br/>（stats_reporter.sh）"]
+    R -->|"Unix datagram socket<br/>JSON 上报"| X["xtp-rs<br/>/tmp/xtp-rs-report.sock"]
+```
+
+**部署**：
+
+```bash
+# 安装到 OpenWrt
+cp contrib/etc/init.d/xtp-stats-reporter /etc/init.d/
+cp contrib/usr/libexec/xtp-rs/stats_reporter.sh /usr/libexec/xtp-rs/
+chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
+
+# 启用并启动
+/etc/init.d/xtp-stats-reporter enable
+/etc/init.d/xtp-stats-reporter start
+```
+
+**依赖**：`socat`（用于发送 Unix 数据报）、`logread`（OpenWrt 自带）。
+
+**上报 JSON 格式**：
+
+```json
+{"upstream_id": "bbr_tunnel", "peer": "1234", "rtt_ms": 152.300, "loss_rate": 0.3700, "mtu": 1280, "link": "downlink"}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `upstream_id` | 从 ShadowQUIC 的 `-c` / `--config` 参数推导的实例名（配置文件名去扩展名，见下例） |
+| `peer` | ShadowQUIC 进程 PID |
+| `rtt_ms` | 链路 RTT（毫秒） |
+| `loss_rate` | 丢包率（小数，0.37 = 37%） |
+| `mtu` | 链路 MTU |
+| `link` | 方向：`uplink` / `downlink` |
+
+`upstream_id` 的推导规则：读取 `/proc/PID/cmdline`，找到 `-c` / `-c=` / `--config` / `--config=` 参数对应的路径，取 basename 并去掉扩展名。例如：
+
+| 启动命令 | `upstream_id` |
+|----------|---------------|
+| `shadowquic -c /etc/shadowquic/bbr.yaml` | `bbr` |
+| `shadowquic -c /etc/shadowquic/brutal.yaml` | `brutal` |
+| `shadowquic --config=/etc/shadowquic/poe.yaml` | `poe` |
+| 找不到 `-c` 参数 | `unknown-<PID>` |
+
+> [!NOTE]
+> xtp-stats-reporter 仅解析 ShadowQUIC 格式的 syslog 条目（匹配 `shadowquic[PID]:` 前缀 + `uplink stats` / `downlink stats` 关键字）。其他进程的日志会被忽略。
+
 ### 健康检查
 
 | 参数 | 类型 | 默认值 | 说明 |
@@ -398,14 +453,17 @@ xtp-rs/
 ├── contrib/
 │   ├── etc/
 │   │   ├── capabilities/xtp-rs.json    # Linux capabilities 配置
-│   │   ├── init.d/xtp-rs               # OpenWrt init 脚本
+│   │   ├── init.d/
+│   │   │   ├── xtp-rs                  # OpenWrt init 脚本
+│   │   │   └── xtp-stats-reporter      # ShadowQUIC 性能上报 daemon 的 init 脚本
 │   │   └── xtp-rs/
 │   │       ├── config.toml                     # 完整配置模板
 │   │       └── Country-only-cn-private.mmdb    # GeoIP 数据库示例
 │   └── usr/libexec/xtp-rs/
 │       ├── common.sh                   # 公共函数库
 │       ├── setup-xtp-rs.sh             # 透明代理环境安装脚本
-│       └── unsetup-xtp-rs.sh           # 清理脚本
+│       ├── unsetup-xtp-rs.sh           # 清理脚本
+│       └── stats_reporter.sh           # ShadowQUIC 性能上报 daemon 主脚本
 ├── scripts/
 │   └── test_socks5_udp.py              # UDP 测试脚本
 ├── src/

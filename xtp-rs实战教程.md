@@ -419,7 +419,7 @@ xtp-rs 给每条上游维护一个 0–1000 的动态分，来自两个信息源
 | 10 MiB/s | 800 |
 | ≥ 50 MiB/s | 1000 |
 
-**② QUIC 探针分（被动接收）**：隧道客户端（如打了报告补丁的 ShadowQUIC）通过本地 Unix 数据报 socket `/tmp/xtp-rs-report.sock` 上报链路质量，JSON 格式：
+**② QUIC 探针分（被动接收）**：ShadowQUIC 原生支持将链路质量（RTT、丢包率、MTU）输出到 syslog，无需任何修改。配套的 `xtp-stats-reporter` daemon（`contrib/usr/libexec/xtp-rs/stats_reporter.sh`）实时捕获这些日志，解析后通过本地 Unix 数据报 socket `/tmp/xtp-rs-report.sock` 以 JSON 格式上报给 xtp-rs：
 
 ```json
 {"upstream_id": "bbr_tunnel", "peer": "vps:1443", "rtt_ms": 152.3, "loss_rate": 0.37, "mtu": 1280, "link": "downlink"}
@@ -699,6 +699,28 @@ logread -f | grep xtp-rs                 # OpenWrt（procd 无 journalctl）
 ```bash
 /etc/init.d/xtp-rs enable && /etc/init.d/xtp-rs start
 ```
+
+### 9.3.1 xtp-stats-reporter：ShadowQUIC 性能上报
+
+如果你使用 ShadowQUIC 作为隧道客户端并希望 xtp-rs 能根据 QUIC 链路质量动态选路，需要部署 `xtp-stats-reporter`。ShadowQUIC 原生支持将链路质量输出到 syslog，无需任何修改；xtp-stats-reporter 作为配套 daemon，从 syslog 中实时捕获这些日志（RTT、丢包率、MTU），解析后上报给 xtp-rs。
+
+**安装**：
+
+```bash
+cp contrib/etc/init.d/xtp-stats-reporter /etc/init.d/
+cp contrib/usr/libexec/xtp-rs/stats_reporter.sh /usr/libexec/xtp-rs/
+chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
+
+/etc/init.d/xtp-stats-reporter enable
+/etc/init.d/xtp-stats-reporter start
+```
+
+**依赖**：`socat`（`opkg install socat`）、`logread`（OpenWrt 自带）。
+
+**验证**：`logread | grep xtp-stats-reporter` 应能看到解析日志；如果 ShadowQUIC 正在运行且链路有流量，xtp-rs 的 debug 日志中会出现 QUIC 探针分数更新。
+
+> [!NOTE]
+> 不使用 ShadowQUIC 时无需部署此 daemon。xtp-rs 的 TCP 吞吐评分（基于 `TCP_INFO`）始终自动生效，不依赖任何外部组件。
 
 ### 9.4 路由缓存
 
