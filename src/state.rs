@@ -1296,7 +1296,7 @@ mod tests {
             health_check_timeout_secs: 5,
             health_check_fail_threshold: 2,
             health_check_url: "cp.cloudflare.com".into(),
-            quic_weight: 70,
+            quic_weight: 40,
             proxy_mode: ProxyMode::default(),
             geosite_path: None,
             direct_geosite_tags: vec![],

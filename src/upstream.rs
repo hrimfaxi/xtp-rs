@@ -44,7 +44,7 @@ pub struct Upstream {
     quic_downlink_score: AtomicU32,
     quic_uplink_last_update_secs: AtomicU64,
     quic_downlink_last_update_secs: AtomicU64,
-    quic_weight: AtomicU32, // 0-100，默认 70
+    quic_weight: AtomicU32, // 0-100，默认 40
 }
 
 impl Upstream {
@@ -71,7 +71,7 @@ impl Upstream {
             last_check_secs: AtomicU64::new(0),
             tcp_info_initialized: AtomicBool::new(false),
             health_failures: AtomicU32::new(0),
-            quic_weight: AtomicU32::new(70),
+            quic_weight: AtomicU32::new(40),
         })
     }
 
@@ -910,7 +910,7 @@ mod tests {
         set_tcp_score(&up, 600);
         set_quic_downlink(&up, 700);
         // uplink never updated => invalid, quic = downlink = 700
-        let expected = (600 * 30 + 700 * 70) / 100; // 670
+        let expected = (600 * 60 + 700 * 40) / 100; // 640
         assert_eq!(up.score(), expected);
     }
 
@@ -920,7 +920,7 @@ mod tests {
         set_tcp_score(&up, 600);
         set_quic_uplink(&up, 800);
         set_quic_downlink(&up, 600);
-        let expected = (600 * 30 + 700 * 70) / 100; // 670
+        let expected = (600 * 60 + 700 * 40) / 100; // 640
         assert_eq!(up.score(), expected);
     }
 
@@ -946,7 +946,7 @@ mod tests {
 
     fn upstream_set(ids: &[&str], tolerance: u32) -> UpstreamSet {
         let items: Vec<_> = ids.iter().map(|id| upstream(id)).collect();
-        UpstreamSet::new(items, tolerance, 70).unwrap()
+        UpstreamSet::new(items, tolerance, 40).unwrap()
     }
 
     #[test]
@@ -1021,9 +1021,9 @@ mod tests {
             set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
-        // "b" quic=700 => score=(500*3+700*7)/10=640, diff=140 > 100
+        // "b" quic=850 => score=(500*60+850*40)/100=640, diff=140 > 100
         let up_b = set.find_by_id("b").unwrap();
-        set_quic_uplink(&up_b, 700);
+        set_quic_uplink(&up_b, 850);
         let picked = set.pick().unwrap();
         assert_eq!(picked.id, "b");
     }
@@ -1033,8 +1033,8 @@ mod tests {
         let up = make_upstream("b");
         set_tcp_score(&up, 600);
         set_quic_uplink(&up, 800);
-        // 默认 qw=70, tw=30
-        let expected = (600 * 30 + 800 * 70) / 100; // 740
+        // 默认 qw=40, tw=60
+        let expected = (600 * 60 + 800 * 40) / 100; // 680
         assert_eq!(up.score(), expected);
     }
 
@@ -1066,7 +1066,7 @@ mod tests {
             upstream_with_groups("c", vec!["office".to_string()]),
             upstream_with_groups("d", vec!["office".to_string()]),
         ];
-        let set = UpstreamSet::new(items, 50, 70).unwrap();
+        let set = UpstreamSet::new(items, 50, 40).unwrap();
 
         // sticky default -> a, office -> c
         {
@@ -1179,7 +1179,7 @@ mod tests {
         for u in &items {
             set_tcp_score(u, 500);
         }
-        let set = UpstreamSet::new(items, 0, 70).unwrap();
+        let set = UpstreamSet::new(items, 0, 40).unwrap();
 
         // effective: high=1000, low=250
         // weight: high=1000000, low=62500, ratio ~16:1
@@ -1223,7 +1223,7 @@ mod tests {
             set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
-        let set = UpstreamSet::new(items, 50, 70).unwrap();
+        let set = UpstreamSet::new(items, 50, 40).unwrap();
 
         // sticky to "a"
         {
@@ -1251,7 +1251,7 @@ mod tests {
             set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
-        let set2 = UpstreamSet::new(items2, 50, 70).unwrap();
+        let set2 = UpstreamSet::new(items2, 50, 40).unwrap();
         {
             let mut cur = set2.current.lock().unwrap();
             cur.insert("default".to_string(), Some("a".to_string()));

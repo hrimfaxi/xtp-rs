@@ -231,8 +231,10 @@ health_check_fail_threshold = 2
 health_check_url = "cp.cloudflare.com"
 
 # QUIC 探针在最终选路分数中的权重百分比（0‑100）
-# 默认值：70（即 TCP 权重 30，QUIC 权重 70）
-quic_weight = 70
+# 默认值：40（即 TCP 权重 60，QUIC 权重 40）
+# QUIC 探针基于丢包率扣分，但 Brutal 拥塞控制的设计行为就是主动制造丢包，
+# 导致 QUIC 分被系统性低估；降低 QUIC 权重让 TCP 实测吞吐成为主导因素。
+quic_weight = 40
 
 # ==================================================
 # 上游 SOCKS5 服务器（必须至少配置一个）

@@ -312,7 +312,7 @@ flowchart TD
 |------|------|--------|------|
 | `disable_upstream_score` | bool | `false` | 禁用上游动态评分（启用后完全随机选择） |
 | `upstream_switch_tolerance` | u32 | `0` | 粘性切换容忍度（分），0 表示不启用粘性 |
-| `quic_weight` | u32 | `70` | QUIC 探针在选路分数中的权重（0-100） |
+| `quic_weight` | u32 | `40` | QUIC 探针在选路分数中的权重（0-100） |
 
 ### xtp-stats-reporter（ShadowQUIC 性能上报 daemon）
 
