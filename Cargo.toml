@@ -9,9 +9,10 @@ categories = ["network-programming"]
 description = "基于 TPROXY 的高性能透明代理，支持 GeoIP/geosite 智能分流和 SOCKS5 转发"
 
 [features]
-default = [ "geosite", "sniff-quic", "sniff-http", "sniff-tls" ]
+default = [ "geosite", "sniff-quic", "sniff-http", "sniff-tls", "mimalloc" ]
 # default = [ ]
 geosite = ["dep:prost"]
+mimalloc = ["dep:mimalloc"]
 sniff-tls-common = []
 sniff-quic = ["dep:aes", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "sniff-tls-common"]
 sniff-tls = ["sniff-tls-common"]
@@ -45,6 +46,7 @@ arc-swap = "1.9.1"
 prost = { version = "0.14", optional = true }
 dashmap = "6.2.1"
 portable-atomic = { version = "1", features = ["fallback"] }
+mimalloc = { version = "0.1", optional = true }
 
 [profile.release]
 opt-level = "z"      # 比 "s" 更激进的体积优化

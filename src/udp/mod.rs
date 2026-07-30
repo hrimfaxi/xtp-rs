@@ -553,9 +553,8 @@ async fn run_direct_udp_recv_loop(
     let _ = ready_tx.send(());
 
     let idle_timeout_secs = state.config.udp_session_idle_timeout_secs;
-    let mut got_first_response = false;
-    let initial_idle_deadline = wait_initial_idle_timeout(idle_timeout_secs);
-    tokio::pin!(initial_idle_deadline);
+    let idle_deadline = make_idle_deadline(idle_timeout_secs);
+    tokio::pin!(idle_deadline);
 
     loop {
         reset_udp_buf(&mut buf);
@@ -570,13 +569,13 @@ async fn run_direct_udp_recv_loop(
                 );
                 return Ok(());
             }
-            _ = &mut initial_idle_deadline, if !got_first_response => {
+            _ = &mut idle_deadline, if idle_timeout_secs > 0 => {
                 warn!(
                     kind = ?key.kind,
                     client = %key.client_addr,
                     target = %key.target_addr,
                     timeout_secs = idle_timeout_secs,
-                    "direct UDP session no response, cancelling"
+                    "direct UDP session idle timeout, cancelling"
                 );
                 return Ok(());
             }
@@ -592,9 +591,7 @@ async fn run_direct_udp_recv_loop(
                 };
 
                 session.touch();
-                if !got_first_response {
-                    got_first_response = true;
-                }
+                reset_idle_deadline(idle_deadline.as_mut(), idle_timeout_secs);
 
                 let payload = &buf[..n];
 
@@ -625,12 +622,11 @@ async fn run_socks5_udp_recv_loop(
 
     let _ = ready_tx.send(());
 
-    // 首包空闲超时：session 建立后，如果在指定时间内没收到任何回包，
+    // 空闲超时：每次收到回包后重置。如果在指定时间内没收到任何回包，
     // 说明 SOCKS5 UDP relay 可能失效，主动取消 session 以便客户端快速重试。
     let idle_timeout_secs = state.config.udp_session_idle_timeout_secs;
-    let mut got_first_response = false;
-    let initial_idle_deadline = wait_initial_idle_timeout(idle_timeout_secs);
-    tokio::pin!(initial_idle_deadline);
+    let idle_deadline = make_idle_deadline(idle_timeout_secs);
+    tokio::pin!(idle_deadline);
     let mut recv_count: u64 = 0;
     let mut inject_ok_count: u64 = 0;
 
@@ -651,7 +647,7 @@ async fn run_socks5_udp_recv_loop(
                 return Ok(());
             }
 
-            _ = &mut initial_idle_deadline, if !got_first_response => {
+            _ = &mut idle_deadline, if idle_timeout_secs > 0 => {
                 warn!(
                     session_id = session.session_id,
                     kind = ?key.kind,
@@ -659,7 +655,7 @@ async fn run_socks5_udp_recv_loop(
                     target = %key.target_addr,
                     relay = %relay_addr,
                     timeout_secs = idle_timeout_secs,
-                    "SOCKS5 UDP session no response, cancelling"
+                    "SOCKS5 UDP session idle timeout, cancelling"
                 );
                 return Ok(());
             }
@@ -677,8 +673,8 @@ async fn run_socks5_udp_recv_loop(
 
                 session.touch();
                 recv_count += 1;
-                if !got_first_response {
-                    got_first_response = true;
+                reset_idle_deadline(idle_deadline.as_mut(), idle_timeout_secs);
+                if recv_count == 1 {
                     debug!(
                         session_id = session.session_id,
                         kind = ?key.kind,
@@ -959,12 +955,25 @@ async fn spawn_udp_packet_handler(
     });
 }
 
-/// 等待首包空闲超时。idle_timeout_secs > 0 时正常 sleep，否则永不触发。
-async fn wait_initial_idle_timeout(idle_timeout_secs: u64) {
+/// 创建空闲超时 deadline。
+/// idle_timeout_secs == 0 时返回远未来 deadline；调用方必须通过 select! guard 禁用该分支。
+fn make_idle_deadline(idle_timeout_secs: u64) -> tokio::time::Sleep {
     if idle_timeout_secs > 0 {
-        tokio::time::sleep(Duration::from_secs(idle_timeout_secs)).await;
+        tokio::time::sleep(Duration::from_secs(idle_timeout_secs))
     } else {
-        std::future::pending::<()>().await;
+        tokio::time::sleep(Duration::from_secs(30 * 365 * 24 * 3600))
+    }
+}
+
+/// 重置空闲超时 deadline。idle_timeout_secs == 0 时不做任何操作。
+/// 使用 checked_add 防止超大配置值导致 Instant 溢出。
+fn reset_idle_deadline(deadline: std::pin::Pin<&mut tokio::time::Sleep>, idle_timeout_secs: u64) {
+    if idle_timeout_secs > 0 {
+        let now = tokio::time::Instant::now();
+        let next = now
+            .checked_add(Duration::from_secs(idle_timeout_secs))
+            .unwrap_or(now + Duration::from_secs(30 * 365 * 24 * 3600));
+        deadline.reset(next);
     }
 }
 

@@ -595,7 +595,7 @@ pub fn default_health_check_fail_threshold() -> u32 {
 }
 
 pub fn default_quic_weight() -> u32 {
-    70
+    40
 }
 
 pub fn default_health_check_url() -> String {
@@ -828,7 +828,7 @@ mod tests {
             health_check_timeout_secs: 5,
             health_check_fail_threshold: 2,
             health_check_url: "cp.cloudflare.com".into(),
-            quic_weight: 70,
+            quic_weight: 40,
             proxy_mode: ProxyMode::Smart,
             geosite_path: None,
             proxy_geosite_tags: vec![],

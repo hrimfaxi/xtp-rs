@@ -31,8 +31,9 @@ cargo test <test_name>
 | `sniff-http` | 从 HTTP 请求头提取 Host |
 | `sniff-quic` | 解析 QUIC Initial 包的 SNI（引入 `aes`、`hkdf`、`sha2`、`aes-gcm`） |
 | `sniff-tls-common` | TLS 公共代码，被 `sniff-quic` 和 `sniff-tls` 自动启用 |
+| `mimalloc` | 使用 mimalloc 分配器（低内存场景可选优化，默认使用系统 allocator） |
 
-默认启用全部。可禁用单个 sniff feature 以减小二进制体积。
+默认启用全部 sniff + geosite + mimalloc。可禁用单个 sniff feature 以减小二进制体积。
 
 ## 架构
 

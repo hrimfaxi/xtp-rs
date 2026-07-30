@@ -379,7 +379,7 @@ pub async fn handle_tcp_connection(
 
     let relay_start = Instant::now();
     if let Some(ref up) = up {
-        let token = up.track(upstream.as_raw_fd()).await;
+        let token = up.track(upstream.as_raw_fd());
         let result = relay_tcp(
             &mut client,
             &mut upstream,
@@ -466,7 +466,7 @@ pub async fn run_tcp_port_forward(
                             };
 
                             let start = Instant::now();
-                            let _token = up.track(upstream.as_raw_fd()).await;
+                            let _token = up.track(upstream.as_raw_fd());
                             let splice_result = splice_or_copy_bidirectional(
                                 state.config.splice,
                                 &mut client,

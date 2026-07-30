@@ -1,3 +1,8 @@
+// mimalloc 分配器（默认启用，可用 --no-default-features 回退到系统 allocator）
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cli;
 #[cfg(feature = "geosite")]
 mod geosite;
