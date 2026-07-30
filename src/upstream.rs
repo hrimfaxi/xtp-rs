@@ -20,8 +20,8 @@ use crate::state::AppState;
 use crate::util::{get_tcp_info_ext_raw, now_secs};
 
 /// TCP 分数默认值（未通过流量更新前使用）
-/// 略高于惩罚分(100)，避免卡住连接保持高分，同时给新 upstream 一个较低起点
-const DEFAULT_SCORE: u32 = 150;
+/// 略高于惩罚分，避免卡住连接保持高分，同时给新 upstream 一个较低起点
+const DEFAULT_SCORE: u32 = 75;
 
 /// QUIC 探针分数过期阈值（秒）。超过此时间未更新视为断流，评分归零。
 const QUIC_STALE_SECS: u64 = 60;
@@ -276,10 +276,12 @@ impl Upstream {
     }
 
     pub fn penalize(&self) {
-        self.tcp_score.store(100, Ordering::Relaxed);
+        self.tcp_score.store(DEFAULT_SCORE, Ordering::Relaxed);
         self.tcp_score_initialized.store(true, Ordering::Relaxed);
-        self.quic_uplink_score.store(100, Ordering::Relaxed);
-        self.quic_downlink_score.store(100, Ordering::Relaxed);
+        self.quic_uplink_score
+            .store(DEFAULT_SCORE, Ordering::Relaxed);
+        self.quic_downlink_score
+            .store(DEFAULT_SCORE, Ordering::Relaxed);
         let now = now_secs();
         self.quic_uplink_last_update_secs
             .store(now, Ordering::Relaxed);
@@ -948,13 +950,16 @@ mod tests {
     }
 
     #[test]
-    fn penalize_sets_all_to_100() {
+    fn penalize_sets_all_to_default() {
         let up = make_upstream("e");
         up.penalize();
-        assert_eq!(up.tcp_score.load(Ordering::Relaxed), 100);
+        assert_eq!(up.tcp_score.load(Ordering::Relaxed), DEFAULT_SCORE);
         assert!(up.tcp_score_initialized.load(Ordering::Relaxed));
-        assert_eq!(up.quic_uplink_score.load(Ordering::Relaxed), 100);
-        assert_eq!(up.quic_downlink_score.load(Ordering::Relaxed), 100);
+        assert_eq!(up.quic_uplink_score.load(Ordering::Relaxed), DEFAULT_SCORE);
+        assert_eq!(
+            up.quic_downlink_score.load(Ordering::Relaxed),
+            DEFAULT_SCORE
+        );
     }
 
     #[test]
