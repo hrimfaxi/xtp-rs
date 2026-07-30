@@ -202,9 +202,9 @@ if ! mkfifo "$FIFO"; then
 fi
 
 if [ "$DEBUG" = "1" ]; then
-    logread -f -e 'shadowquic\[[0-9][0-9]*\].*(uplink|downlink) stats ' > "$FIFO" 2>>"$DEBUG_LOG" &
+    logread -f -e 'shadowquic\[[0-9][0-9]*\].*\(uplink\|downlink\) stats ' > "$FIFO" 2>>"$DEBUG_LOG" &
 else
-    logread -f -e 'shadowquic\[[0-9][0-9]*\].*(uplink|downlink) stats ' > "$FIFO" 2>/dev/null &
+    logread -f -e 'shadowquic\[[0-9][0-9]*\].*\(uplink\|downlink\) stats ' > "$FIFO" 2>/dev/null &
 fi
 
 LOGREAD_PID=$!
