@@ -20,7 +20,8 @@ use crate::state::AppState;
 use crate::util::{get_tcp_info_ext_raw, now_secs};
 
 /// TCP 分数默认值（未通过流量更新前使用）
-const DEFAULT_SCORE: u32 = 500;
+/// 略高于惩罚分(100)，避免卡住连接保持高分，同时给新 upstream 一个较低起点
+const DEFAULT_SCORE: u32 = 150;
 
 #[derive(Debug)]
 pub struct Upstream {
@@ -62,8 +63,8 @@ impl Upstream {
             gain,
             tcp_score: AtomicU32::new(DEFAULT_SCORE),
             tcp_score_initialized: AtomicBool::new(false),
-            quic_uplink_score: AtomicU32::new(500),
-            quic_downlink_score: AtomicU32::new(500),
+            quic_uplink_score: AtomicU32::new(DEFAULT_SCORE),
+            quic_downlink_score: AtomicU32::new(DEFAULT_SCORE),
             quic_uplink_last_update_secs: AtomicU64::new(0),
             quic_downlink_last_update_secs: AtomicU64::new(0),
             last_total_recv: AtomicU64::new(0),
@@ -181,7 +182,7 @@ impl Upstream {
             (true, true) => (uplink + downlink) / 2,
             (true, false) => uplink,
             (false, true) => downlink,
-            (false, false) => 500,
+            (false, false) => DEFAULT_SCORE,
         };
 
         // tcp_score_initialized 为 false 说明从未通过 TCP 流量更新过，视为无效
@@ -194,7 +195,7 @@ impl Upstream {
             (true, true) => (tcp * tw + quic * qw) / 100,
             (false, true) => quic,
             (true, false) => tcp,
-            (false, false) => 500,
+            (false, false) => DEFAULT_SCORE,
         }
     }
 
@@ -899,9 +900,9 @@ mod tests {
     }
 
     #[test]
-    fn score_initial_500() {
+    fn score_initial() {
         let up = make_upstream("a");
-        assert_eq!(up.score(), 500);
+        assert_eq!(up.score(), DEFAULT_SCORE);
     }
 
     #[test]
