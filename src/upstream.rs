@@ -23,6 +23,9 @@ use crate::util::{get_tcp_info_ext_raw, now_secs};
 /// 略高于惩罚分(100)，避免卡住连接保持高分，同时给新 upstream 一个较低起点
 const DEFAULT_SCORE: u32 = 150;
 
+/// QUIC 探针分数过期阈值（秒）。超过此时间未更新视为断流，评分归零。
+const QUIC_STALE_SECS: u64 = 60;
+
 #[derive(Debug)]
 pub struct Upstream {
     pub id: String,
@@ -172,22 +175,40 @@ impl Upstream {
 
     pub fn score(&self) -> u32 {
         let tcp = self.tcp_score.load(Ordering::Relaxed);
-        let uplink = self.quic_uplink_score.load(Ordering::Relaxed);
-        let downlink = self.quic_downlink_score.load(Ordering::Relaxed);
+        let now = now_secs();
 
-        let uplink_valid = self.quic_uplink_last_update_secs.load(Ordering::Relaxed) != 0;
-        let downlink_valid = self.quic_downlink_last_update_secs.load(Ordering::Relaxed) != 0;
+        // 对每个方向应用线性衰减：从上次更新起，QUIC_STALE_SECS 秒内线性降到 0
+        let decay = |score: u32, last_update_secs: u64| -> Option<u32> {
+            if last_update_secs == 0 {
+                return None;
+            }
+            let elapsed = now.saturating_sub(last_update_secs);
+            if elapsed >= QUIC_STALE_SECS {
+                return Some(0);
+            }
+            let factor = (QUIC_STALE_SECS - elapsed) as f64 / QUIC_STALE_SECS as f64;
+            Some((score as f64 * factor) as u32)
+        };
 
-        let quic = match (uplink_valid, downlink_valid) {
-            (true, true) => (uplink + downlink) / 2,
-            (true, false) => uplink,
-            (false, true) => downlink,
-            (false, false) => DEFAULT_SCORE,
+        let uplink = decay(
+            self.quic_uplink_score.load(Ordering::Relaxed),
+            self.quic_uplink_last_update_secs.load(Ordering::Relaxed),
+        );
+        let downlink = decay(
+            self.quic_downlink_score.load(Ordering::Relaxed),
+            self.quic_downlink_last_update_secs.load(Ordering::Relaxed),
+        );
+
+        let quic = match (uplink, downlink) {
+            (Some(u), Some(d)) => (u + d) / 2,
+            (Some(u), None) => u,
+            (None, Some(d)) => d,
+            (None, None) => DEFAULT_SCORE,
         };
 
         // tcp_score_initialized 为 false 说明从未通过 TCP 流量更新过，视为无效
         let tcp_valid = self.tcp_score_initialized.load(Ordering::Relaxed);
-        let quic_valid = uplink_valid || downlink_valid;
+        let quic_valid = uplink.is_some() || downlink.is_some();
         let qw = self.quic_weight.load(Ordering::Relaxed);
         let tw = 100 - qw;
 
@@ -890,13 +911,14 @@ mod tests {
     /// 直接设置 QUIC 分数并标记为已更新（绕过 3:7 平滑混合）
     fn set_quic_uplink(up: &Upstream, score: u32) {
         up.quic_uplink_score.store(score, Ordering::Relaxed);
-        up.quic_uplink_last_update_secs.store(1, Ordering::Relaxed);
+        up.quic_uplink_last_update_secs
+            .store(now_secs(), Ordering::Relaxed);
     }
 
     fn set_quic_downlink(up: &Upstream, score: u32) {
         up.quic_downlink_score.store(score, Ordering::Relaxed);
         up.quic_downlink_last_update_secs
-            .store(1, Ordering::Relaxed);
+            .store(now_secs(), Ordering::Relaxed);
     }
 
     #[test]
@@ -933,6 +955,43 @@ mod tests {
         assert!(up.tcp_score_initialized.load(Ordering::Relaxed));
         assert_eq!(up.quic_uplink_score.load(Ordering::Relaxed), 100);
         assert_eq!(up.quic_downlink_score.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn quic_score_decays_linearly() {
+        let up = make_upstream("stale");
+        set_tcp_score(&up, 800);
+        // 设置 QUIC 分数，但 last_update 在 QUIC_STALE_SECS / 2 秒前
+        let half_stale = now_secs() - QUIC_STALE_SECS / 2;
+        up.quic_uplink_score.store(800, Ordering::Relaxed);
+        up.quic_uplink_last_update_secs
+            .store(half_stale, Ordering::Relaxed);
+        up.quic_downlink_score.store(800, Ordering::Relaxed);
+        up.quic_downlink_last_update_secs
+            .store(half_stale, Ordering::Relaxed);
+
+        let s = up.score();
+        // QUIC 方向经过半衰期衰减：800 * 0.5 = 400
+        // tcp=800, quic=400, qw=40 => (800*60 + 400*40)/100 = 640
+        assert!(s < 650 && s > 630, "expected ~640, got {s}");
+    }
+
+    #[test]
+    fn quic_score_zero_when_stale() {
+        let up = make_upstream("dead");
+        set_tcp_score(&up, 800);
+        // last_update 超过 QUIC_STALE_SECS 秒
+        let old = now_secs() - QUIC_STALE_SECS - 10;
+        up.quic_uplink_score.store(800, Ordering::Relaxed);
+        up.quic_uplink_last_update_secs
+            .store(old, Ordering::Relaxed);
+        up.quic_downlink_score.store(800, Ordering::Relaxed);
+        up.quic_downlink_last_update_secs
+            .store(old, Ordering::Relaxed);
+
+        let s = up.score();
+        // QUIC 衰减到 0，仍参与加权：(800*60 + 0*40)/100 = 480
+        assert_eq!(s, 480, "expected 480, got {s}");
     }
 
     // ---------- UpstreamSet ----------
