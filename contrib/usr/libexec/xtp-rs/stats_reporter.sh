@@ -84,24 +84,44 @@ get_instance_id() {
     # shadowquic --config /etc/xray/shadowquic/niyaou.yaml
     # shadowquic --config=/etc/xray/shadowquic/niyaou.yaml
     cfg_file=$(
-        tr '\000' '\n' < "$cmdline_file" 2>/dev/null | awk '
-            $0 == "-c" || $0 == "--config" {
-                if (getline > 0) {
-                    print
-                    exit
+        tr '\0' '\n' < "$cmdline_file" 2>/dev/null |
+        awk '
+            { a[NR] = $0 }
+
+            END {
+                # 有 "--" 时，仅解析其后的真实程序参数；
+                # 无 "--" 时，从头解析。
+                start = 1
+                for (i = 1; i <= NR; i++) {
+                    if (a[i] == "--") {
+                        start = i + 1
+                        break
+                    }
                 }
-            }
 
-            index($0, "-c=") == 1 {
-                sub(/^-c=/, "")
-                print
-                exit
-            }
+                for (i = start; i <= NR; i++) {
+                    file = ""
 
-            index($0, "--config=") == 1 {
-                sub(/^--config=/, "")
-                print
-                exit
+                    # -c /path/config.yaml
+                    # --config /path/config.yaml
+                    if ((a[i] == "-c" || a[i] == "--config") && i < NR) {
+                        file = a[i + 1]
+                    }
+                    # -c=/path/config.yaml
+                    else if (a[i] ~ /^-c=/) {
+                        file = substr(a[i], 4)
+                    }
+                    # --config=/path/config.yaml
+                    else if (a[i] ~ /^--config=/) {
+                        file = substr(a[i], 10)
+                    }
+
+                    # 只需非空且不以 "-" 开头即可
+                    if (file != "" && file !~ /^-/) {
+                        print file
+                        exit
+                    }
+                }
             }
         '
     )
