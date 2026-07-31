@@ -447,6 +447,14 @@ pub struct Config {
     #[serde(default = "default_upstream_score_debug_interval_secs")]
     pub upstream_score_debug_interval_secs: u64,
 
+    /// 上游选中统计窗口，单位秒。
+    ///
+    /// 记录滑动窗口内每个 upstream 被选中的次数，每 60 秒打印一次 INFO 日志。
+    /// 默认 0（禁用）。需要排障时显式设为 1800 等值开启。
+    /// 最大值 604800（7 天），超出会在启动时校验报错。
+    #[serde(default = "default_pick_stats_window_secs")]
+    pub pick_stats_window_secs: u32,
+
     #[serde(default)]
     /// 代理模式：smart / global / bypass。
     /// 运行时可通过 `SIGUSR1` 临时切换，`SIGHUP` 重载后恢复为此值。
@@ -620,6 +628,10 @@ pub fn default_upstream_score_debug_interval_secs() -> u64 {
     0
 }
 
+pub fn default_pick_stats_window_secs() -> u32 {
+    0
+}
+
 pub fn default_health_check_url() -> String {
     "cp.cloudflare.com".to_string()
 }
@@ -678,6 +690,7 @@ impl Config {
             self.upstream_switch_tolerance,
             self.quic_weight,
             self.quic_stale_secs,
+            self.pick_stats_window_secs,
         )
     }
 
@@ -700,6 +713,10 @@ impl Config {
 
         if self.health_check_interval_secs > 0 && self.health_check_fail_threshold == 0 {
             bail!("health_check_fail_threshold must be > 0 when health_check is enabled");
+        }
+
+        if self.pick_stats_window_secs > 604800 {
+            bail!("pick_stats_window_secs must be <= 604800 (7 days)");
         }
 
         for u in &self.upstream {
@@ -862,6 +879,7 @@ mod tests {
             quic_weight: 40,
             quic_stale_secs: default_quic_stale_secs(),
             upstream_score_debug_interval_secs: default_upstream_score_debug_interval_secs(),
+            pick_stats_window_secs: default_pick_stats_window_secs(),
             proxy_mode: ProxyMode::Smart,
             geosite_path: None,
             proxy_geosite_tags: vec![],

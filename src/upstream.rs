@@ -2,8 +2,7 @@ use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use portable_atomic::AtomicU64;
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -51,7 +50,7 @@ pub struct Upstream {
     quic_downlink_score: AtomicU32,
     quic_uplink_last_update_secs: AtomicU64,
     quic_downlink_last_update_secs: AtomicU64,
-    quic_weight: AtomicU32,    // 0-100，默认 40
+    quic_weight: AtomicU32,     // 0-100，默认 40
     quic_stale_secs: AtomicU64, // 过期阈值（秒），由 UpstreamSet 统一设置
 }
 
@@ -89,8 +88,7 @@ impl Upstream {
     }
 
     pub fn set_quic_stale_secs(&self, secs: u64) {
-        self.quic_stale_secs
-            .store(secs.max(1), Ordering::Relaxed);
+        self.quic_stale_secs.store(secs.max(1), Ordering::Relaxed);
     }
 
     fn lock_registry(&self) -> std::sync::MutexGuard<'_, Vec<(Weak<()>, std::os::fd::RawFd)>> {
@@ -347,11 +345,172 @@ impl Upstream {
     }
 }
 
+/// 时间桶，覆盖 [start_secs, start_secs + bucket_secs) 时间段。
+/// 时钟回拨时事件会归入当前最新桶，因此该桶的时间范围是统计近似值。
+struct PickStatsBucket {
+    start_secs: u64,
+    counts: Vec<u64>,
+}
+
+/// 内部状态，由单个 Mutex 保护。
+struct PickStatsInner {
+    buckets: VecDeque<PickStatsBucket>,
+    totals: Vec<u64>,
+}
+
+/// 选中统计：固定时间桶 + upstream 索引计数。
+///
+/// - 内存：O(桶数 × upstream 数)，与 pick 频率无关
+/// - record_by_id()：按 id 查索引后整数加一，常规路径零分配（仅新桶时分配固定大小计数数组）
+/// - counts()：O(k)，k = upstream 数
+const PICK_STATS_BUCKET_SECS: u64 = 10;
+
+struct PickStats {
+    window_secs: u64,
+    bucket_secs: u64,
+    /// upstream id → 索引映射，record_by_id() 使用。
+    indexes: HashMap<String, usize>,
+    /// index → upstream id，仅日志打印时使用。
+    upstream_ids: Vec<String>,
+    inner: Mutex<PickStatsInner>,
+    last_log_secs: AtomicU64,
+}
+
+impl PickStats {
+    fn new(window_secs: u64, upstream_ids: Vec<String>) -> Self {
+        let n = upstream_ids.len();
+        let indexes = upstream_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+        let bucket_secs = PICK_STATS_BUCKET_SECS.min(window_secs).max(1);
+        Self {
+            window_secs,
+            bucket_secs,
+            indexes,
+            upstream_ids,
+            inner: Mutex::new(PickStatsInner {
+                buckets: VecDeque::new(),
+                totals: vec![0; n],
+            }),
+            last_log_secs: AtomicU64::new(0),
+        }
+    }
+
+    /// 按 upstream id 记录一次选中，返回是否成功（未知 id 返回 false）。
+    fn record_by_id(&self, upstream_id: &str) -> bool {
+        let Some(&idx) = self.indexes.get(upstream_id) else {
+            debug_assert!(
+                false,
+                "picked upstream missing from pick stats index: {upstream_id}"
+            );
+            return false;
+        };
+        self.record_at(now_secs(), idx);
+        true
+    }
+
+    fn record_at(&self, now: u64, upstream_index: usize) {
+        let bucket_start = now / self.bucket_secs * self.bucket_secs;
+        let cutoff = now.saturating_sub(self.window_secs);
+        let n = self.upstream_ids.len();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 淘汰窗口外的旧桶
+        while inner
+            .buckets
+            .front()
+            .is_some_and(|b| b.start_secs.saturating_add(self.bucket_secs) <= cutoff)
+        {
+            let expired = inner.buckets.pop_front().expect("checked above");
+            for (total, &cnt) in inner.totals.iter_mut().zip(&expired.counts) {
+                debug_assert!(*total >= cnt, "pick stats total must cover expired bucket");
+                *total = total.saturating_sub(cnt);
+            }
+        }
+
+        // 找到或创建当前桶；时钟回拨时归入最新桶
+        let use_existing = inner
+            .buckets
+            .back()
+            .is_some_and(|b| b.start_secs > bucket_start);
+        if !use_existing
+            && inner
+                .buckets
+                .back()
+                .is_none_or(|b| b.start_secs != bucket_start)
+        {
+            inner.buckets.push_back(PickStatsBucket {
+                start_secs: bucket_start,
+                counts: vec![0; n],
+            });
+        }
+
+        let bucket = inner.buckets.back_mut().expect("just ensured bucket");
+        bucket.counts[upstream_index] += 1;
+        inner.totals[upstream_index] += 1;
+    }
+
+    /// 返回窗口内各 upstream 的选中次数，按次数降序。O(k) 复杂度。
+    fn counts(&self) -> Vec<(String, u64)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counts: Vec<_> = self
+            .upstream_ids
+            .iter()
+            .zip(&inner.totals)
+            .filter_map(|(id, &c)| (c > 0).then_some((id.clone(), c)))
+            .collect();
+        counts.sort_by_key(|b| std::cmp::Reverse(b.1));
+        counts
+    }
+
+    /// 距上次日志超过 60 秒时打印统计。
+    fn maybe_log(&self) {
+        let now = now_secs();
+        let last = self.last_log_secs.load(Ordering::Relaxed);
+        // 时钟回拨时重置节流基准，避免日志被长时间抑制
+        if now < last {
+            let _ = self.last_log_secs.compare_exchange(
+                last,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            return;
+        }
+        if now - last < 60 {
+            return;
+        }
+        if self
+            .last_log_secs
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let counts = self.counts();
+        if counts.is_empty() {
+            return;
+        }
+        let total: u64 = counts.iter().map(|(_, c)| *c).sum();
+        let parts: Vec<String> = counts.iter().map(|(id, c)| format!("{id}: {c}")).collect();
+        info!(
+            window_secs = self.window_secs,
+            bucket_secs = self.bucket_secs,
+            total_picks = total,
+            upstreams = %parts.join(", "),
+            "pick stats"
+        );
+    }
+}
+
 pub struct UpstreamSet {
     groups: HashMap<String, Vec<Arc<Upstream>>>,
     all_items: Vec<Arc<Upstream>>,
     current: Mutex<HashMap<String, Option<String>>>,
     tolerance: u32,
+    pick_stats: Option<PickStats>,
 }
 
 impl UpstreamSet {
@@ -360,6 +519,7 @@ impl UpstreamSet {
         tolerance: u32,
         quic_weight: u32,
         quic_stale_secs: u64,
+        pick_stats_window_secs: u32,
     ) -> Result<Self> {
         if items.is_empty() {
             bail!("UpstreamSet cannot be created with empty items");
@@ -380,11 +540,17 @@ impl UpstreamSet {
             up.set_quic_stale_secs(quic_stale_secs);
         }
 
+        let pick_stats = (pick_stats_window_secs > 0).then(|| {
+            let ids: Vec<String> = items.iter().map(|u| u.id.clone()).collect();
+            PickStats::new(pick_stats_window_secs as u64, ids)
+        });
+
         Ok(Self {
             groups,
             all_items: items,
             current: Mutex::new(HashMap::new()),
             tolerance,
+            pick_stats,
         })
     }
 
@@ -571,6 +737,13 @@ impl UpstreamSet {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(group.to_string(), Some(chosen.id.clone()));
+
+        // 5. 记录选中统计
+        if let Some(ref stats) = self.pick_stats
+            && stats.record_by_id(&chosen.id)
+        {
+            stats.maybe_log();
+        }
 
         Some(chosen)
     }
@@ -1166,7 +1339,7 @@ mod tests {
 
     fn upstream_set(ids: &[&str], tolerance: u32) -> UpstreamSet {
         let items: Vec<_> = ids.iter().map(|id| upstream(id)).collect();
-        UpstreamSet::new(items, tolerance, 40, DEFAULT_QUIC_STALE_SECS).unwrap()
+        UpstreamSet::new(items, tolerance, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap()
     }
 
     #[test]
@@ -1286,7 +1459,7 @@ mod tests {
             upstream_with_groups("c", vec!["office".to_string()]),
             upstream_with_groups("d", vec!["office".to_string()]),
         ];
-        let set = UpstreamSet::new(items, 50, 40, DEFAULT_QUIC_STALE_SECS).unwrap();
+        let set = UpstreamSet::new(items, 50, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
 
         // sticky default -> a, office -> c
         {
@@ -1399,7 +1572,7 @@ mod tests {
         for u in &items {
             set_tcp_score(u, 500);
         }
-        let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS).unwrap();
+        let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
 
         // effective: high=1000, low=250
         // weight: high=1000000, low=62500, ratio ~16:1
@@ -1443,7 +1616,7 @@ mod tests {
             set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
-        let set = UpstreamSet::new(items, 50, 40, DEFAULT_QUIC_STALE_SECS).unwrap();
+        let set = UpstreamSet::new(items, 50, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
 
         // sticky to "a"
         {
@@ -1471,7 +1644,7 @@ mod tests {
             set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
-        let set2 = UpstreamSet::new(items2, 50, 40, DEFAULT_QUIC_STALE_SECS).unwrap();
+        let set2 = UpstreamSet::new(items2, 50, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
         {
             let mut cur = set2.current.lock().unwrap();
             cur.insert("default".to_string(), Some("a".to_string()));
@@ -1617,5 +1790,112 @@ mod tests {
             .await
             .expect("task should exit within timeout")
             .expect("task should not panic");
+    }
+
+    // ---------- PickStats ----------
+    #[test]
+    fn pick_stats_record_and_count() {
+        let ids: Vec<String> = ["vmshell", "vmshell_1444"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let stats = PickStats::new(1800, ids);
+        stats.record_at(100, 0);
+        stats.record_at(101, 0);
+        stats.record_at(102, 1);
+        let counts = stats.counts();
+        assert_eq!(counts.len(), 2);
+        // 按次数降序
+        assert_eq!(counts[0], ("vmshell".to_string(), 2));
+        assert_eq!(counts[1], ("vmshell_1444".to_string(), 1));
+    }
+
+    #[test]
+    fn pick_stats_bucket_eviction() {
+        // 桶宽 10 秒，窗口 30 秒
+        let ids: Vec<String> = ["bbr", "brutal"].iter().map(|s| s.to_string()).collect();
+        let stats = PickStats::new(30, ids);
+
+        // t=1：0-9 秒桶，bbr 两次
+        stats.record_at(1, 0);
+        stats.record_at(8, 0);
+        // t=12：10-19 秒桶，brutal 一次
+        stats.record_at(12, 1);
+        assert_eq!(
+            stats.counts(),
+            vec![("bbr".to_string(), 2), ("brutal".to_string(), 1)]
+        );
+
+        // t=41：窗口 30 秒，0-9 秒桶应被淘汰（end=10 <= cutoff=11）
+        stats.record_at(41, 1);
+        assert_eq!(stats.counts(), vec![("brutal".to_string(), 2)]);
+    }
+
+    #[test]
+    fn pick_stats_cross_multiple_buckets() {
+        let ids: Vec<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        let stats = PickStats::new(100, ids);
+
+        // 跨越多个桶
+        for t in [5, 15, 25, 35, 45] {
+            stats.record_at(t, 0);
+        }
+        assert_eq!(stats.counts(), vec![("a".to_string(), 5)]);
+    }
+
+    #[test]
+    fn pick_stats_long_gap_clears_all() {
+        let ids: Vec<String> = ["x"].iter().map(|s| s.to_string()).collect();
+        let stats = PickStats::new(30, ids);
+
+        stats.record_at(100, 0);
+        assert_eq!(stats.counts(), vec![("x".to_string(), 1)]);
+
+        // 长时间无 pick 后，一次 record 清除所有旧桶
+        stats.record_at(200, 0);
+        assert_eq!(stats.counts(), vec![("x".to_string(), 1)]);
+    }
+
+    #[test]
+    fn pick_stats_clock_rollback_uses_latest_bucket() {
+        let ids: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let stats = PickStats::new(100, ids);
+
+        // 正常记录到 t=50 桶
+        stats.record_at(50, 0);
+        stats.record_at(55, 0);
+        // 时钟回拨到 t=30，应归入 t=50 桶而非创建新桶
+        stats.record_at(30, 1);
+
+        let counts = stats.counts();
+        // 只有一个桶，两个 upstream 都在其中
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0], ("a".to_string(), 2));
+        assert_eq!(counts[1], ("b".to_string(), 1));
+
+        // 内部只应有一个桶
+        let inner = stats.inner.lock().unwrap();
+        assert_eq!(inner.buckets.len(), 1);
+    }
+
+    #[test]
+    fn upstream_set_with_pick_stats() {
+        let items: Vec<_> = ["a", "b"].iter().map(|id| upstream(id)).collect();
+        let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS, 1800).unwrap();
+        // 多次 pick 应该记录统计
+        for _ in 0..10 {
+            set.pick().unwrap();
+        }
+        let stats = set.pick_stats.as_ref().unwrap();
+        let counts = stats.counts();
+        let total: u64 = counts.iter().map(|(_, c)| *c).sum();
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn upstream_set_disables_pick_stats_when_window_is_zero() {
+        let items = vec![upstream("a")];
+        let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
+        assert!(set.pick_stats.is_none());
     }
 }

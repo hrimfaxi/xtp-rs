@@ -217,6 +217,11 @@ disable_upstream_score = false
 # - >0：仅当新上游分数比当前高超过此值时才允许切换
 upstream_switch_tolerance = 0
 
+# 上游选中统计窗口（秒）。
+# 记录滑动窗口内每个 upstream 被 pick 的次数，每 60 秒打印一次 INFO 日志。
+# 默认值：0（禁用）。需要排障时显式开启，例如 pick_stats_window_secs = 1800。
+# pick_stats_window_secs = 0
+
 # 主动健康检查间隔（秒），0 表示禁用主动探测
 # 默认值：0（依赖 TCP_INFO 聚合和 shadowquic 探针）
 health_check_interval_secs = 0

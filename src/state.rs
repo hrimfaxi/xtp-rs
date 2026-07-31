@@ -1217,7 +1217,7 @@ mod tests {
             vec!["default".to_string()],
             1.0,
         );
-        let upstreams = UpstreamSet::new(vec![upstream], 0, 70, 180).unwrap();
+        let upstreams = UpstreamSet::new(vec![upstream], 0, 70, 180, 0).unwrap();
         let udp_runtime = Arc::new(UdpRuntime::new(Duration::from_secs(60)));
         AppState {
             mmdb: None,
@@ -1310,6 +1310,7 @@ mod tests {
             quic_weight: 40,
             quic_stale_secs: 180,
             upstream_score_debug_interval_secs: 0,
+            pick_stats_window_secs: 0,
             proxy_mode: ProxyMode::default(),
             geosite_path: None,
             direct_geosite_tags: vec![],
