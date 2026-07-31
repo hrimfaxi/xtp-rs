@@ -606,7 +606,13 @@ impl UpstreamSet {
                     score = up.score(),
                     "pick: single upstream"
                 );
-                return Some(Arc::clone(up));
+                let chosen = Arc::clone(up);
+                self.current
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(group.to_string(), Some(chosen.id.clone()));
+                self.record_pick_stats(&chosen);
+                return Some(chosen);
             }
             _ => {}
         }
@@ -650,7 +656,9 @@ impl UpstreamSet {
                         tolerance = self.tolerance,
                         "pick: keep sticky upstream"
                     );
-                    return Some(Arc::clone(cur));
+                    let chosen = Arc::clone(cur);
+                    self.record_pick_stats(&chosen);
+                    return Some(chosen);
                 }
             }
         }
@@ -739,13 +747,16 @@ impl UpstreamSet {
             .insert(group.to_string(), Some(chosen.id.clone()));
 
         // 5. 记录选中统计
+        self.record_pick_stats(&chosen);
+        Some(chosen)
+    }
+
+    fn record_pick_stats(&self, chosen: &Arc<Upstream>) {
         if let Some(ref stats) = self.pick_stats
             && stats.record_by_id(&chosen.id)
         {
             stats.maybe_log();
         }
-
-        Some(chosen)
     }
 
     pub fn find_by_id(&self, id: &str) -> Option<Arc<Upstream>> {
@@ -1897,5 +1908,44 @@ mod tests {
         let items = vec![upstream("a")];
         let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
         assert!(set.pick_stats.is_none());
+    }
+
+    #[test]
+    fn single_upstream_pick_records_stats() {
+        let items = vec![upstream("solo")];
+        let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS, 1800).unwrap();
+        for _ in 0..5 {
+            set.pick().unwrap();
+        }
+        let stats = set.pick_stats.as_ref().unwrap();
+        let counts = stats.counts();
+        let total: u64 = counts.iter().map(|(_, c)| *c).sum();
+        assert_eq!(total, 5, "single upstream picks must be recorded");
+        assert_eq!(counts[0], ("solo".to_string(), 5));
+        let cur = set.current.lock().unwrap();
+        assert_eq!(
+            cur.get("default"),
+            Some(&Some("solo".to_string())),
+            "single upstream must be recorded in current"
+        );
+    }
+
+    #[test]
+    fn sticky_keep_pick_records_stats() {
+        let items: Vec<_> = ["a", "b"].iter().map(|id| upstream(id)).collect();
+        let set = UpstreamSet::new(items, 1000, 40, DEFAULT_QUIC_STALE_SECS, 1800).unwrap();
+        // 所有 upstream 同分，sticky 到 "a"
+        {
+            let mut cur = set.current.lock().unwrap();
+            cur.insert("default".to_string(), Some("a".to_string()));
+        }
+        for _ in 0..5 {
+            set.pick().unwrap();
+        }
+        let stats = set.pick_stats.as_ref().unwrap();
+        let counts = stats.counts();
+        let total: u64 = counts.iter().map(|(_, c)| *c).sum();
+        assert_eq!(total, 5, "sticky keep picks must be recorded");
+        assert_eq!(counts[0], ("a".to_string(), 5));
     }
 }
