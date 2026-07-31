@@ -433,6 +433,13 @@ pub struct Config {
     #[serde(default = "default_quic_weight")]
     pub quic_weight: u32,
 
+    /// 上游分数调试打印间隔，单位秒。
+    ///
+    /// 仅在 debug 日志级别启用时生效。
+    /// 默认 0（禁用）。
+    #[serde(default = "default_upstream_score_debug_interval_secs")]
+    pub upstream_score_debug_interval_secs: u64,
+
     #[serde(default)]
     /// 代理模式：smart / global / bypass。
     /// 运行时可通过 `SIGUSR1` 临时切换，`SIGHUP` 重载后恢复为此值。
@@ -596,6 +603,10 @@ pub fn default_health_check_fail_threshold() -> u32 {
 
 pub fn default_quic_weight() -> u32 {
     40
+}
+
+pub fn default_upstream_score_debug_interval_secs() -> u64 {
+    0
 }
 
 pub fn default_health_check_url() -> String {
@@ -829,6 +840,7 @@ mod tests {
             health_check_fail_threshold: 2,
             health_check_url: "cp.cloudflare.com".into(),
             quic_weight: 40,
+            upstream_score_debug_interval_secs: default_upstream_score_debug_interval_secs(),
             proxy_mode: ProxyMode::Smart,
             geosite_path: None,
             proxy_geosite_tags: vec![],
@@ -1078,6 +1090,11 @@ mod tests {
                 ..super::tests::minimal_config()
             };
             assert!(cfg.validate().is_err());
+        }
+
+        #[test]
+        fn default_upstream_score_debug_interval_is_disabled() {
+            assert_eq!(super::default_upstream_score_debug_interval_secs(), 0);
         }
     }
 }

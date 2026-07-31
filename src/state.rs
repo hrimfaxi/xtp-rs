@@ -27,7 +27,7 @@ use crate::socket_factory::{
 };
 use crate::tcp::{run_tcp_port_forward, tcp_accept_loop};
 use crate::udp::{UdpRuntime, run_udp_gc_loop, run_udp_loop, run_udp_port_forward};
-use crate::upstream::{Upstream, UpstreamSet, run_health_check_task};
+use crate::upstream::{Upstream, UpstreamSet, run_health_check_task, run_score_debug_printer};
 use crate::util::{
     TaskGuard, build_ip_tries, canonical_domain, domain_matches_suffix, parse_ip_net_list,
     parse_ip_or_cidr, warn_if_splice_with_forwarding,
@@ -257,6 +257,7 @@ pub struct AppState {
     pub tcp_handlers: TaskGuard,
     pub health_check: TaskGuard,
     pub udp_gc: TaskGuard,
+    pub score_debug_printer: TaskGuard,
     pub runtime: Arc<AppRuntime>,
     direct_cache: DirectCache,
     route_cache_ttl: Duration,
@@ -888,6 +889,7 @@ impl AppState {
             tcp_handlers: TaskGuard::new(),
             health_check: TaskGuard::new(),
             udp_gc: TaskGuard::new(),
+            score_debug_printer: TaskGuard::new(),
             runtime: Arc::new(AppRuntime {
                 proxy_mode: AtomicU8::new(proxy_mode),
                 udp: udp_runtime,
@@ -916,10 +918,18 @@ impl AppState {
         }
 
         if !self.config.disable_upstream_score {
-            for up in self.upstreams.iter() {
-                let up = up.clone();
+            let all_upstreams: Vec<Arc<Upstream>> = self.upstreams.iter().cloned().collect();
+            for up in &all_upstreams {
+                let up = Arc::clone(up);
                 self.upstream_scores
                     .spawn(|cancel| up.run_score_task(cancel));
+            }
+
+            // 仅在 debug 级别启用且 interval > 0 时，启动分数调试打印任务
+            let interval_secs = self.config.upstream_score_debug_interval_secs;
+            if interval_secs > 0 && tracing::enabled!(tracing::Level::DEBUG) {
+                self.score_debug_printer
+                    .spawn(|cancel| run_score_debug_printer(all_upstreams, interval_secs, cancel));
             }
         }
 
@@ -1232,6 +1242,7 @@ mod tests {
             tcp_handlers: TaskGuard::new(),
             health_check: TaskGuard::new(),
             udp_gc: TaskGuard::new(),
+            score_debug_printer: TaskGuard::new(),
             runtime: Arc::new(AppRuntime {
                 proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
                 udp: udp_runtime,
@@ -1297,6 +1308,7 @@ mod tests {
             health_check_fail_threshold: 2,
             health_check_url: "cp.cloudflare.com".into(),
             quic_weight: 40,
+            upstream_score_debug_interval_secs: 0,
             proxy_mode: ProxyMode::default(),
             geosite_path: None,
             direct_geosite_tags: vec![],

@@ -313,6 +313,7 @@ flowchart TD
 | `disable_upstream_score` | bool | `false` | 禁用上游动态评分（启用后完全随机选择） |
 | `upstream_switch_tolerance` | u32 | `0` | 粘性切换容忍度（分），0 表示不启用粘性 |
 | `quic_weight` | u32 | `40` | QUIC 探针在选路分数中的权重（0-100） |
+| `upstream_score_debug_interval_secs` | u64 | `0` | 分数调试打印间隔（秒），仅在 debug 级别启用时生效，设置为 0 禁用 |
 
 **评分机制说明**：
 

@@ -177,10 +177,55 @@ impl Upstream {
     }
 
     pub fn score(&self) -> u32 {
-        let tcp = self.tcp_score.load(Ordering::Relaxed);
-        let now = now_secs();
+        self.score_at(now_secs())
+    }
 
-        // 对每个方向应用线性衰减：从上次更新起，QUIC_STALE_SECS 秒内线性降到最低分
+    /// 有效分数 = 原始动态分数 × gain，用于选路权重和 tolerance 比较。
+    pub fn effective_score(&self) -> u64 {
+        self.effective_score_at(now_secs())
+    }
+
+    /// 使用指定时间计算有效分数
+    pub fn effective_score_at(&self, now: u64) -> u64 {
+        let raw_score = self.score_at(now);
+        let eff = raw_score as f64 * self.gain;
+        let clamped = eff.clamp(1.0, 10_000_000.0) as u64;
+        if eff > 10_000_000.0 {
+            debug!(
+                id = %self.id,
+                raw_score,
+                gain = self.gain,
+                effective_score = clamped,
+                "effective score clamped to upper bound"
+            );
+        }
+        clamped
+    }
+
+    /// 使用指定时间计算综合分数
+    fn score_at(&self, now: u64) -> u32 {
+        let tcp = self.tcp_score.load(Ordering::Relaxed);
+        let quic = self.quic_score_effective_at(now);
+
+        let tcp_valid = self.tcp_score_initialized.load(Ordering::Relaxed);
+        // 注意：quic_valid 判定与 quic_score_effective_at 内的 decay 逻辑存在隐含契约——
+        // decay 仅在 last_update_secs == 0 时返回 None，stale 仍返回 Some(MINIMAL_SCORE)。
+        // 若修改 decay 让超期也返回 None，此处需同步调整。
+        let quic_valid = self.quic_uplink_last_update_secs.load(Ordering::Relaxed) > 0
+            || self.quic_downlink_last_update_secs.load(Ordering::Relaxed) > 0;
+        let qw = self.quic_weight.load(Ordering::Relaxed);
+        let tw = 100 - qw;
+
+        match (tcp_valid, quic_valid) {
+            (true, true) => (tcp * tw + quic * qw) / 100,
+            (false, true) => quic,
+            (true, false) => tcp,
+            (false, false) => DEFAULT_SCORE,
+        }
+    }
+
+    /// 获取 QUIC 有效分数（应用衰减后的值），使用指定时间
+    fn quic_score_effective_at(&self, now: u64) -> u32 {
         let decay = |score: u32, last_update_secs: u64| -> Option<u32> {
             if last_update_secs == 0 {
                 return None;
@@ -203,42 +248,42 @@ impl Upstream {
             self.quic_downlink_last_update_secs.load(Ordering::Relaxed),
         );
 
-        let quic = match (uplink, downlink) {
+        match (uplink, downlink) {
             (Some(u), Some(d)) => (u + d) / 2,
             (Some(u), None) => u,
             (None, Some(d)) => d,
             (None, None) => DEFAULT_SCORE,
-        };
-
-        // tcp_score_initialized 为 false 说明从未通过 TCP 流量更新过，视为无效
-        let tcp_valid = self.tcp_score_initialized.load(Ordering::Relaxed);
-        let quic_valid = uplink.is_some() || downlink.is_some();
-        let qw = self.quic_weight.load(Ordering::Relaxed);
-        let tw = 100 - qw;
-
-        match (tcp_valid, quic_valid) {
-            (true, true) => (tcp * tw + quic * qw) / 100,
-            (false, true) => quic,
-            (true, false) => tcp,
-            (false, false) => DEFAULT_SCORE,
         }
     }
 
-    /// 有效分数 = 原始动态分数 × gain，用于选路权重和 tolerance 比较。
-    pub fn effective_score(&self) -> u64 {
-        let raw = self.score() as f64;
-        let eff = raw * self.gain;
-        let clamped = eff.clamp(1.0, 10_000_000.0) as u64;
-        if eff > 10_000_000.0 {
-            warn!(
-                id = %self.id,
-                raw_score = self.score(),
-                gain = self.gain,
-                effective_score = clamped,
-                "effective score clamped to upper bound"
-            );
-        }
-        clamped
+    /// 获取 TCP 分数（原始值，未经衰减）
+    pub fn tcp_score_raw(&self) -> u32 {
+        self.tcp_score.load(Ordering::Relaxed)
+    }
+
+    /// 获取上行 QUIC 分数（原始值，未经衰减）
+    pub fn quic_uplink_score_raw(&self) -> u32 {
+        self.quic_uplink_score.load(Ordering::Relaxed)
+    }
+
+    /// 获取下行 QUIC 分数（原始值，未经衰减）
+    pub fn quic_downlink_score_raw(&self) -> u32 {
+        self.quic_downlink_score.load(Ordering::Relaxed)
+    }
+
+    /// 获取上行 QUIC 最后更新时间（秒）
+    pub fn quic_uplink_last_update_secs(&self) -> u64 {
+        self.quic_uplink_last_update_secs.load(Ordering::Relaxed)
+    }
+
+    /// 获取下行 QUIC 最后更新时间（秒）
+    pub fn quic_downlink_last_update_secs(&self) -> u64 {
+        self.quic_downlink_last_update_secs.load(Ordering::Relaxed)
+    }
+
+    /// TCP 分数是否已初始化（有过流量更新）
+    pub fn tcp_score_initialized(&self) -> bool {
+        self.tcp_score_initialized.load(Ordering::Relaxed)
     }
 
     /// 更新上行 QUIC 分数（冷却 5 秒）
@@ -829,6 +874,98 @@ pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationTok
     }
 }
 
+/// 定期打印所有 upstream 的详细分数信息（仅在 debug 级别启用时运行）
+pub async fn run_score_debug_printer(
+    upstreams: Vec<Arc<Upstream>>,
+    interval_secs: u64,
+    cancel: CancellationToken,
+) {
+    // interval_secs = 0 表示禁用，直接返回
+    if interval_secs == 0 {
+        return;
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {},
+        }
+
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            continue;
+        }
+
+        // 统一时间基准，确保同一轮计算基于同一时间点
+        let now = now_secs();
+
+        let mut scores: Vec<UpstreamScoreSnapshot> = Vec::new();
+        for up in &upstreams {
+            let quic_up_last = up.quic_uplink_last_update_secs();
+            let quic_down_last = up.quic_downlink_last_update_secs();
+            scores.push(UpstreamScoreSnapshot {
+                id: up.id.as_str(),
+                tcp_raw: up.tcp_score_raw(),
+                tcp_init: up.tcp_score_initialized(),
+                quic_up_raw: up.quic_uplink_score_raw(),
+                quic_up_age: if quic_up_last > 0 {
+                    now.saturating_sub(quic_up_last)
+                } else {
+                    0
+                },
+                quic_up_init: quic_up_last > 0,
+                quic_down_raw: up.quic_downlink_score_raw(),
+                quic_down_age: if quic_down_last > 0 {
+                    now.saturating_sub(quic_down_last)
+                } else {
+                    0
+                },
+                quic_down_init: quic_down_last > 0,
+                quic_eff: up.quic_score_effective_at(now),
+                eff_score: up.effective_score_at(now),
+            });
+        }
+
+        // 按 effective_score 降序排列
+        scores.sort_by_key(|s| std::cmp::Reverse(s.eff_score));
+
+        for s in &scores {
+            debug!(
+                id = %s.id,
+                tcp_raw = s.tcp_raw,
+                tcp_init = s.tcp_init,
+                quic_uplink_raw = s.quic_up_raw,
+                quic_uplink_age_secs = s.quic_up_age,
+                quic_uplink_initialized = s.quic_up_init,
+                quic_downlink_raw = s.quic_down_raw,
+                quic_downlink_age_secs = s.quic_down_age,
+                quic_downlink_initialized = s.quic_down_init,
+                quic_effective = s.quic_eff,
+                effective_score = s.eff_score,
+                "upstream scores detail"
+            );
+        }
+    }
+}
+
+/// 单个 upstream 的分数快照，用于调试打印
+struct UpstreamScoreSnapshot<'a> {
+    id: &'a str,
+    tcp_raw: u32,
+    tcp_init: bool,
+    quic_up_raw: u32,
+    quic_up_age: u64,
+    quic_up_init: bool,
+    quic_down_raw: u32,
+    quic_down_age: u64,
+    quic_down_init: bool,
+    quic_eff: u32,
+    eff_score: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,5 +1465,143 @@ mod tests {
         // a effective=500, b effective=1500, diff=1000 > 50
         let picked = set2.pick().unwrap();
         assert_eq!(picked.id, "b", "should switch due to higher gain");
+    }
+
+    // ---------- QUIC 衰减逻辑一致性 ----------
+
+    /// 手动设置 QUIC 分数和时间戳（绕过冷却）
+    fn set_quic_uplink_at(up: &Upstream, score: u32, last_update: u64) {
+        up.quic_uplink_score.store(score, Ordering::Relaxed);
+        up.quic_uplink_last_update_secs
+            .store(last_update, Ordering::Relaxed);
+    }
+
+    fn set_quic_downlink_at(up: &Upstream, score: u32, last_update: u64) {
+        up.quic_downlink_score.store(score, Ordering::Relaxed);
+        up.quic_downlink_last_update_secs
+            .store(last_update, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn quic_score_effective_at_averages_both_links() {
+        let up = make_upstream("decay_test");
+        let now = 1_000_000;
+
+        set_tcp_score(&up, 500);
+        set_quic_uplink_at(&up, 800, now);
+        set_quic_downlink_at(&up, 600, now);
+
+        let quic_eff = up.quic_score_effective_at(now);
+        assert_eq!(quic_eff, 700, "expected (800+600)/2 = 700");
+
+        // 验证综合分
+        let score = up.score_at(now);
+        assert_eq!(score, 580, "expected (500*60 + 700*40)/100 = 580");
+    }
+
+    #[test]
+    fn quic_score_effective_at_with_stale() {
+        let up = make_upstream("stale_test");
+        let now = 1_000_000;
+        let old = now - QUIC_STALE_SECS - 10;
+
+        set_tcp_score(&up, 500);
+        set_quic_uplink_at(&up, 800, old);
+        set_quic_downlink_at(&up, 600, old);
+
+        let quic_eff = up.quic_score_effective_at(now);
+        // 超过 QUIC_STALE_SECS，应该降到 MINIMAL_SCORE
+        assert_eq!(quic_eff, MINIMAL_SCORE, "expected MINIMAL_SCORE when stale");
+    }
+
+    #[test]
+    fn quic_score_effective_at_partial_decay() {
+        let up = make_upstream("partial_decay");
+        let now = 1_000_000;
+        // 30 秒前更新（半衰期）
+        let half_stale = now - QUIC_STALE_SECS / 2;
+
+        set_tcp_score(&up, 500);
+        set_quic_uplink_at(&up, 800, half_stale);
+        set_quic_downlink_at(&up, 800, half_stale);
+
+        let quic_eff = up.quic_score_effective_at(now);
+        // 半衰期：800 * 0.5 = 400
+        assert_eq!(quic_eff, 400, "expected 800 * 0.5 = 400 at half stale");
+    }
+
+    #[test]
+    fn score_at_consistent_with_quic_effective() {
+        let up = make_upstream("consistency_test");
+        let now = 1_000_000;
+
+        set_tcp_score(&up, 500);
+        set_quic_uplink_at(&up, 800, now);
+
+        let quic_eff = up.quic_score_effective_at(now);
+        let score = up.score_at(now);
+
+        // 只有 uplink 有效，quic = uplink = 800
+        assert_eq!(quic_eff, 800);
+        // (500 * 60 + 800 * 40) / 100 = 620
+        assert_eq!(score, 620);
+    }
+
+    // ---------- effective_score_at ----------
+
+    #[test]
+    fn effective_score_at_uses_fixed_time() {
+        let up = make_upstream("time_consistent");
+        let now = 1_000_000;
+
+        set_tcp_score(&up, 500);
+        set_quic_uplink_at(&up, 500, now);
+
+        let eff_at = up.effective_score_at(now);
+        let score = up.score_at(now);
+
+        // effective_score = score * gain = 500 * 1.0 = 500
+        assert_eq!(eff_at, score as u64);
+    }
+
+    // ---------- interval_secs = 0 ----------
+
+    #[tokio::test]
+    async fn score_debug_printer_exits_on_zero_interval() {
+        let up = make_upstream("test");
+        let upstreams = vec![up];
+        let cancel = CancellationToken::new();
+
+        // interval_secs = 0 应该立即返回
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_score_debug_printer(upstreams, 0, cancel),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "should exit immediately when interval_secs = 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn score_debug_printer_exits_on_cancel() {
+        let up = make_upstream("test");
+        let upstreams = vec![up];
+        let cancel = CancellationToken::new();
+
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            run_score_debug_printer(upstreams, 5, cancel_clone).await;
+        });
+
+        // 立即取消，任务进入 select! 后会发现取消状态
+        cancel.cancel();
+
+        // 验证：1) 一秒内退出 2) 没有 panic
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("task should exit within timeout")
+            .expect("task should not panic");
     }
 }
