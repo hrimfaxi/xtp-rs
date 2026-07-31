@@ -314,6 +314,14 @@ flowchart TD
 | `upstream_switch_tolerance` | u32 | `0` | 粘性切换容忍度（分），0 表示不启用粘性 |
 | `quic_weight` | u32 | `40` | QUIC 探针在选路分数中的权重（0-100） |
 
+**评分机制说明**：
+
+- **TCP 分数**：基于 `TCP_INFO` 实时吞吐量（bytes_received + bytes_acked），每 2 秒采样更新，采用 50/50 历史与新数据混合。
+- **QUIC 分数**：基于 ShadowQUIC 探针报告的 RTT、丢包率、MTU 综合计算，采用 30/70 历史与新数据混合，支持上行/下行双链路独立评分。
+- **QUIC 衰减**：QUIC 探针分数在 60 秒未更新后线性衰减到最低分（10 分），避免因探针断流导致 upstream 被"饿死"而无法被选中更新。
+- **综合评分**：最终分数 = TCP 分数 × (100 - quic_weight) + QUIC 分数 × quic_weight，任一分数无效时退化为另一方。
+- **选路权重**：effective_score = score × gain，采用平方加权随机选择（高分优势放大），effective_score 最小值为 1 以保证所有 upstream 有机会被选中。
+
 ### xtp-stats-reporter（ShadowQUIC 性能上报 daemon）
 
 `xtp-stats-reporter` 是一个 **ShadowQUIC 专用**的性能上报 daemon，运行在 OpenWrt 路由器上。ShadowQUIC 原生支持将链路质量（RTT、丢包率、MTU）输出到 syslog，xtp-stats-reporter 从 syslog 中实时捕获这些日志，解析后通过本地 Unix 数据报 socket（`/tmp/xtp-rs-report.sock`）以 JSON 格式上报给 xtp-rs，供上游动态评分使用。无需对 ShadowQUIC 做任何修改。
