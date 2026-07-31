@@ -23,8 +23,8 @@ use crate::util::{get_tcp_info_ext_raw, now_secs};
 /// 用于避免历史高分在异常或连接卡住后长期保留。
 const DEFAULT_SCORE: u32 = 75;
 
-/// QUIC 探针分数过期阈值（秒）。超过此时间未更新视为断流，评分降到最低分。
-const QUIC_STALE_SECS: u64 = 60;
+/// QUIC 探针分数过期阈值默认值（秒）。实际值由配置决定，通过 UpstreamSet 统一设置。
+const DEFAULT_QUIC_STALE_SECS: u64 = 180;
 
 /// 最低分数，避免分数归零导致 upstream 被"饿死"无法被选中更新。
 const MINIMAL_SCORE: u32 = 10;
@@ -51,7 +51,8 @@ pub struct Upstream {
     quic_downlink_score: AtomicU32,
     quic_uplink_last_update_secs: AtomicU64,
     quic_downlink_last_update_secs: AtomicU64,
-    quic_weight: AtomicU32, // 0-100，默认 40
+    quic_weight: AtomicU32,    // 0-100，默认 40
+    quic_stale_secs: AtomicU64, // 过期阈值（秒），由 UpstreamSet 统一设置
 }
 
 impl Upstream {
@@ -79,11 +80,17 @@ impl Upstream {
             tcp_info_initialized: AtomicBool::new(false),
             health_failures: AtomicU32::new(0),
             quic_weight: AtomicU32::new(40),
+            quic_stale_secs: AtomicU64::new(DEFAULT_QUIC_STALE_SECS),
         })
     }
 
     pub fn set_quic_weight(&self, w: u32) {
         self.quic_weight.store(w.clamp(0, 100), Ordering::Relaxed);
+    }
+
+    pub fn set_quic_stale_secs(&self, secs: u64) {
+        self.quic_stale_secs
+            .store(secs.max(1), Ordering::Relaxed);
     }
 
     fn lock_registry(&self) -> std::sync::MutexGuard<'_, Vec<(Weak<()>, std::os::fd::RawFd)>> {
@@ -226,15 +233,16 @@ impl Upstream {
 
     /// 获取 QUIC 有效分数（应用衰减后的值），使用指定时间
     fn quic_score_effective_at(&self, now: u64) -> u32 {
+        let stale_secs = self.quic_stale_secs.load(Ordering::Relaxed);
         let decay = |score: u32, last_update_secs: u64| -> Option<u32> {
             if last_update_secs == 0 {
                 return None;
             }
             let elapsed = now.saturating_sub(last_update_secs);
-            if elapsed >= QUIC_STALE_SECS {
+            if elapsed >= stale_secs {
                 return Some(MINIMAL_SCORE);
             }
-            let factor = (QUIC_STALE_SECS - elapsed) as f64 / QUIC_STALE_SECS as f64;
+            let factor = (stale_secs - elapsed) as f64 / stale_secs as f64;
             let decayed = (score as f64 * factor) as u32;
             Some(decayed.max(MINIMAL_SCORE))
         };
@@ -347,7 +355,12 @@ pub struct UpstreamSet {
 }
 
 impl UpstreamSet {
-    pub fn new(items: Vec<Arc<Upstream>>, tolerance: u32, quic_weight: u32) -> Result<Self> {
+    pub fn new(
+        items: Vec<Arc<Upstream>>,
+        tolerance: u32,
+        quic_weight: u32,
+        quic_stale_secs: u64,
+    ) -> Result<Self> {
         if items.is_empty() {
             bail!("UpstreamSet cannot be created with empty items");
         }
@@ -364,6 +377,7 @@ impl UpstreamSet {
 
         for up in &items {
             up.set_quic_weight(quic_weight);
+            up.set_quic_stale_secs(quic_stale_secs);
         }
 
         Ok(Self {
@@ -1107,8 +1121,8 @@ mod tests {
     fn quic_score_decays_linearly() {
         let up = make_upstream("stale");
         set_tcp_score(&up, 800);
-        // 设置 QUIC 分数，但 last_update 在 QUIC_STALE_SECS / 2 秒前
-        let half_stale = now_secs() - QUIC_STALE_SECS / 2;
+        // 设置 QUIC 分数，但 last_update 在过期阈值 / 2 秒前
+        let half_stale = now_secs() - DEFAULT_QUIC_STALE_SECS / 2;
         up.quic_uplink_score.store(800, Ordering::Relaxed);
         up.quic_uplink_last_update_secs
             .store(half_stale, Ordering::Relaxed);
@@ -1126,8 +1140,8 @@ mod tests {
     fn quic_score_minimal_when_stale() {
         let up = make_upstream("dead");
         set_tcp_score(&up, 800);
-        // last_update 超过 QUIC_STALE_SECS 秒
-        let old = now_secs() - QUIC_STALE_SECS - 10;
+        // last_update 超过过期阈值
+        let old = now_secs() - DEFAULT_QUIC_STALE_SECS - 10;
         up.quic_uplink_score.store(800, Ordering::Relaxed);
         up.quic_uplink_last_update_secs
             .store(old, Ordering::Relaxed);
@@ -1152,7 +1166,7 @@ mod tests {
 
     fn upstream_set(ids: &[&str], tolerance: u32) -> UpstreamSet {
         let items: Vec<_> = ids.iter().map(|id| upstream(id)).collect();
-        UpstreamSet::new(items, tolerance, 40).unwrap()
+        UpstreamSet::new(items, tolerance, 40, DEFAULT_QUIC_STALE_SECS).unwrap()
     }
 
     #[test]
@@ -1272,7 +1286,7 @@ mod tests {
             upstream_with_groups("c", vec!["office".to_string()]),
             upstream_with_groups("d", vec!["office".to_string()]),
         ];
-        let set = UpstreamSet::new(items, 50, 40).unwrap();
+        let set = UpstreamSet::new(items, 50, 40, DEFAULT_QUIC_STALE_SECS).unwrap();
 
         // sticky default -> a, office -> c
         {
@@ -1385,7 +1399,7 @@ mod tests {
         for u in &items {
             set_tcp_score(u, 500);
         }
-        let set = UpstreamSet::new(items, 0, 40).unwrap();
+        let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS).unwrap();
 
         // effective: high=1000, low=250
         // weight: high=1000000, low=62500, ratio ~16:1
@@ -1429,7 +1443,7 @@ mod tests {
             set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
-        let set = UpstreamSet::new(items, 50, 40).unwrap();
+        let set = UpstreamSet::new(items, 50, 40, DEFAULT_QUIC_STALE_SECS).unwrap();
 
         // sticky to "a"
         {
@@ -1457,7 +1471,7 @@ mod tests {
             set_tcp_score(u, 500);
             set_quic_uplink(u, 500);
         }
-        let set2 = UpstreamSet::new(items2, 50, 40).unwrap();
+        let set2 = UpstreamSet::new(items2, 50, 40, DEFAULT_QUIC_STALE_SECS).unwrap();
         {
             let mut cur = set2.current.lock().unwrap();
             cur.insert("default".to_string(), Some("a".to_string()));
@@ -1503,14 +1517,14 @@ mod tests {
     fn quic_score_effective_at_with_stale() {
         let up = make_upstream("stale_test");
         let now = 1_000_000;
-        let old = now - QUIC_STALE_SECS - 10;
+        let old = now - DEFAULT_QUIC_STALE_SECS - 10;
 
         set_tcp_score(&up, 500);
         set_quic_uplink_at(&up, 800, old);
         set_quic_downlink_at(&up, 600, old);
 
         let quic_eff = up.quic_score_effective_at(now);
-        // 超过 QUIC_STALE_SECS，应该降到 MINIMAL_SCORE
+        // 超过过期阈值，应该降到 MINIMAL_SCORE
         assert_eq!(quic_eff, MINIMAL_SCORE, "expected MINIMAL_SCORE when stale");
     }
 
@@ -1518,8 +1532,8 @@ mod tests {
     fn quic_score_effective_at_partial_decay() {
         let up = make_upstream("partial_decay");
         let now = 1_000_000;
-        // 30 秒前更新（半衰期）
-        let half_stale = now - QUIC_STALE_SECS / 2;
+        // 90 秒前更新（半衰期）
+        let half_stale = now - DEFAULT_QUIC_STALE_SECS / 2;
 
         set_tcp_score(&up, 500);
         set_quic_uplink_at(&up, 800, half_stale);

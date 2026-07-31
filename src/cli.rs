@@ -433,6 +433,13 @@ pub struct Config {
     #[serde(default = "default_quic_weight")]
     pub quic_weight: u32,
 
+    #[serde(default = "default_quic_stale_secs")]
+    /// QUIC 探针分数过期阈值，单位秒。
+    ///
+    /// 超过此时间未更新的 QUIC 探针分数视为断流，评分线性衰减到最低分。
+    /// 默认 180 秒。允许范围 10..=3600。
+    pub quic_stale_secs: u64,
+
     /// 上游分数调试打印间隔，单位秒。
     ///
     /// 仅在 debug 日志级别启用时生效。
@@ -605,6 +612,10 @@ pub fn default_quic_weight() -> u32 {
     40
 }
 
+pub fn default_quic_stale_secs() -> u64 {
+    180
+}
+
 pub fn default_upstream_score_debug_interval_secs() -> u64 {
     0
 }
@@ -662,12 +673,21 @@ impl Config {
             })
             .collect();
 
-        UpstreamSet::new(items, self.upstream_switch_tolerance, self.quic_weight)
+        UpstreamSet::new(
+            items,
+            self.upstream_switch_tolerance,
+            self.quic_weight,
+            self.quic_stale_secs,
+        )
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.quic_weight > 100 {
             bail!("quic_weight must be in range 0..=100");
+        }
+
+        if !(10..=3600).contains(&self.quic_stale_secs) {
+            bail!("quic_stale_secs must be in range 10..=3600");
         }
 
         if self.udp_session_timeout_secs == 0 {
@@ -840,6 +860,7 @@ mod tests {
             health_check_fail_threshold: 2,
             health_check_url: "cp.cloudflare.com".into(),
             quic_weight: 40,
+            quic_stale_secs: default_quic_stale_secs(),
             upstream_score_debug_interval_secs: default_upstream_score_debug_interval_secs(),
             proxy_mode: ProxyMode::Smart,
             geosite_path: None,
