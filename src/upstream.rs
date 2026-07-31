@@ -19,8 +19,8 @@ use crate::socks5::{Socks5Target, socks5_connect};
 use crate::state::AppState;
 use crate::util::{get_tcp_info_ext_raw, now_secs};
 
-/// TCP 分数默认值（未通过流量更新前使用）
-/// 略高于惩罚分，避免卡住连接保持高分，同时给新 upstream 一个较低起点
+/// 新 upstream 和惩罚后的 upstream 使用的基础分数。
+/// 用于避免历史高分在异常或连接卡住后长期保留。
 const DEFAULT_SCORE: u32 = 75;
 
 /// QUIC 探针分数过期阈值（秒）。超过此时间未更新视为断流，评分降到最低分。
