@@ -23,8 +23,11 @@ use crate::util::{get_tcp_info_ext_raw, now_secs};
 /// 略高于惩罚分，避免卡住连接保持高分，同时给新 upstream 一个较低起点
 const DEFAULT_SCORE: u32 = 75;
 
-/// QUIC 探针分数过期阈值（秒）。超过此时间未更新视为断流，评分归零。
+/// QUIC 探针分数过期阈值（秒）。超过此时间未更新视为断流，评分降到最低分。
 const QUIC_STALE_SECS: u64 = 60;
+
+/// 最低分数，避免分数归零导致 upstream 被"饿死"无法被选中更新。
+const MINIMAL_SCORE: u32 = 10;
 
 #[derive(Debug)]
 pub struct Upstream {
@@ -177,17 +180,18 @@ impl Upstream {
         let tcp = self.tcp_score.load(Ordering::Relaxed);
         let now = now_secs();
 
-        // 对每个方向应用线性衰减：从上次更新起，QUIC_STALE_SECS 秒内线性降到 0
+        // 对每个方向应用线性衰减：从上次更新起，QUIC_STALE_SECS 秒内线性降到最低分
         let decay = |score: u32, last_update_secs: u64| -> Option<u32> {
             if last_update_secs == 0 {
                 return None;
             }
             let elapsed = now.saturating_sub(last_update_secs);
             if elapsed >= QUIC_STALE_SECS {
-                return Some(0);
+                return Some(MINIMAL_SCORE);
             }
             let factor = (QUIC_STALE_SECS - elapsed) as f64 / QUIC_STALE_SECS as f64;
-            Some((score as f64 * factor) as u32)
+            let decayed = (score as f64 * factor) as u32;
+            Some(decayed.max(MINIMAL_SCORE))
         };
 
         let uplink = decay(
@@ -982,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn quic_score_zero_when_stale() {
+    fn quic_score_minimal_when_stale() {
         let up = make_upstream("dead");
         set_tcp_score(&up, 800);
         // last_update 超过 QUIC_STALE_SECS 秒
@@ -995,8 +999,8 @@ mod tests {
             .store(old, Ordering::Relaxed);
 
         let s = up.score();
-        // QUIC 衰减到 0，仍参与加权：(800*60 + 0*40)/100 = 480
-        assert_eq!(s, 480, "expected 480, got {s}");
+        // QUIC 衰减到最低分 MINIMAL_SCORE(10)，仍参与加权：(800*60 + 10*40)/100 = 484
+        assert_eq!(s, 484, "expected 484, got {s}");
     }
 
     // ---------- UpstreamSet ----------
