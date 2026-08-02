@@ -1,5 +1,6 @@
 // mimalloc 分配器（默认启用，可用 --no-default-features 回退到系统 allocator）
-#[cfg(feature = "mimalloc")]
+// 32 位 MIPS 禁用：mimalloc 的 C 代码使用 64 位原子操作，链接 libatomic 在 cross 容器中不可用
+#[cfg(all(feature = "mimalloc", not(target_arch = "mips")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
