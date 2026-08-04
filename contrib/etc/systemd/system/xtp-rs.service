@@ -1,0 +1,72 @@
+[Unit]
+Description=xtp-rs Transparent Proxy Service
+Documentation=https://github.com/hrimfaxi/xtp-rs
+After=network-online.target
+Wants=network-online.target
+ConditionFileIsExecutable=/usr/bin/xtp-rs
+ConditionFileNotEmpty=/etc/xtp-rs/config.toml
+
+[Service]
+Type=simple
+
+# ========== 启动前配置检查 ==========
+# 失败则中止启动，避免带错配置反复 respawn
+ExecStartPre=/usr/bin/xtp-rs --check -c /etc/xtp-rs/config.toml
+
+# ========== 主进程 ==========
+ExecStart=/usr/bin/xtp-rs -c /etc/xtp-rs/config.toml
+
+# ========== 启动后延迟执行 setup ==========
+# 主进程就绪后等待 0.5s 再添加透明代理规则
+ExecStartPost=/bin/sh -c 'sleep 0.5; exec /usr/libexec/xtp-rs/setup-xtp-rs.sh'
+
+# ========== 停止时先清理规则再停进程 ==========
+# ExecStop 在 SIGTERM 之前执行，保证 unsetup 先于进程退出
+ExecStop=/usr/libexec/xtp-rs/unsetup-xtp-rs.sh
+
+# ========== Reload = HUP 信号 ==========
+ExecReload=/bin/kill -HUP $MAINPID
+
+# ========== 自动重启（对应 procd respawn 3600 5 0）==========
+Restart=on-failure
+RestartSec=5s
+# 3600秒内最多重启5次，超过则放弃
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+# ========== 文件描述符限制 ==========
+LimitNOFILE=1024768
+
+# ========== DynamicUser 沙盒保护 ==========
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# 只读路径（对应 procd_add_jail_mount）
+ReadOnlyPaths=/etc/xtp-rs \
+              /etc/tsubamegaeshi-rs \
+              /usr/libexec/xtp-rs \
+              /usr/bin/xtp-rs
+
+# /tmp 可写（对应 procd_add_jail_mount_rw /tmp）
+# DynamicUser 的 PrivateTmp=yes 已提供独立可写 tmpfs
+# 若程序需要访问宿主 /tmp 而非私有 tmp，改为：
+# ReadWritePaths=/tmp
+
+# ========== Capabilities ==========
+# 透明代理通常需要 NET_ADMIN，根据 xtp-rs.json 实际内容调整
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+SystemCallFilter=@system-service @network-io @io-event
+SystemCallFilter=~@privileged @resources
+
+# ========== 日志 ==========
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xtp-rs
+
+[Install]
+WantedBy=multi-user.target
