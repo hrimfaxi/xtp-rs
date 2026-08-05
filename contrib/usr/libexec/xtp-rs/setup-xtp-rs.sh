@@ -123,6 +123,16 @@ add_ip6_rule "$XTP_FWMARK" "$XTP_TABLE_ID"
 # -------------------------------------------------------------------------
 # 3. nftables 透明代理规则
 # -------------------------------------------------------------------------
+# tproxy / socket 是 nft 表达式，分别由内核模块 nft_tproxy / nft_socket 提供；
+# 缺模块时整张表加载失败。先尝试加载，失败则提示安装对应 kmod 包。
+for _mod in nft_tproxy nft_socket; do
+  [ -d "/sys/module/$_mod" ] || modprobe "$_mod" 2>/dev/null || true
+  if [ ! -d "/sys/module/$_mod" ]; then
+    echo "xtp-rs: kernel module $_mod not available, install kmod-nft-${_mod#nft_}" >&2
+    exit 1
+  fi
+done
+
 #cat <<NFTABLES
 load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 #
