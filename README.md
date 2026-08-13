@@ -41,7 +41,7 @@
 | 🔁 **透明代理（TPROXY）** | IPv4 / IPv6 双栈，TCP 与 UDP 流量全量拦截转发，客户端零配置 |
 | 🧭 **智能路由** | 按 GeoIP2 国家归属（MaxMind MMDB）、geosite 域名分类、自定义 CIDR、本地地址类型自动判定直连 / 代理；支持域名强制规则（`force_direct_domains` / `force_socks5_domains`）覆盖 geosite 与 IP 规则 |
 | 📡 **多 SOCKS5 上游** | 配置多个上游服务器，支持用户名 / 密码认证、分组路由与增益系数 |
-| 📈 **动态上游评分** | 基于 `TCP_INFO` 实时吞吐监控与 QUIC 探针（RTT / 丢包率 / MTU）报告综合评分，平方加权随机选择最优上游；粘性切换容忍度避免频繁抖动 |
+| 📈 **动态上游评分** | 基于 `TCP_INFO` 实时吞吐监控与 QUIC 探针（RTT / 丢包率 / MTU）报告综合评分，平方加权随机选择最优上游；支持跨链路相对归一化评分与冷启动加速（新上游立即参与竞争）；粘性切换容忍度避免频繁抖动 |
 | 👃 **域名嗅探** | TLS SNI（HTTPS）、HTTP Host（明文 HTTP）、QUIC SNI（QUIC Initial）三种协议嗅探；默认关闭，按需开启 |
 | ⚙️ **端口转发** | 将本地 TCP/UDP 端口强制经 SOCKS5 转发到指定目标（可用于 DNS over SOCKS5、远程访问等） |
 | 🔄 **热重载** | `SIGHUP` 重载配置无需重启；`SIGUSR1` 在 smart → global → bypass 间循环切换代理模式 |
@@ -313,15 +313,28 @@ flowchart TD
 | `disable_upstream_score` | bool | `false` | 禁用上游动态评分（启用后完全随机选择） |
 | `upstream_switch_tolerance` | u32 | `0` | 粘性切换容忍度（分），0 表示不启用粘性 |
 | `quic_weight` | u32 | `40` | QUIC 探针在选路分数中的权重（0-100） |
+| `quic_stale_secs` | u64 | `180` | QUIC 探针分数过期阈值（秒），超期后线性衰减到最低分（10） |
+| `enable_relative_scoring` | bool | `false` | 启用跨链路相对归一化评分（见下方说明） |
+| `relative_rescore_interval_secs` | u64 | `2` | 相对归一化评分重算间隔（秒），仅相对模式生效 |
 | `upstream_score_debug_interval_secs` | u64 | `0` | 分数调试打印间隔（秒），仅在 debug 级别启用时生效，设置为 0 禁用 |
 
-**评分机制说明**：
+**评分机制说明**（默认绝对分段模式）：
 
 - **TCP 分数**：基于 `TCP_INFO` 实时吞吐量（bytes_received + bytes_acked），每 2 秒采样更新，采用 50/50 历史与新数据混合。
 - **QUIC 分数**：基于 ShadowQUIC 探针报告的 RTT、丢包率、MTU 综合计算，采用 30/70 历史与新数据混合，支持上行/下行双链路独立评分。
-- **QUIC 衰减**：QUIC 探针分数在 60 秒未更新后线性衰减到最低分（10 分），避免因探针断流导致 upstream 被"饿死"而无法被选中更新。
-- **综合评分**：最终分数 = TCP 分数 × (100 - quic_weight) + QUIC 分数 × quic_weight，任一分数无效时退化为另一方。
-- **选路权重**：effective_score = score × gain，采用平方加权随机选择（高分优势放大），effective_score 最小值为 1 以保证所有 upstream 有机会被选中。
+- **QUIC 衰减**：QUIC 探针分数在 `quic_stale_secs`（默认 180 秒）未更新后线性衰减到最低分（10 分），避免因探针断流导致 upstream 被"饿死"而无法被选中更新。
+- **综合评分**：最终分数 = TCP 分数 × (100 - quic_weight) + QUIC 分数 × quic_weight，任一分数无效时退化为另一方；两路都无效时按基础分 75 处理。
+- **惩罚与基础分**：新 upstream 与连接失败被惩罚的 upstream 统一使用基础分 75，有效分下限 1 保证所有 upstream 都有机会被选中。
+- **选路权重**：effective_score = score × gain，采用平方加权随机选择（高分优势放大）。
+
+**相对归一化模式**（`enable_relative_scoring = true`，默认关闭）：
+
+绝对分段模式按固定吞吐阈值（≥50 MiB/s = 1000 分）打分，光纤链路稳定拿满分，4G/卫星链路被压得抬不起头。相对模式把吞吐速率与探针质量**相对同组最大值**归一化到 0~1000，自动适配任意网络环境：
+
+- 每个 `relative_rescore_interval_secs`（默认 2 秒）跨链路重算一次：组内最快/最优的链路得满分，其余按比例得分，评分口径与绝对量纲无关。
+- **冷启动种子**：尚无吞吐样本的新链路用探针相对分预置初始分；连探针报告都拿不到（新链路还没分到流量，ShadowQUIC 只在有流量时上报）时，用组内最优的一半做乐观先验，避免「无样本 → 无分数 → 无流量」的饥饿死锁。
+- **未初始化探索**：存在无任何测量样本的上游时，选路以 5% 概率从中均匀选取，保证新链路必能分到流量产生样本（对绝对模式同样生效）。
+- 坏链路成本有上限：连接失败即惩罚到基础分 75 并标记为已测量，探索与种子立即停止向它倾斜。
 
 ### xtp-stats-reporter（ShadowQUIC 性能上报 daemon）
 
