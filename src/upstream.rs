@@ -28,6 +28,10 @@ const DEFAULT_QUIC_STALE_SECS: u64 = 180;
 /// 最低分数，避免分数归零导致 upstream 被"饿死"无法被选中更新。
 const MINIMAL_SCORE: u32 = 10;
 
+/// pick 时对未初始化（无任何测量样本）upstream 的探索概率。
+/// 保证新链路能分到流量产生吞吐/探针样本，打破"无样本→无分数→无流量"的饥饿循环。
+const PICK_EXPLORE_RATIO: f32 = 0.05;
+
 #[derive(Debug)]
 pub struct Upstream {
     pub id: String,
@@ -52,6 +56,12 @@ pub struct Upstream {
     quic_downlink_last_update_secs: AtomicU64,
     quic_weight: AtomicU32,     // 0-100，默认 40
     quic_stale_secs: AtomicU64, // 过期阈值（秒），由 UpstreamSet 统一设置
+
+    // 相对归一化评分（enable_relative_scoring 开启时使用）
+    throughput_rate_mibs: AtomicU64, // 最近实测吞吐速率（MiB/s，存 f64 bits，EMA）
+    throughput_updated_secs: AtomicU64, // 吞吐速率最后更新时间（秒）
+    probe_quality: AtomicU64,        // 连续探针质量（0~1，存 f64 bits）
+    probe_quality_updated_secs: AtomicU64, // 探针质量最后更新时间（秒）
 }
 
 impl Upstream {
@@ -80,6 +90,10 @@ impl Upstream {
             health_failures: AtomicU32::new(0),
             quic_weight: AtomicU32::new(40),
             quic_stale_secs: AtomicU64::new(DEFAULT_QUIC_STALE_SECS),
+            throughput_rate_mibs: AtomicU64::new(0),
+            throughput_updated_secs: AtomicU64::new(0),
+            probe_quality: AtomicU64::new(0),
+            probe_quality_updated_secs: AtomicU64::new(0),
         })
     }
 
@@ -102,7 +116,7 @@ impl Upstream {
         token
     }
 
-    pub async fn run_score_task(self: Arc<Self>, cancel: CancellationToken) {
+    pub async fn run_score_task(self: Arc<Self>, relative_mode: bool, cancel: CancellationToken) {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -159,24 +173,49 @@ impl Upstream {
             let delta_bytes = delta_recv + delta_sent;
             let delta_secs = now.saturating_sub(prev_secs).max(1);
 
-            if let Some(raw) = calc_throughput_score(delta_bytes, Duration::from_secs(delta_secs)) {
-                let old = self.tcp_score.load(Ordering::Relaxed);
-                // 50/50，历史与新数据同等权重
-                let blended = (old * 5 + raw * 5) / 10;
+            if delta_bytes >= 1024 * 16 {
                 let speed_mbps = 8.0 * delta_bytes as f64 / 1_000_000.0 / delta_secs as f64;
                 let speed_str = format!("{:.2}", speed_mbps);
-
-                self.tcp_score.store(blended, Ordering::Relaxed);
-                self.tcp_score_initialized.store(true, Ordering::Relaxed);
                 let delta_mb = format!("{:.2}", delta_bytes as f64 / 1024.0 / 1024.0);
-                debug!(
-                    id = %self.id,
-                    alive = alive,
-                    delta_mb = %delta_mb,
-                    speed_mbps = %speed_str,
-                    score = blended,
-                    "upstream aggregate score"
-                );
+
+                if relative_mode {
+                    // 相对模式：只记录实测速率（MiB/s 的 EMA），不直接写 tcp_score。
+                    // tcp_score 由 run_relative_score_task 统一做跨链路归一化后写入。
+                    let mib_per_sec = delta_bytes as f64 / 1024.0 / 1024.0 / delta_secs as f64;
+                    let old_rate = load_f64(&self.throughput_rate_mibs);
+                    let new_rate = if old_rate == 0.0 {
+                        mib_per_sec
+                    } else {
+                        old_rate * 0.5 + mib_per_sec * 0.5
+                    };
+                    store_f64(&self.throughput_rate_mibs, new_rate);
+                    self.throughput_updated_secs.store(now, Ordering::Relaxed);
+                    debug!(
+                        id = %self.id,
+                        alive = alive,
+                        delta_mb = %delta_mb,
+                        speed_mbps = %speed_str,
+                        rate_mibs = new_rate,
+                        "upstream throughput rate (relative mode)"
+                    );
+                } else if let Some(raw) =
+                    calc_throughput_score(delta_bytes, Duration::from_secs(delta_secs))
+                {
+                    let old = self.tcp_score.load(Ordering::Relaxed);
+                    // 50/50，历史与新数据同等权重
+                    let blended = (old * 5 + raw * 5) / 10;
+
+                    self.tcp_score.store(blended, Ordering::Relaxed);
+                    self.tcp_score_initialized.store(true, Ordering::Relaxed);
+                    debug!(
+                        id = %self.id,
+                        alive = alive,
+                        delta_mb = %delta_mb,
+                        speed_mbps = %speed_str,
+                        score = blended,
+                        "upstream aggregate score"
+                    );
+                }
             }
         }
     }
@@ -328,6 +367,25 @@ impl Upstream {
             let blended = (old * 3 + raw * 7) / 10;
             score.store(blended, Ordering::Relaxed);
         }
+    }
+
+    /// 记录探针连续质量（0~1），并刷新对应方向的最后更新时间。
+    /// 相对评分模式下由 run_relative_score_task 消费，替代绝对分段评分。
+    pub fn set_probe_quality(&self, q: f64, link: Option<&str>) {
+        store_f64(&self.probe_quality, q);
+        let now = now_secs();
+        match link {
+            Some("downlink") => {
+                self.quic_downlink_last_update_secs
+                    .store(now, Ordering::Relaxed);
+            }
+            _ => {
+                self.quic_uplink_last_update_secs
+                    .store(now, Ordering::Relaxed);
+            }
+        }
+        self.probe_quality_updated_secs
+            .store(now, Ordering::Relaxed);
     }
 
     pub fn penalize(&self) {
@@ -617,6 +675,31 @@ impl UpstreamSet {
             _ => {}
         }
 
+        // 0. 探索：存在尚无任何测量样本（未初始化）的 upstream 时，以固定概率从中均匀选取。
+        //    探针报告与吞吐样本都依赖流量产生，若不探索，新链路会陷入
+        //    "无样本→无分数→无流量"的死锁；penalize() 会把失败链路标记为已初始化，
+        //    因此探索不会持续浪费流量在坏链路上。
+        let uninit: Vec<&Arc<Upstream>> = items
+            .iter()
+            .filter(|u| !u.tcp_score_initialized())
+            .collect();
+        if !uninit.is_empty() && fastrand::f32() < PICK_EXPLORE_RATIO {
+            let idx = fastrand::usize(..uninit.len());
+            let chosen = Arc::clone(uninit[idx]);
+            debug!(
+                group = %group,
+                exclude_ctx = ?exclude_ctx,
+                upstream_id = %chosen.id,
+                "pick: explore uninitialized upstream"
+            );
+            self.current
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(group.to_string(), Some(chosen.id.clone()));
+            self.record_pick_stats(&chosen);
+            return Some(chosen);
+        }
+
         // 1. 候选里的最高有效分数
         let best = items.iter().max_by_key(|u| u.effective_score())?;
         let best_eff = best.effective_score();
@@ -877,10 +960,16 @@ pub async fn run_upstream_stats_listener(
                        }
 
                         if let Some(up) = state.upstreams.find_by_id(&rep.upstream_id) {
-                            let score = calc_quic_score(rep.rtt_ms, rep.loss_rate, rep.mtu);
-                            match rep.link.as_deref() {
-                                Some("downlink") => up.update_downlink_score(score),
-                                _ => up.update_uplink_score(score), // 默认按上行处理（兼容旧报告）
+                            if state.config.enable_relative_scoring {
+                                if let Some(q) = probe_quality(rep.rtt_ms, rep.loss_rate, rep.mtu) {
+                                    up.set_probe_quality(q, rep.link.as_deref());
+                                }
+                            } else {
+                                let score = calc_quic_score(rep.rtt_ms, rep.loss_rate, rep.mtu);
+                                match rep.link.as_deref() {
+                                    Some("downlink") => up.update_downlink_score(score),
+                                    _ => up.update_uplink_score(score), // 默认按上行处理（兼容旧报告）
+                                }
                             }
                         }
                    }
@@ -944,6 +1033,40 @@ fn calc_quic_score(rtt_ms: f64, loss_rate: f64, mtu: u16) -> Option<u32> {
             .saturating_sub(mtu_penalty)
             .max(50),
     )
+}
+
+/// 连续探针质量函数（0~1，无绝对阈值分段），用于相对归一化评分。
+/// 各分量随 RTT/丢包/MTU 变差而单调下降，无人工分段点，天然适配任意网络环境。
+fn probe_quality(rtt_ms: f64, loss_rate: f64, mtu: u16) -> Option<f64> {
+    if !rtt_ms.is_finite()
+        || rtt_ms < 0.0
+        || !loss_rate.is_finite()
+        || !(0.0..=1.0).contains(&loss_rate)
+    {
+        return None;
+    }
+    let rtt_q = 1.0 / (1.0 + rtt_ms / 50.0);
+    let loss_q = (-loss_rate * 10.0).exp();
+    let mtu_q = (mtu.min(1400) as f64) / 1400.0;
+    Some((rtt_q * loss_q * mtu_q).clamp(0.0, 1.0))
+}
+
+/// 相对归一化映射：value 相对 max 映射到 0~1000。
+fn relative_score(value: f64, max: f64) -> u32 {
+    if max <= 0.0 || value <= 0.0 {
+        return 0;
+    }
+    (value / max * 1000.0).clamp(0.0, 1000.0) as u32
+}
+
+/// 将 f64 以 bits 形式存入 AtomicU64。
+fn store_f64(a: &AtomicU64, v: f64) {
+    a.store(v.to_bits(), Ordering::Relaxed);
+}
+
+/// 从 AtomicU64 读回 f64（以 bits 形式存储）。
+fn load_f64(a: &AtomicU64) -> f64 {
+    f64::from_bits(a.load(Ordering::Relaxed))
 }
 
 async fn check_upstream_health(
@@ -1067,6 +1190,125 @@ pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationTok
                         "upstream health check failed"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// 相对归一化评分任务：跨链路把实测吞吐速率与探针质量映射到相对分（0~1000）。
+/// 仅在 enable_relative_scoring 开启时运行，替代绝对分段评分的 tcp/quic 分写入。
+pub async fn run_relative_score_task(state: Arc<AppState>, cancel: CancellationToken) {
+    let interval_secs = state.config.relative_rescore_interval_secs.max(1);
+    let stale_secs = state.config.quic_stale_secs;
+    info!(interval_secs, "relative score task started");
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // max 的 EMA，跨周期持久，避免瞬时抖动
+    let mut max_rate_ema: f64 = 0.0;
+    let mut max_q_ema: f64 = 0.0;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("relative score task shutting down");
+                break;
+            }
+            _ = interval.tick() => {},
+        }
+
+        let now = now_secs();
+        let ups: Vec<Arc<Upstream>> = state.upstreams.iter().cloned().collect();
+
+        // 1. 收集快照并统计本轮 max
+        struct Snap {
+            up: Arc<Upstream>,
+            rate: f64,
+            has_rate: bool,
+            q: f64,
+            has_q: bool,
+        }
+        let mut snaps: Vec<Snap> = Vec::with_capacity(ups.len());
+        let mut max_rate = 0.0f64;
+        let mut max_q = 0.0f64;
+        for up in &ups {
+            let rate_last = up.throughput_updated_secs.load(Ordering::Relaxed);
+            let has_rate = rate_last > 0 && now.saturating_sub(rate_last) < stale_secs;
+            let rate = if has_rate {
+                load_f64(&up.throughput_rate_mibs)
+            } else {
+                0.0
+            };
+            let q_last = up.probe_quality_updated_secs.load(Ordering::Relaxed);
+            let has_q = q_last > 0 && now.saturating_sub(q_last) < stale_secs;
+            let q = if has_q {
+                load_f64(&up.probe_quality)
+            } else {
+                0.0
+            };
+            if has_rate {
+                max_rate = max_rate.max(rate);
+            }
+            if has_q {
+                max_q = max_q.max(q);
+            }
+            snaps.push(Snap {
+                up: Arc::clone(up),
+                rate,
+                has_rate,
+                q,
+                has_q,
+            });
+        }
+
+        // 2. 更新 max 的 EMA
+        if max_rate > 0.0 {
+            max_rate_ema = if max_rate_ema == 0.0 {
+                max_rate
+            } else {
+                max_rate_ema * 0.9 + max_rate * 0.1
+            };
+        }
+        if max_q > 0.0 {
+            max_q_ema = if max_q_ema == 0.0 {
+                max_q
+            } else {
+                max_q_ema * 0.9 + max_q * 0.1
+            };
+        }
+
+        // 3. 写入相对分
+        for snap in &snaps {
+            let up = &snap.up;
+            if max_q_ema > 0.0 && snap.has_q {
+                let rel_quic = relative_score(snap.q, max_q_ema);
+                up.quic_uplink_score.store(rel_quic, Ordering::Relaxed);
+                up.quic_downlink_score.store(rel_quic, Ordering::Relaxed);
+            }
+            if snap.has_rate && max_rate_ema > 0.0 {
+                let rel_tcp = relative_score(snap.rate, max_rate_ema);
+                let old = up.tcp_score_raw();
+                let blended = (old + rel_tcp) / 2;
+                up.tcp_score.store(blended, Ordering::Relaxed);
+                up.tcp_score_initialized.store(true, Ordering::Relaxed);
+            } else if !up.tcp_score_initialized() && max_q_ema > 0.0 {
+                // 冷启动：尚无吞吐样本时用探针相对分做种子（若有）；探针也拿不到
+                // （新链路尚无流量回报）时，用组内最优的一半做乐观先验，使新链路在
+                // 拿到真实样本前就具备竞争力，避免被高分链路长期饿死。
+                let seed = if snap.has_q {
+                    relative_score(snap.q, max_q_ema)
+                } else {
+                    relative_score(max_q_ema * 0.5, max_q_ema)
+                };
+                up.tcp_score.store(seed, Ordering::Relaxed);
+                up.tcp_score_initialized.store(true, Ordering::Relaxed);
+                debug!(
+                    id = %up.id,
+                    seed,
+                    has_q = snap.has_q,
+                    "relative score cold-start seed"
+                );
             }
         }
     }
@@ -1947,5 +2189,57 @@ mod tests {
         let total: u64 = counts.iter().map(|(_, c)| *c).sum();
         assert_eq!(total, 5, "sticky keep picks must be recorded");
         assert_eq!(counts[0], ("a".to_string(), 5));
+    }
+
+    // ---------- probe_quality / relative_score ----------
+
+    #[test]
+    fn probe_quality_rejects_invalid() {
+        assert_eq!(probe_quality(f64::NAN, 0.0, 1450), None);
+        assert_eq!(probe_quality(-1.0, 0.0, 1450), None);
+        assert_eq!(probe_quality(10.0, 1.5, 1450), None);
+        assert_eq!(probe_quality(10.0, f64::INFINITY, 1450), None);
+    }
+
+    #[test]
+    fn probe_quality_bounded_0_to_1() {
+        let q = probe_quality(10.0, 0.0, 1450).unwrap();
+        assert!((0.0..=1.0).contains(&q));
+        let q_worst = probe_quality(10_000.0, 1.0, 100).unwrap();
+        assert!((0.0..=1.0).contains(&q_worst));
+    }
+
+    #[test]
+    fn probe_quality_monotonic_worse_metric_lower_score() {
+        // RTT 增大 → 质量下降
+        let good = probe_quality(10.0, 0.0, 1450).unwrap();
+        let bad = probe_quality(300.0, 0.0, 1450).unwrap();
+        assert!(good > bad, "higher RTT must lower quality");
+
+        // 丢包增大 → 质量下降
+        let no_loss = probe_quality(50.0, 0.0, 1450).unwrap();
+        let high_loss = probe_quality(50.0, 0.2, 1450).unwrap();
+        assert!(no_loss > high_loss, "higher loss must lower quality");
+
+        // MTU 减小 → 质量下降
+        let full_mtu = probe_quality(50.0, 0.0, 1400).unwrap();
+        let low_mtu = probe_quality(50.0, 0.0, 800).unwrap();
+        assert!(full_mtu > low_mtu, "lower MTU must lower quality");
+    }
+
+    #[test]
+    fn relative_score_mapping() {
+        assert_eq!(relative_score(50.0, 100.0), 500);
+        assert_eq!(relative_score(100.0, 100.0), 1000);
+        assert_eq!(relative_score(200.0, 100.0), 1000); // 超过 max 时 clamp
+        assert_eq!(relative_score(0.0, 100.0), 0);
+        assert_eq!(relative_score(50.0, 0.0), 0); // max 为 0 时返回 0
+    }
+
+    #[test]
+    fn relative_score_scale_independent() {
+        // 相对评分与绝对量纲无关：1 MiB/s 与 500 MiB/s 两种网络，
+        // 只要比值相同，相对分相同（解决阈值固化问题）。
+        assert_eq!(relative_score(1.0, 2.0), relative_score(500.0, 1000.0));
     }
 }

@@ -440,6 +440,20 @@ pub struct Config {
     /// 默认 180 秒。允许范围 10..=3600。
     pub quic_stale_secs: u64,
 
+    #[serde(default = "default_enable_relative_scoring")]
+    /// 是否启用跨链路相对归一化评分。
+    ///
+    /// - `false`（默认）：使用原有绝对分段评分（calc_throughput_score / calc_quic_score）
+    /// - `true`：相对归一化评分 + 冷启动探针种子，自动适配光纤/4G/卫星等不同网络
+    ///
+    /// 相对模式保留 TCP_INFO 实测吞吐为主信号，仅把评分口径从"绝对阈值分段"
+    /// 改为"跨链路相对归一化"，并新增 `run_relative_score_task` 统一写入分数。
+    pub enable_relative_scoring: bool,
+
+    #[serde(default = "default_relative_rescore_interval_secs")]
+    /// 相对归一化评分任务间隔，单位秒。默认 2。
+    pub relative_rescore_interval_secs: u64,
+
     /// 上游分数调试打印间隔，单位秒。
     ///
     /// 仅在 debug 日志级别启用时生效。
@@ -624,6 +638,14 @@ pub fn default_quic_stale_secs() -> u64 {
     180
 }
 
+pub fn default_enable_relative_scoring() -> bool {
+    false
+}
+
+pub fn default_relative_rescore_interval_secs() -> u64 {
+    2
+}
+
 pub fn default_upstream_score_debug_interval_secs() -> u64 {
     0
 }
@@ -717,6 +739,12 @@ impl Config {
 
         if self.pick_stats_window_secs > 604800 {
             bail!("pick_stats_window_secs must be <= 604800 (7 days)");
+        }
+
+        if self.enable_relative_scoring && self.relative_rescore_interval_secs == 0 {
+            bail!(
+                "relative_rescore_interval_secs must be > 0 when enable_relative_scoring is true"
+            );
         }
 
         for u in &self.upstream {
@@ -878,6 +906,8 @@ mod tests {
             health_check_url: "cp.cloudflare.com".into(),
             quic_weight: 40,
             quic_stale_secs: default_quic_stale_secs(),
+            enable_relative_scoring: default_enable_relative_scoring(),
+            relative_rescore_interval_secs: default_relative_rescore_interval_secs(),
             upstream_score_debug_interval_secs: default_upstream_score_debug_interval_secs(),
             pick_stats_window_secs: default_pick_stats_window_secs(),
             proxy_mode: ProxyMode::Smart,
