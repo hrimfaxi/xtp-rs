@@ -35,7 +35,7 @@ StartLimitIntervalSec=3600
 StartLimitBurst=5
 
 # ========== 文件描述符限制 ==========
-LimitNOFILE=1024768
+LimitNOFILE=1048576
 
 # ========== DynamicUser 沙盒保护 ==========
 DynamicUser=yes

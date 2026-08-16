@@ -32,7 +32,7 @@ start_service() {
     procd_add_jail_mount_rw /tmp
   fi
 
-  procd_set_param limits nofile="1024768 1024768"
+  procd_set_param limits nofile="1048576 1048576"
   procd_set_param command $XTP_BIN -c /etc/xtp-rs/config.toml
   procd_set_param respawn 3600 5 0 # 设置自动重启
   procd_set_param stdout 1 # 启用日志输出
