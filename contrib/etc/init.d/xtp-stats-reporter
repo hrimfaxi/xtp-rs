@@ -25,6 +25,7 @@ start_service() {
 
     # 如Debug=1: 写入 /tmp/shadowquic-stats-report.debug.log
     procd_set_param env DEBUG=0
+    procd_set_param env REFRESH_INTERVAL=30
 
     # 运行不足 3600 秒即退出时，按崩溃处理；
     # 5 秒后重启；retry=0 表示无限重试（logd 重启等场景不应放弃）。
