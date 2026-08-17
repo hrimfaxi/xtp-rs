@@ -2175,6 +2175,11 @@ mod tests {
     #[test]
     fn sticky_keep_pick_records_stats() {
         let items: Vec<_> = ["a", "b"].iter().map(|id| upstream(id)).collect();
+        // 标记已初始化，避开 5% 探索路径（基于 fastrand 熵种子，逐平台抖动非确定性）
+        for up in &items {
+            set_tcp_score(up, 500);
+            set_quic_uplink(up, 500);
+        }
         let set = UpstreamSet::new(items, 1000, 40, DEFAULT_QUIC_STALE_SECS, 1800).unwrap();
         // 所有 upstream 同分，sticky 到 "a"
         {
