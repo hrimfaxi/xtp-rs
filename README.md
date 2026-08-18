@@ -252,10 +252,10 @@ flowchart TD
     SE -->|"是"| FW["直接转发（不重新路由）"]
     SE -->|"否"| IP{"IP-only 判定（基于目标 IP）"}
     IP -->|"直连"| LO["本地 UDP socket 直接发送"]
-    IP -->|"非直连"| Q{"quic_sniff_forward_first"}
-    Q -->|"true（默认）"| BG["首包立即转发（不携带域名）<br/>后台异步嗅探 QUIC SNI<br/>后续数据包使用嗅探到的域名"]
-    Q -->|"false"| WT["缓存数据包，直到嗅探完成"]
-    BG --> UA["SOCKS5 UDP ASSOCIATE"]
+    IP -->|"非直连"| Q{"QUIC SNI 嗅探开启？"}
+    Q -->|"否"| FW2["立即转发（按 IP 路由）"]
+    Q -->|"是"| WT["缓存数据包，直到嗅探完成<br/>随后携带嗅探到的域名转发"]
+    FW2 --> UA
     WT --> UA
     UA --> UP["上游选择：分组查找 + 动态评分"]
     FW --> DONE(["转发"])
@@ -290,8 +290,7 @@ flowchart TD
 | `direct_local_ip` | bool | `true` | 回环 / 链路本地地址是否强制直连 |
 | `sniff_tls_sni` | bool | `false` | 是否启用 TLS SNI 嗅探（仅非直连 TCP） |
 | `sniff_http_host` | bool | `false` | 是否启用 HTTP Host 嗅探 |
-| `sniff_quic_sni` | bool | `false` | 是否启用 QUIC SNI 嗅探（UDP） |
-| `quic_sniff_forward_first` | bool | `true` | QUIC 嗅探模式：首包先转发、后台嗅探（`true`）；缓存首包直到嗅探完成（`false`） |
+| `quic_sniff_mode` | string | `"none"` | QUIC SNI 嗅探档位：`none` / `besteffort` / `full` |
 | `proxy_mode` | string | `"smart"` | 代理模式：`smart` / `global` / `bypass` |
 | `geosite_path` | string | 无 | geosite.dat 文件路径（需编译 geosite feature） |
 | `proxy_geosite_tags` | [string] | `[]` | 走代理的 geosite 分类（如 `gfw`） |
@@ -526,7 +525,11 @@ cargo test
 
 1. **权限要求** — 透明代理需要 root 权限（或 `CAP_NET_ADMIN` + `CAP_NET_RAW` + `CAP_NET_BIND_SERVICE`）。
 2. **splice 零拷贝** — 若系统启用了 IP 转发（`net.ipv4.ip_forward=1`），使用 `splice` 可能导致性能下降，参见 [splice 与转发路径的注意事项](https://github.com/XTLS/Xray-core/discussions/59)。建议保持默认 `splice = false`。
-3. **QUIC SNI 嗅探** — 与其他嗅探功能一样默认关闭（`sniff_quic_sni = false`）。开启后默认采用 forward-first 模式（`quic_sniff_forward_first = true`）：首包立即转发、后台异步嗅探。解析 QUIC Initial 会增加 CPU 开销，可按需关闭。
+3. **QUIC SNI 嗅探** — 三档（`quic_sniff_mode`，默认 `none`）：
+   - `none`：不嗅探，UDP 包立即按 IP 路由转发（零延迟、零 CPU 开销）；
+   - `besteffort`：只对每个流（同一目的 IP）的首包尝试提取 SNI，首包不足或失败即放弃、不再对后续包重试，无额外延迟（xray-core 默认行为）；
+   - `full`：按域名分组更准。需要嗅探的 QUIC 数据包缓存在 pending 中直到嗅探出域名再转发，但会牺牲约 n*RTT 时延（仅当 ClientHello 跨多个包时缓存等待补齐，典型约 1 秒、最坏 5 秒；单包内装下的 ClientHello 仍立即转发）。
+   解析 QUIC Initial 会增加 CPU 开销，可按需选择档位。
 4. **配置文件路径** — 默认读取当前工作目录下的 `config.toml`，可通过 `-c` 参数指定；`xtp-rs -T` 可在启动前校验配置。
 5. **热重载限制** — `SIGHUP` 重载时，端口转发监听地址若发生改变，旧地址上的监听 socket 会被关闭、新地址重新绑定；若新旧地址冲突可能导致短暂失败，建议避免频繁变动。
 6. **客户端路由** — 使用 `client_routes` 和 `client_domain_routes` 时，确保引用的 upstream 分组已在 `[[upstream]]` 中配置；未配置 `groups` 的 upstream 默认属于 `default` 组。

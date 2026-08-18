@@ -341,18 +341,20 @@ pub fn build_sniffers(config: &Config) -> Vec<Arc<dyn Sniffer>> {
 pub fn build_udp_sniffers(config: &Config) -> Vec<Arc<dyn UdpSnifferEngine>> {
     #[cfg(feature = "sniff-quic")]
     {
+        use crate::cli::QuicSniffMode;
         use crate::sniff::quic::QuicSniUdpSniffer;
         let mut sniffers: Vec<Arc<dyn UdpSnifferEngine>> = Vec::new();
-        if config.sniff_quic_sni {
+        if config.quic_sniff_mode != QuicSniffMode::None {
             sniffers.push(Arc::new(QuicSniUdpSniffer));
         }
         sniffers
     }
     #[cfg(not(feature = "sniff-quic"))]
     {
-        if config.sniff_quic_sni {
+        use crate::cli::QuicSniffMode;
+        if config.quic_sniff_mode != QuicSniffMode::None {
             warn!(
-                "config sniff_quic_sni=true but binary compiled without sniff-quic feature; \
+                "config quic_sniff_mode!=none but binary compiled without sniff-quic feature; \
                  QUIC SNI sniffing disabled"
             );
         }

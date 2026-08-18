@@ -88,21 +88,19 @@ http_sniff_timeout_ms = 1000
 # QUIC SNI 嗅探（UDP）
 # -------------------------------
 
-# 是否对 UDP/QUIC Initial Packet 进行 TLS ClientHello SNI 嗅探
-# 默认 false，避免在嵌入式平台产生额外 CPU 开销
-# 这是一个总开关：开启后可以解析 QUIC 连接的 SNI 用于分流/日志
-sniff_quic_sni = false
+# QUIC/UDP SNI 嗅探档位：none / besteffort / full，默认 none。
+# - none：不做 QUIC sniff，UDP 包立即按 IP 路由转发（零延迟、零 CPU 开销）。
+# - besteffort：只对每个流（同一目的 IP）的首个数据包尝试提取 SNI，成功即用域名分组；
+#   首包不足或失败即放弃，不再对后续包重试，无额外延迟（xray-core 默认行为）。
+# - full：使用 pending 缓存，凑够能提取出 SNI 的多个包后才放行（带域名分组），
+#   牺牲约 n*RTT 时延换取更高识别率；单包内装下的 ClientHello 仍立即转发。
+#
+# 解析 QUIC Initial 会增加 CPU 开销，低配路由可在分组需求不强时使用 none/besteffort。
+quic_sniff_mode = "none"
 
-# QUIC sniff 遇到 NeedMore（ClientHello 跨多个包）时，是否立即转发首包。
-#
-# - true（默认）：首包立即转发（无 sniffed_host，走 IP 路由），pending 只缓存后续包。
-#   优点：QUIC 握手零延迟，避免 PTO 重传等待（~1s）。
-#   缺点：首包走 IP 路由，若域名路由与 IP 路由不一致可能走错路径（罕见）。
-#
-# - false：首包缓存在 pending 中，等 sniff 完成后一起 flush。
-#   所有包都带 sniffed_host，路由完全准确，但 ClientHello 跨包时会阻塞 ~1s。
-#
-# quic_sniff_forward_first = true
+# 下面的旧布尔开关已被 quic_sniff_mode 取代，不再支持：
+#   旧 sniff_quic_sni = true  →  quic_sniff_mode = "full"
+#   旧 sniff_quic_sni = false →  quic_sniff_mode = "none"
 
 # UDP session 建立后，如果在此时间内没收到任何回包，主动取消 session。
 # 用于检测 SOCKS5 UDP relay 失效的僵尸 session，避免等待整个 udp_session_timeout。

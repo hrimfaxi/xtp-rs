@@ -210,14 +210,14 @@ IP 版本同理：`force_direct_ips` / `force_socks5_ips` 支持 CIDR，量大�
 |------|------|--------------|
 | `sniff_tls_sni` | TCP | TLS ClientHello 的 SNI 字段（HTTPS） |
 | `sniff_http_host` | TCP | HTTP/1.x 请求头的 Host 字段（明文 HTTP） |
-| `sniff_quic_sni` | UDP | QUIC Initial 包里的 SNI（HTTP/3） |
+| `quic_sniff_mode` | UDP | QUIC SNI 嗅探档位：`none` / `besteffort` / `full` |
 
-**默认全部关闭**，需要显式打开：
+**默认全部关闭**（`quic_sniff_mode` 默认 `none`），需要显式打开：
 
 ```toml
 sniff_tls_sni = true
 sniff_http_host = true
-sniff_quic_sni = true
+quic_sniff_mode = "full"     # 或 "besteffort"，见 4.4
 tls_sniff_peek_len = 4096    # ClientHello 较大时更稳妥（默认 2048）
 ```
 
@@ -238,18 +238,24 @@ tls_sniff_peek_len = 4096    # ClientHello 较大时更稳妥（默认 2048）
 - **TCP 嗅探**参与「直连 / 代理」决策：拿到域名后重新过一遍 geosite / force 规则，可以把 IP 层的误判纠正过来。
 - **UDP 嗅探只影响「走哪个上游分组」**，不影响直连 / 代理。UDP 的直连判定永远基于 IP-only 结果。
 
-所以 YouTube 这种 QUIC 大户必须开 `sniff_quic_sni`：TCP 443 走 TLS 嗅探能进 youtube 组，UDP 443（HTTP/3）要靠 QUIC 嗅探才能进同一个组。不开的话，同一个视频的 TCP 走专线、QUIC 走默认池，体验割裂。
+所以 YouTube 这种 QUIC 大户必须把 QUIC 嗅探打开（`besteffort` 或 `full`）：TCP 443 走 TLS 嗅探能进 youtube 组，UDP 443（HTTP/3）要靠 QUIC 嗅探才能进同一个组。不开的话，同一个视频的 TCP 走专线、QUIC 走默认池，体验割裂。
 
-### 4.4 QUIC 嗅探的两种模式
+### 4.4 QUIC 嗅探的转发行为（三档）
+
+QUIC 的 ClientHello 可能跨多个包（分片），SNI 不一定在首包就能拿到。针对三种取舍提供三档 `quic_sniff_mode`：
+
+- **`none`**：不做 QUIC sniff。UDP 包立即按 IP 路由转发，零延迟、零 CPU 开销。
+- **`besteffort`**：只对每个流（同一目的 IP）的**首个数据包**尝试提取 SNI，成功就用域名分组；首包不足或失败就**直接放弃**——不再创建 pending、不再对后续包重试，立即按 IP 转发。无额外延迟，代价是跨包 ClientHello 的 QUIC 流量识别不到域名。这是 xray-core 的默认行为。
+  > 命中 best-effort 放弃时，debug 日志会打印 `UDP sniff best-effort: SNI not found in first packet, giving up`，明确说明不再尝试。
+- **`full`**：用 pending 缓存。首个包 `NeedMore` 时把包缓存进 pending，凑够能提取出 SNI 的多个包后再带域名一起转发，路由完全准确；代价是牺牲约 **n×RTT** 时延（n 为凑齐 SNI 所需的包数），仅当 ClientHello 跨多个包时才缓存等待补齐（典型约 1 秒、最坏 5 秒），单包内装下的 ClientHello 仍立即转发、零延迟。
 
 ```toml
-quic_sniff_forward_first = true   # 默认值
+quic_sniff_mode = "besteffort"   # 首选：零延迟 + 尽可能识别（xray 默认）
+quic_sniff_mode = "full"         # 分组最准，但跨包 ClientHello 会多花 n 倍 RTT
+quic_sniff_mode = "none"         # 完全不嗅探，QUIC 一律按 IP 路由
 ```
 
-- `true`（默认）：**首包先转发**（不带域名，按默认分组），后台异步解析，解析出域名后后续包用新分组。优点：首包零延迟。
-- `false`：**缓存首包等嗅探完成**再转发。优点：第一个包就进对组；缺点：首包增加一点延迟。
-
-看视频场景首包晚几十毫秒无所谓、但进错组可能卡缓冲，在意的话可以用 `false`。
+看视频场景：若要求 QUIC 握手零延迟、且你的 QUIC 大户走的路由与 IP 判定一致，用 `besteffort` 或 `none` 换零延迟；若必须确保每个视频都进对组、能接受几十毫秒起步的时延，用 `full`。
 
 ---
 
@@ -576,7 +582,7 @@ flowchart TD
 
 注意前提，缺一个规则就「看着配了却不生效」：
 
-1. **域名从嗅探来**——必须开 `sniff_tls_sni` / `sniff_quic_sni`（见第 4 章），且客户端 IP 命中 `client_domain_routes` 才会触发嗅探；改为 `client_dst_ip_routes` 后不依赖嗅探，目的 IP 直判即可；
+1. **域名从嗅探来**——必须开 `sniff_tls_sni` / `quic_sniff_mode!=none`（见第 4 章），且客户端 IP 命中 `client_domain_routes` 才会触发嗅探；改为 `client_dst_ip_routes` 后不依赖嗅探，目的 IP 直判即可；
 2. **引用的组必须存在且有 upstream**，启动时 `-T` 自检会报不存在的组；
 3. **域名匹配按最长后缀优先**——`.googlevideo.com` 和 `.com` 同时配了，前者赢；IP/CIDR 同样按最长前缀优先。
 
@@ -695,7 +701,7 @@ groups = ["poe"]
 YouTube / Google 系在 v6 上几乎全是 QUIC（UDP 443）。v6 流量进了 TPROXY、客户端也命中了 2409::/16 之后，还差最后一步——**从 QUIC Initial 里解析出域名**才能匹配 `.googlevideo.com`：
 
 ```toml
-sniff_quic_sni = true
+quic_sniff_mode = "besteffort"   # 通常足够；要 100% 命中跨包 ClientHello 再上 "full"
 ```
 
 回忆第 4 章：UDP 嗅探不影响直连/代理（那是 IP 层定的），只决定**进哪个分组**——这正是本场景需要的。
@@ -785,7 +791,7 @@ chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
 ### 9.5 性能提示
 
 - `splice = false` 保持默认：内核开了 `ip_forward` 时 splice 零拷贝反而可能掉速；
-- 嗅探只处理非直连流量首包，全开的开销可以忽略；QUIC 解析 AES 相对贵一点，低配路由可在分组需求不强时关 `sniff_quic_sni`；
+- 嗅探只处理非直连流量首包，全开的开销可以忽略；QUIC 解析 AES 相对贵一点，低配路由可在分组需求不强时用 `quic_sniff_mode = "none"`；
 - UDP 会话超时 `udp_session_timeout_secs`（默认 60s）对 QUIC 长连接足够。
 
 ---
@@ -813,7 +819,7 @@ force_direct_domains = [".dl.playstation.net", ".steamserver.net"]
 # ═══════════ 嗅探（第 4 章）═══════════
 sniff_tls_sni  = true
 sniff_http_host = true
-sniff_quic_sni = true          # YouTube QUIC 分组的关键（第 8.4 节）
+quic_sniff_mode = "besteffort"   # YouTube QUIC 分组的关键（第 8.4 节）
 tls_sniff_peek_len = 4096
 
 # ═══════════ 动态竞争（第 6 章）═══════════
@@ -922,7 +928,7 @@ network = "udp"
 ## 第 11 章 排障 FAQ
 
 **Q1：YouTube 网页能开，视频疯狂缓冲？**
-按序查：① 域名表有没有 `.googlevideo.com`；② `sniff_quic_sni` 开没开；③ 设备的 **IPv6** 连接是否命中规则（第 8 章，2409::/16 配没配）；④ debug 日志里视频连接进的是不是 `youtube` 组。
+按序查：① 域名表有没有 `.googlevideo.com`；② `quic_sniff_mode` 是否为 `besteffort`/`full`；③ 设备的 **IPv6** 连接是否命中规则（第 8 章，2409::/16 配没配）；④ debug 日志里视频连接进的是不是 `youtube` 组。若日志出现 `UDP sniff best-effort: SNI not found in first packet`，说明跨包 ClientHello 没识别到域名，可改用 `full`。
 
 **Q2：Poe 没走 niyaou 专线？**
 九成是只建了 `groups = ["poe"]` 却没配 `".poe.com" = "poe"` 路由——**池子 ≠ 派单**（第 7.6 节）。另外确认访问 Poe 的客户端 IP 命中了某条 `client_domain_routes`。

@@ -22,6 +22,7 @@ use tracing::{debug, trace, warn};
 // 使用 DashMap 替代 tokio::sync::Mutex<HashMap> 以减少锁竞争。
 pub(crate) type PendingSniffMap = Arc<DashMap<UdpSessionKey, PendingUdpSniff>>;
 
+use crate::cli::QuicSniffMode;
 use crate::sniff::udp::{
     UdpSniffOutcome, UdpSnifferSessionEngine, udp_sniff_error_reason, udp_sniff_protocol_name,
 };
@@ -39,14 +40,6 @@ impl PendingReplayBuffer {
         Self {
             datagrams: vec![Bytes::copy_from_slice(first_payload)],
             cached_bytes: first_payload.len(),
-        }
-    }
-
-    // 空缓冲：首包已立即转发，pending 只缓存后续包
-    pub(crate) fn new_empty() -> Self {
-        Self {
-            datagrams: Vec::new(),
-            cached_bytes: 0,
         }
     }
 
@@ -95,20 +88,6 @@ impl PendingUdpSniff {
             spec,
             sniffer,
             replay: PendingReplayBuffer::new(first_payload),
-        }
-    }
-
-    // 首包已立即转发，pending 从空缓冲开始，只缓存后续包
-    pub(crate) fn new_forwarded(
-        spec: UdpSessionSpec,
-        sniffer: Box<dyn UdpSnifferSessionEngine>,
-    ) -> Self {
-        use crate::util::now_secs;
-        Self {
-            started_secs: now_secs(),
-            spec,
-            sniffer,
-            replay: PendingReplayBuffer::new_empty(),
         }
     }
 
@@ -224,7 +203,6 @@ pub(crate) async fn handle_udp_client_payload(
 
     if let Some(session) = state.runtime.udp.get_ready_udp_session(key).await {
         pending_sniff.remove(&key);
-
         trace!(
             kind = ?key.kind,
             client = %key.client_addr,
@@ -385,39 +363,43 @@ pub(crate) async fn handle_new_udp_sniff(
                 return true;
             }
             UdpSniffOutcome::NeedMore { protocol } => {
-                if state.config.quic_sniff_forward_first {
-                    debug!(
-                        sniffer = sniffer.name(),
-                        protocol = udp_sniff_protocol_name(protocol),
-                        kind = ?key.kind,
-                        client = %key.client_addr,
-                        target = %key.target_addr,
-                        payload_len = payload.len(),
-                        "UDP sniff need more, forwarding first packet immediately"
-                    );
+                match state.config.quic_sniff_mode {
+                    QuicSniffMode::Full => {
+                        debug!(
+                            sniffer = sniffer.name(),
+                            protocol = udp_sniff_protocol_name(protocol),
+                            kind = ?key.kind,
+                            client = %key.client_addr,
+                            target = %key.target_addr,
+                            payload_len = payload.len(),
+                            "UDP sniff need more, pending created (full mode)"
+                        );
 
-                    // 首包立即转发，不阻塞 QUIC 握手启动。
-                    // pending 只缓存后续包，等 sniff 成功后带 sniffed_host 转发。
-                    forward_udp_payload(state.clone(), spec.clone(), payload).await;
+                        // full 模式：缓存首包到 pending，等 sniff 完成后带 sniffed_host 一起转发。
+                        // 凑够能提取 SNI 的多个包才放行，牺牲 n*RTT 时延换取识别率。
+                        let pending = PendingUdpSniff::new(spec, sniff_session, payload);
+                        pending_sniff.insert(key, pending);
+                        enforce_pending_udp_sniff_capacity(pending_sniff).await;
+                        return true;
+                    }
+                    QuicSniffMode::BestEffort | QuicSniffMode::None => {
+                        // best-effort：只对首个数据包尝试提取 SNI。
+                        // 首包不足即放弃，不再创建 pending、不再对后续包重试，直接按 IP 转发。
+                        debug!(
+                            sniffer = sniffer.name(),
+                            protocol = udp_sniff_protocol_name(protocol),
+                            mode = ?state.config.quic_sniff_mode,
+                            kind = ?key.kind,
+                            client = %key.client_addr,
+                            target = %key.target_addr,
+                            "UDP sniff best-effort: SNI not found in first packet, \
+                             giving up (no further reassembly), forwarding by IP"
+                        );
 
-                    let pending = PendingUdpSniff::new_forwarded(spec, sniff_session);
-                    pending_sniff.insert(key, pending);
-                } else {
-                    debug!(
-                        sniffer = sniffer.name(),
-                        protocol = udp_sniff_protocol_name(protocol),
-                        kind = ?key.kind,
-                        client = %key.client_addr,
-                        target = %key.target_addr,
-                        payload_len = payload.len(),
-                        "UDP sniff need more, pending created"
-                    );
-
-                    let pending = PendingUdpSniff::new(spec, sniff_session, payload);
-                    pending_sniff.insert(key, pending);
+                        forward_udp_payload(state, spec, payload).await;
+                        return true;
+                    }
                 }
-                enforce_pending_udp_sniff_capacity(pending_sniff).await;
-                return true;
             }
             UdpSniffOutcome::NotMatched => {
                 debug!(

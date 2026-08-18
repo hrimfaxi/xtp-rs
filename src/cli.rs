@@ -111,6 +111,23 @@ impl std::fmt::Display for ProxyMode {
         })
     }
 }
+
+/// QUIC SNI 嗅探档位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuicSniffMode {
+    /// 不嗅探 QUIC SNI。
+    #[default]
+    None,
+    /// 只对每个流（同一 dst ip）的首个数据包尝试提取 SNI；
+    /// 首包不足或失败即放弃，不再对后续包重试，牺牲少量识别率换取无额外延迟。
+    /// 这是 xray-core 的默认行为。
+    BestEffort,
+    /// 使用 pending 缓存，凑够能提取出 SNI 的多个包后才放行，
+    /// 以 n 倍 RTT 的时延为代价换取更高识别率。
+    Full,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     #[serde(default = "default_listen")]
@@ -190,24 +207,16 @@ pub struct Config {
     /// 不适用于 HTTPS、HTTP/2 帧层、HTTP/3/QUIC。
     pub sniff_http_host: bool,
 
-    #[serde(default = "default_sniff_quic_sni")]
-    /// 是否对 UDP/QUIC Initial Packet 启用 TLS ClientHello SNI sniff。
+    #[serde(default)]
+    /// QUIC/UDP SNI 嗅探档位：none / besteffort / full。
     ///
-    /// 仅被动解析 QUIC Initial，不参与握手、不生成响应。
-    /// 默认关闭，避免在路由器/嵌入式平台产生额外 CPU 开销。
-    pub sniff_quic_sni: bool,
-
-    #[serde(default = "default_quic_sniff_forward_first")]
-    /// QUIC sniff 遇到 NeedMore 时，是否立即转发首包而不是阻塞等待。
+    /// - none：不做 QUIC sniff。
+    /// - besteffort：只对每个流（同一目的 IP）的首包尝试提取 SNI，失败即放弃，
+    ///   不阻塞不重试（xray-core 默认行为）。
+    /// - full：用 pending 缓存，凑够能提取 SNI 的多个包才放行，牺牲时延换取识别率。
     ///
-    /// - `true`（默认）：首包立即转发（无 sniffed_host，走 IP 路由），
-    ///   pending 只缓存后续包。sniff 成功后后续包带 sniffed_host 转发。
-    ///   优点：QUIC 握手零延迟，避免 PTO 重传等待。
-    ///   缺点：首包走 IP 路由，若域名路由与 IP 路由不一致可能走错路径（罕见）。
-    ///
-    /// - `false`：首包缓存在 pending 中，等 sniff 完成后一起 flush。
-    ///   所有包都带 sniffed_host，路由完全准确，但 ClientHello 跨包时会阻塞 ~1s。
-    pub quic_sniff_forward_first: bool,
+    /// 默认 none。仅被动解析 QUIC Initial，不参与握手。
+    pub quic_sniff_mode: QuicSniffMode,
 
     #[serde(default = "default_udp_session_idle_timeout_secs")]
     /// UDP session 建立后，如果在此时间内没收到任何回包，主动取消 session。
@@ -555,14 +564,6 @@ pub fn default_sniff_http_host() -> bool {
     false
 }
 
-pub fn default_sniff_quic_sni() -> bool {
-    false
-}
-
-pub fn default_quic_sniff_forward_first() -> bool {
-    true
-}
-
 pub fn default_udp_session_idle_timeout_secs() -> u64 {
     5
 }
@@ -899,8 +900,7 @@ mod tests {
             splice: false,
             sniff_tls_sni: false,
             sniff_http_host: false,
-            sniff_quic_sni: false,
-            quic_sniff_forward_first: true,
+            quic_sniff_mode: QuicSniffMode::None,
             udp_session_idle_timeout_secs: 5,
             tcp_peek_buffer_size: 32 * 1024,
             tls_sniff_peek_len: 2048,
@@ -1196,6 +1196,24 @@ mod tests {
         #[test]
         fn default_upstream_score_debug_interval_is_disabled() {
             assert_eq!(super::default_upstream_score_debug_interval_secs(), 0);
+        }
+
+        #[test]
+        fn quic_sniff_mode_serde_roundtrip() {
+            for (text, mode) in [
+                ("none", super::QuicSniffMode::None),
+                ("besteffort", super::QuicSniffMode::BestEffort),
+                ("full", super::QuicSniffMode::Full),
+            ] {
+                let v: toml::Value = toml::from_str(&format!("m = \"{text}\"")).unwrap();
+                let parsed: super::QuicSniffMode = v.get("m").unwrap().clone().try_into().unwrap();
+                assert_eq!(parsed, mode, "parse {text}");
+            }
+        }
+
+        #[test]
+        fn quic_sniff_mode_default_is_none() {
+            assert_eq!(super::QuicSniffMode::default(), super::QuicSniffMode::None);
         }
     }
 }
