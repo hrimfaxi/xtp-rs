@@ -293,3 +293,9 @@ addr = "127.0.0.1:20808"
 # [client_domain_routes."192.168.1.100"]
 # ".google.com" = "proxy_group"
 # "example.com" = "direct_group"
+
+# 按客户端源 IP + 目的 IP/CIDR 分配 upstream 分组
+# 优先级最高（高于 client_domain_routes / client_routes）。
+# 与 client_domain_routes 同构：外层客户端，内层目的网段。
+# [client_dst_ip_routes."192.168.1.0/24"]
+# "172.253.118.0/24" = "proxy_group"

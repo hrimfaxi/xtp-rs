@@ -227,7 +227,7 @@ flowchart TD
     SN --> FJ{"最终判定<br/>域名 / geosite 规则覆盖 IP-only 结果"}
     FJ -->|"直连"| DR
     FJ -->|"代理"| PX
-    PX --> UP["分组查找：client_domain_routes → client_routes → default<br/>组内按动态评分平方加权随机选择<br/>失败则尝试同组其他上游，最终回退 default 组"]
+    PX --> UP["分组查找：client_dst_ip_routes → client_domain_routes → client_routes → default<br/>组内按动态评分平方加权随机选择<br/>失败则尝试同组其他上游，最终回退 default 组"]
     UP --> CT{"SOCKS5 CONNECT"}
     CT -->|"嗅探成功"| DN["携带域名（交由上游解析）"]
     CT -->|"嗅探失败"| IA["携带原始目标 IP"]
@@ -450,11 +450,18 @@ addr = "192.168.1.100:1080"     # SOCKS5 地址
 [client_domain_routes."192.168.1.100"]
 ".google.com" = "proxy_group"    # 后缀匹配
 "example.com" = "direct_group"   # 精确匹配
+
+# 按客户端源 IP + 目的 IP/CIDR 分配 upstream 分组
+# 优先级最高（高于 client_domain_routes / client_routes）
+[client_dst_ip_routes."192.168.1.0/24"]
+"172.253.118.0/24" = "proxy_group"
 ```
 
 - `client_routes`：按客户端源 IP 分配 upstream 分组，支持单 IP 和 CIDR；
 - `client_domain_routes`：按客户端源 IP + 域名模式分配分组，优先级高于 `client_routes`；
-- 域名匹配按后缀长度降序优先匹配，确保最长匹配优先。
+- `client_dst_ip_routes`：按客户端源 IP + 目的 IP/CIDR 分配分组，优先级最高；
+- 域名匹配按后缀长度降序优先匹配，确保最长匹配优先；
+- 分组查找顺序：`client_dst_ip_routes → client_domain_routes → client_routes → default`。
 
 ### 端口转发
 

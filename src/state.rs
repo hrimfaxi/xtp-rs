@@ -114,6 +114,10 @@ pub type ClientIpRoutes = ClientCidrRoutes<String>;
 /// 客户端域名路由表：基于 CIDR 最长前缀匹配，映射到域名路由表。
 pub type ClientDomainRoutes = ClientCidrRoutes<DomainRouteTable>;
 
+/// 客户端目的 IP 路由表：外层按客户端 CIDR 最长前缀匹配，
+/// 内层按目的 IP/CIDR 最长前缀匹配，映射到 upstream 分组名。
+pub type ClientDstIpRoutes = ClientCidrRoutes<ClientIpRoutes>;
+
 /// 编译后的域名集合，支持精确匹配和后缀匹配。
 /// 配置格式：
 /// - `.example.com` → 后缀匹配（匹配 example.com 及所有子域名）
@@ -176,6 +180,7 @@ pub struct AppRuntime {
     pub udp: Arc<UdpRuntime>,
     pub client_routes: ClientIpRoutes,
     pub client_domain_routes: ClientDomainRoutes,
+    pub client_dst_ip_routes: ClientDstIpRoutes,
 }
 
 #[cfg(feature = "geosite")]
@@ -235,7 +240,7 @@ fn normalize_domain(domain: Option<&str>) -> Option<String> {
 type DirectCache = DashMap<(IpAddr, Option<String>), (bool, Instant)>;
 
 /// Key = (客户端 IP, 目标 IP, 规范化域名)。需要客户端 IP 是因为 upstream 选择
-/// 依赖 client_routes / client_domain_routes，不同客户端可能路由到不同分组。
+/// 依赖 client_routes / client_domain_routes / client_dst_ip_routes，不同客户端可能路由到不同分组。
 /// Value = (选中的 upstream, 写入时间)。
 type UpstreamCache = DashMap<(IpAddr, IpAddr, Option<String>), (Arc<Upstream>, Instant)>;
 
@@ -423,11 +428,24 @@ impl AppState {
                 .is_some()
     }
 
-    /// 根据客户端 IP 和可选域名查找 upstream group。
+    /// 根据客户端 IP、目的 IP 和可选域名查找 upstream group。
     ///
-    /// 优先按域名匹配 client_domain_routes，fallback 到 IP 匹配 client_routes。
-    /// 两者都未命中时返回 "default"。
-    pub fn lookup_upstream_group(&self, client_ip: IpAddr, domain: Option<&str>) -> &str {
+    /// 优先级：目的 IP 路由 client_dst_ip_routes > 域名路由 client_domain_routes
+    /// （仅在提供域名时）> 客户端 IP 路由 client_routes > "default"。
+    pub fn lookup_upstream_group(
+        &self,
+        client_ip: IpAddr,
+        dst_ip: IpAddr,
+        domain: Option<&str>,
+    ) -> &str {
+        if let Some(group) = self
+            .runtime
+            .client_dst_ip_routes
+            .lookup(client_ip)
+            .and_then(|t| t.lookup(dst_ip))
+        {
+            return group.as_str();
+        }
         if let Some(domain_str) = domain {
             self.runtime
                 .client_domain_routes
@@ -870,6 +888,30 @@ impl AppState {
             routes
         };
 
+        let client_dst_ip_routes = {
+            let mut routes = ClientDstIpRoutes::new();
+            for (ip_str, dst_map) in &config.client_dst_ip_routes {
+                let net = parse_ip_or_cidr(ip_str).with_context(|| {
+                    format!("invalid client_dst_ip_routes ip/cidr '{}'", ip_str)
+                })?;
+
+                let mut inner = ClientIpRoutes::new();
+                for (dst_str, group) in dst_map {
+                    let dst_net = parse_ip_or_cidr(dst_str).with_context(|| {
+                        format!(
+                            "invalid client_dst_ip_routes dst ip/cidr '{}' for client '{}'",
+                            dst_str, ip_str
+                        )
+                    })?;
+                    inner.insert(dst_net, group.clone());
+                }
+                inner.finalize();
+                routes.insert(net, inner);
+            }
+            routes.finalize();
+            routes
+        };
+
         let route_cache_ttl = Duration::from_secs(config.route_cache_ttl_secs);
 
         Ok(AppState {
@@ -899,6 +941,7 @@ impl AppState {
                 udp: udp_runtime,
                 client_routes,
                 client_domain_routes,
+                client_dst_ip_routes,
             }),
             direct_cache: DashMap::new(),
             route_cache_ttl,
@@ -1261,6 +1304,7 @@ mod tests {
                 udp: udp_runtime,
                 client_routes: ClientIpRoutes::new(),
                 client_domain_routes: ClientDomainRoutes::new(),
+                client_dst_ip_routes: ClientDstIpRoutes::new(),
             }),
             direct_cache: DashMap::new(),
             route_cache_ttl: Duration::from_secs(5),
@@ -1332,6 +1376,7 @@ mod tests {
             proxy_geosite_tags: vec![],
             client_routes: HashMap::new(),
             client_domain_routes: HashMap::new(),
+            client_dst_ip_routes: HashMap::new(),
             connect_timeout_secs: 20,
             route_cache_ttl_secs: 5,
             route_cache_max: 4096,
@@ -1639,6 +1684,170 @@ mod tests {
                 .lookup("2001:dead::1".parse::<IpAddr>().unwrap())
                 .and_then(|t| t.lookup("test.com")),
             None
+        );
+    }
+
+    #[test]
+    fn client_dst_ip_routes_exact_match() {
+        let mut routes = ClientDstIpRoutes::new();
+        let mut inner = ClientIpRoutes::new();
+        inner.insert(
+            "172.253.118.0/24".parse::<IpNet>().unwrap(),
+            "group_a".to_string(),
+        );
+        inner.finalize();
+        routes.insert("192.168.1.10/32".parse::<IpNet>().unwrap(), inner);
+        routes.finalize();
+
+        assert_eq!(
+            routes
+                .lookup("192.168.1.10".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("172.253.118.5".parse::<IpAddr>().unwrap()))
+                .map(String::as_str),
+            Some("group_a")
+        );
+        assert_eq!(
+            routes
+                .lookup("192.168.1.11".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("172.253.118.5".parse::<IpAddr>().unwrap())),
+            None
+        );
+        assert_eq!(
+            routes
+                .lookup("192.168.1.10".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("8.8.8.8".parse::<IpAddr>().unwrap())),
+            None
+        );
+    }
+
+    #[test]
+    fn client_dst_ip_routes_longest_prefix_match() {
+        let mut routes = ClientDstIpRoutes::new();
+
+        let mut broad = ClientIpRoutes::new();
+        broad.insert(
+            "172.253.0.0/16".parse::<IpNet>().unwrap(),
+            "broad".to_string(),
+        );
+        broad.finalize();
+        routes.insert("192.168.0.0/16".parse::<IpNet>().unwrap(), broad);
+
+        let mut narrow = ClientIpRoutes::new();
+        narrow.insert(
+            "172.253.118.0/24".parse::<IpNet>().unwrap(),
+            "narrow".to_string(),
+        );
+        narrow.finalize();
+        routes.insert("192.168.1.0/24".parse::<IpNet>().unwrap(), narrow);
+
+        routes.finalize();
+
+        assert_eq!(
+            routes
+                .lookup("192.168.1.42".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("172.253.118.1".parse::<IpAddr>().unwrap()))
+                .map(String::as_str),
+            Some("narrow")
+        );
+        assert_eq!(
+            routes
+                .lookup("192.168.2.42".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("172.253.118.1".parse::<IpAddr>().unwrap()))
+                .map(String::as_str),
+            Some("broad")
+        );
+    }
+
+    #[test]
+    fn client_dst_ip_routes_ipv6_match() {
+        let mut routes = ClientDstIpRoutes::new();
+        let mut inner = ClientIpRoutes::new();
+        inner.insert("2001:4860::/32".parse::<IpNet>().unwrap(), "v6".to_string());
+        inner.finalize();
+        routes.insert("2001:db8::/32".parse::<IpNet>().unwrap(), inner);
+        routes.finalize();
+
+        assert_eq!(
+            routes
+                .lookup("2001:db8::1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("2001:4860:1::1".parse::<IpAddr>().unwrap()))
+                .map(String::as_str),
+            Some("v6")
+        );
+        assert_eq!(
+            routes
+                .lookup("2001:db8::1".parse::<IpAddr>().unwrap())
+                .and_then(|t| t.lookup("2001:dead::1".parse::<IpAddr>().unwrap())),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_upstream_group_dst_ip_beats_domain_and_client() {
+        let mut state = minimal_app_state();
+
+        let mut dst_ip = ClientDstIpRoutes::new();
+        let mut inner = ClientIpRoutes::new();
+        inner.insert(
+            "172.253.118.0/24".parse::<IpNet>().unwrap(),
+            "by_ip".to_string(),
+        );
+        inner.finalize();
+        dst_ip.insert("192.168.1.0/24".parse::<IpNet>().unwrap(), inner);
+        dst_ip.finalize();
+
+        let mut domain_routes = ClientDomainRoutes::new();
+        let mut exact = HashMap::new();
+        exact.insert("google.com".to_string(), "by_domain".to_string());
+        domain_routes.insert(
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact,
+                suffixes: vec![],
+            },
+        );
+        domain_routes.finalize();
+
+        let mut client_routes = ClientIpRoutes::new();
+        client_routes.insert(
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+            "by_client".to_string(),
+        );
+        client_routes.finalize();
+
+        state.runtime = Arc::new(AppRuntime {
+            proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
+            udp: Arc::clone(&state.runtime.udp),
+            client_routes,
+            client_domain_routes: domain_routes,
+            client_dst_ip_routes: dst_ip,
+        });
+
+        let client = "192.168.1.5".parse::<IpAddr>().unwrap();
+        let dst = "172.253.118.9".parse::<IpAddr>().unwrap();
+        // 目的 IP 路由优先于域名路由
+        assert_eq!(
+            state.lookup_upstream_group(client, dst, Some("google.com")),
+            "by_ip"
+        );
+        // 无目的 IP 命中时，域名路由优先于客户端路由
+        assert_eq!(
+            state.lookup_upstream_group(client, "8.8.8.8".parse().unwrap(), Some("google.com")),
+            "by_domain"
+        );
+        // 无域名时回退客户端路由
+        assert_eq!(
+            state.lookup_upstream_group(client, "8.8.8.8".parse().unwrap(), None),
+            "by_client"
+        );
+        // 全部未命中回退 default
+        assert_eq!(
+            state.lookup_upstream_group(
+                "10.0.0.1".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+                None
+            ),
+            "default"
         );
     }
 

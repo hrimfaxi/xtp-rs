@@ -529,7 +529,22 @@ groups = ["youtube"]
 - 组内多条上游自动按第 6 章的评分机制竞争——**youtube 组 = 一套独立的 BBR/Brutal 竞争池**，和默认池互不干扰；
 - 组里只有一条上游时，它就是固定专线，无竞争可言。
 
-### 7.2 client_domain_routes：按「谁访问 + 访问什么」派单
+### 7.2 client_routes：按「谁访问」派单
+
+最粗粒度也最省事的派单：**只看客户端源 IP**，把这个设备的所有流量都塞进同一个组。适合「某台 NAS / 指定设备固定走一条专线」的场景：
+
+```toml
+[client_routes]
+"10.1.1.63"      = "youtube"     # 电视盒子：所有国外流量都走 youtube 组
+"192.168.2.0/24" = "group_b"     # CIDR 也行，一段子网一起派
+"2409::/16"      = "group_b"     # v6 运营商大段（见第 8.3 节）也可以
+```
+
+- 键支持任意 **IP/CIDR（v4 或 v6）**，按最长前缀匹配；
+- 它是分组查找链路里兜底的客户端级规则——命中就整台设备进这个组，不再细分域名/目的 IP；
+- 只按来源分流；如果同一设备的流量里既有要走专线的、又有要走默认的，就用下面优先级更高的 `client_domain_routes` / `client_dst_ip_routes` 去细分。
+
+### 7.3 client_domain_routes：按「谁访问 + 访问什么」派单
 
 `groups` 只是建好了候选池，把流量引进池子的是路由规则。最精细的是 `client_domain_routes`：**按客户端源 IP + 目标域名**决定分组：
 
@@ -541,29 +556,43 @@ groups = ["youtube"]
 ".poe.com"        = "poe"
 ```
 
-分组查找的完整顺序：
+# 分组查找的完整顺序（按优先级从高到低）：
 
 ```mermaid
 flowchart TD
-    A["新连接（走代理路径）"] --> B{"client_domain_routes<br/>客户端 IP 命中且域名命中？"}
+    A["新连接（走代理路径）"] --> B{"client_dst_ip_routes<br/>客户端 IP 命中且目的 IP 命中？"}
     B -->|"是"| G1["对应分组"]
-    B -->|"否"| C{"client_routes<br/>客户端 IP 命中？"}
+    B -->|"否"| C{"client_domain_routes<br/>客户端 IP 命中且域名命中？"}
     C -->|"是"| G2["对应分组"]
-    C -->|"否"| G3["default 组"]
-    G1 & G2 & G3 --> P["组内按动态评分<br/>平方加权随机选一条"]
+    C -->|"否"| D{"client_routes<br/>客户端 IP 命中？"}
+    D -->|"是"| G3["对应分组"]
+    D -->|"否"| G4["default 组"]
+    G1 & G2 & G3 & G4 --> P["组内按动态评分<br/>平方加权随机选一条"]
     P --> F{"连接失败？"}
     F -->|"是"| R["尝试同组其他上游<br/>全失败回退 default 组"]
     R --> P
     F -->|"否"| OK["建立连接"]
 ```
 
-注意三个前提，缺一个规则就「看着配了却不生效」：
+注意前提，缺一个规则就「看着配了却不生效」：
 
-1. **域名从嗅探来**——必须开 `sniff_tls_sni` / `sniff_quic_sni`（见第 4 章），且客户端 IP 命中 `client_domain_routes` 才会触发嗅探；
+1. **域名从嗅探来**——必须开 `sniff_tls_sni` / `sniff_quic_sni`（见第 4 章），且客户端 IP 命中 `client_domain_routes` 才会触发嗅探；改为 `client_dst_ip_routes` 后不依赖嗅探，目的 IP 直判即可；
 2. **引用的组必须存在且有 upstream**，启动时 `-T` 自检会报不存在的组；
-3. **域名匹配按最长后缀优先**——`.googlevideo.com` 和 `.com` 同时配了，前者赢。
+3. **域名匹配按最长后缀优先**——`.googlevideo.com` 和 `.com` 同时配了，前者赢；IP/CIDR 同样按最长前缀优先。
 
-### 7.3 实战一：YouTube 专线
+### 7.4 client_dst_ip_routes：按「谁访问 + 目的 IP」派单
+
+当目标地址**只知道 IP、拿不到或不想依赖域名**时，用 `client_dst_ip_routes`——它和外层的客户端源 IP 一起，按**目的 IP/CIDR** 决定分组，且优先级最高，不依赖任何嗅探：
+
+```toml
+[client_dst_ip_routes."192.168.1.0/24"]     # 整个家里网段
+"172.253.118.0/24" = "proxy_group"          # 某段 Google IP 走专线组
+"8.8.8.8"          = "dns_group"            # 单个 IP 也可以
+```
+
+和 `client_domain_routes` 的区别：内层键前者是**域名**（需要嗅探），后者是**目的 IP/CIDR**（无需嗅探，任何 TCP/UDP 直达）。因为优先级最高，即使同一客户端同时命中域名规则，只要目的 IP 命中这里，就以这里为准。
+
+### 7.5 实战一：YouTube 专线
 
 YouTube 的流量绝不只有 `youtube.com`：
 
@@ -582,7 +611,7 @@ YouTube 的流量绝不只有 `youtube.com`：
 
 两个客户端条目（10.1.1.63、10.1.1.158）各配一份相同的域名表。TOML 没有锚点语法，重复是不可避免的；如果嫌长，可以把整段生成出来，或者用下一章的 CIDR 技巧合并。
 
-### 7.4 实战二：Poe 专线
+### 7.6 实战二：Poe 专线
 
 ```toml
 [[upstream]]
@@ -896,7 +925,7 @@ network = "udp"
 按序查：① 域名表有没有 `.googlevideo.com`；② `sniff_quic_sni` 开没开；③ 设备的 **IPv6** 连接是否命中规则（第 8 章，2409::/16 配没配）；④ debug 日志里视频连接进的是不是 `youtube` 组。
 
 **Q2：Poe 没走 niyaou 专线？**
-九成是只建了 `groups = ["poe"]` 却没配 `".poe.com" = "poe"` 路由——**池子 ≠ 派单**（第 7.4 节）。另外确认访问 Poe 的客户端 IP 命中了某条 `client_domain_routes`。
+九成是只建了 `groups = ["poe"]` 却没配 `".poe.com" = "poe"` 路由——**池子 ≠ 派单**（第 7.6 节）。另外确认访问 Poe 的客户端 IP 命中了某条 `client_domain_routes`。
 
 **Q3：Brutal 明明更快，评分却不选它？**
 - 评分靠真实流量喂养：小网页短连接看不出吞吐差异，用大文件下载 / 4K 视频验证；

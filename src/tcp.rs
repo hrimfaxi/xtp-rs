@@ -221,7 +221,7 @@ async fn pick_and_connect(
         "tcp upstream select"
     );
 
-    let group = state.lookup_upstream_group(client_addr.ip(), domain);
+    let group = state.lookup_upstream_group(client_addr.ip(), orig_dst.ip(), domain);
 
     trace!(
         client = %client_addr,

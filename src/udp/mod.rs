@@ -400,7 +400,11 @@ impl UdpSession {
 
 async fn connect_socks5_udp(state: &AppState, spec: &UdpSessionSpec) -> Result<Socks5UdpAssoc> {
     let key = spec.key;
-    let group = state.lookup_upstream_group(key.client_addr.ip(), spec.sniffed_host.as_deref());
+    let group = state.lookup_upstream_group(
+        key.client_addr.ip(),
+        key.target_addr.ip(),
+        spec.sniffed_host.as_deref(),
+    );
     let up = state
         .upstreams
         .pick_from_group(group)

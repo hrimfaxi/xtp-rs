@@ -497,6 +497,11 @@ pub struct Config {
     /// 客户端源 IP → {域名模式 → upstream 分组}
     pub client_domain_routes: HashMap<String, HashMap<String, String>>,
 
+    #[serde(default)]
+    /// 客户端源 IP → {目的 IP/CIDR → upstream 分组}
+    /// 优先级最高（高于 client_domain_routes / client_routes）。
+    pub client_dst_ip_routes: HashMap<String, HashMap<String, String>>,
+
     #[serde(default = "default_route_cache_ttl_secs")]
     /// 路由结果缓存 TTL，单位秒。
     ///
@@ -771,8 +776,9 @@ impl Config {
             }
             // 未显式配置 groups 的 upstream 视为属于 default 组
             let has_default = group_count.contains_key("default");
-            let has_client_routes =
-                !self.client_routes.is_empty() || !self.client_domain_routes.is_empty();
+            let has_client_routes = !self.client_routes.is_empty()
+                || !self.client_domain_routes.is_empty()
+                || !self.client_dst_ip_routes.is_empty();
             if !has_default {
                 if has_client_routes {
                     warn!(
@@ -812,6 +818,31 @@ impl Config {
                             "client_domain_routes '{}' domain '{}' references group '{}' which has no upstream",
                             ip_str,
                             domain,
+                            group
+                        );
+                    }
+                }
+            }
+
+            // 校验 client_dst_ip_routes 的 IP/CIDR 及引用分组存在且非空
+            for (ip_str, dst_map) in &self.client_dst_ip_routes {
+                if parse_ip_or_cidr(ip_str).is_err() {
+                    bail!("invalid IP/CIDR in client_dst_ip_routes: '{}'", ip_str);
+                }
+                for (dst_str, group) in dst_map {
+                    if parse_ip_or_cidr(dst_str).is_err() {
+                        bail!(
+                            "invalid IP/CIDR '{}' in client_dst_ip_routes for client '{}'",
+                            dst_str,
+                            ip_str
+                        );
+                    }
+                    let count = group_count.get(group.as_str()).copied().unwrap_or(0);
+                    if count == 0 {
+                        bail!(
+                            "client_dst_ip_routes '{}' dst '{}' references group '{}' which has no upstream",
+                            ip_str,
+                            dst_str,
                             group
                         );
                     }
@@ -916,6 +947,7 @@ mod tests {
             direct_geosite_tags: vec![],
             client_routes: HashMap::new(),
             client_domain_routes: HashMap::new(),
+            client_dst_ip_routes: HashMap::new(),
             connect_timeout_secs: 20,
             route_cache_ttl_secs: 5,
             route_cache_max: 4096,
