@@ -91,12 +91,23 @@ http_sniff_timeout_ms = 1000
 # QUIC/UDP SNI 嗅探档位：none / besteffort / full，默认 none。
 # - none：不做 QUIC sniff，UDP 包立即按 IP 路由转发（零延迟、零 CPU 开销）。
 # - besteffort：只对每个流（同一目的 IP）的首个数据包尝试提取 SNI，成功即用域名分组；
-#   首包不足或失败即放弃，不再对后续包重试，无额外延迟（xray-core 默认行为）。
-# - full：使用 pending 缓存，凑够能提取出 SNI 的多个包后才放行（带域名分组），
-#   牺牲约 n*RTT 时延换取更高识别率；单包内装下的 ClientHello 仍立即转发。
+#   首包不足或失败即放弃，不再对后续包重试，无额外延迟。
+# - full：使用 pending 缓存，仿效 xray-core 的 QUIC sniffer——在 quic_sniff_pending_timeout_ms
+#   预算窗口内累积多个 QUIC Initial 包，凑够能提取出 SNI 后才放行（带域名分组），
+#   牺牲至多约一个 pending 窗口的时延换取更高识别率；单包内装下的 ClientHello 仍立即转发。
 #
 # 解析 QUIC Initial 会增加 CPU 开销，低配路由可在分组需求不强时使用 none/besteffort。
 quic_sniff_mode = "none"
+
+# full 模式下，pending 等待凑齐 QUIC SNI 的最大时长（毫秒），默认 200。
+# 对应 xray-core 的 cacheDeadline（~200ms）预算；超过该窗口仍未凑出 SNI 则按 IP 转发。
+# 窗口内提前凑齐即立即转发，不额外等待。调试识别率/时延权衡时可调整。
+#
+# 注意：默认窗口已由旧硬编码的 5 秒缩短为 200ms。跨多包慢速到达的 ClientHello
+# （旧 5s 窗口内通常能凑齐）现在更可能超时按 IP 转发，识别率会下降；
+# 需要贴近旧行为的用户请调大此值。设为 0 表示 pending 创建即失效，
+# 行为退化为近似 besteffort（每条流只试首包）。
+# quic_sniff_pending_timeout_ms = 200
 
 # 下面的旧布尔开关已被 quic_sniff_mode 取代，不再支持：
 #   旧 sniff_quic_sni = true  →  quic_sniff_mode = "full"

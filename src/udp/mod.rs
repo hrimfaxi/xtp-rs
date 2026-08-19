@@ -17,12 +17,13 @@ use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
-pub(crate) use pending::UDP_SNIFF_REAP_INTERVAL_SECS;
+pub(crate) use pending::{UDP_SNIFF_REAP_IDLE_INTERVAL, UDP_SNIFF_REAP_INTERVAL};
 pub(crate) use session::{
     UdpOutbound, UdpReplyPath, UdpRoutingMode, UdpSession, UdpSessionEntry, UdpSessionKey,
     UdpSessionSpec,
 };
 
+use crate::cli::QuicSniffMode;
 use crate::socket_factory::create_direct_udp_socket;
 use crate::socks5::{Socks5UdpAssoc, socks5_udp_associate_for_client};
 use crate::state::AppState;
@@ -32,6 +33,7 @@ use crate::udp::tproxy::TProxyUdpSocket;
 use crate::util::{
     hex_encode, is_anyhow_emsgsize, is_io_emsgsize, new_udp_buf, now_secs, reset_udp_buf,
 };
+use std::time::Instant;
 
 // 每个 UdpSessionKey 的串行锁：空 Mutex 只用于互斥，不存数据。
 type UdpKeyLock = Arc<tokio::sync::Mutex<()>>;
@@ -790,6 +792,32 @@ fn reap_idle_udp_key_locks(key_locks: &UdpKeyLocks) {
     key_locks.retain(|_, lock| Arc::strong_count(lock) > 1);
 }
 
+// 统一的 periodic 清理：UDP recv 循环在收包时顺带调用（无定时器臂，仅做机会式收紧）。
+// 仅 full 模式会产出 pending，才需 100ms 周期收紧 pending 超时；none/besteffort
+// 无重组需求，回落秒级只清理 idle key_lock，避免 MIPS 低配场景交额外周期税。
+// 使用单调时钟 `Instant`，避免墙钟在 NTP 校时跳变时扭曲周期。
+async fn maybe_reap_pending_udp_sniff(
+    state: Arc<AppState>,
+    pending_sniff: &PendingSniffMap,
+    key_locks: &UdpKeyLocks,
+    last_reap: &mut Instant,
+) {
+    let produces_pending = state.config.quic_sniff_mode == QuicSniffMode::Full;
+    let interval = if produces_pending {
+        UDP_SNIFF_REAP_INTERVAL
+    } else {
+        UDP_SNIFF_REAP_IDLE_INTERVAL
+    };
+    if last_reap.elapsed() < interval {
+        return;
+    }
+    *last_reap = Instant::now();
+    if produces_pending {
+        reap_pending_udp_sniff(state.clone(), pending_sniff.clone()).await;
+    }
+    reap_idle_udp_key_locks(key_locks);
+}
+
 pub async fn run_udp_loop(
     state: Arc<AppState>,
     tproxy_udp: UdpSocket,
@@ -807,7 +835,7 @@ pub async fn run_udp_loop(
     let key_locks: UdpKeyLocks = Arc::new(DashMap::new());
     // 共享 sniff 状态
     let pending_sniff = Arc::new(DashMap::new());
-    let mut last_pending_reap_secs = now_secs();
+    let mut last_pending_reap = Instant::now();
 
     loop {
         reset_udp_buf(&mut buf);
@@ -828,13 +856,13 @@ pub async fn run_udp_loop(
             }
         };
 
-        let now = now_secs();
-        if now.saturating_sub(last_pending_reap_secs) >= UDP_SNIFF_REAP_INTERVAL_SECS {
-            last_pending_reap_secs = now;
-            reap_pending_udp_sniff(state.clone(), pending_sniff.clone()).await;
-            // 顺带清理无 task 使用的 idle key_lock，防内存泄漏
-            reap_idle_udp_key_locks(&key_locks);
-        }
+        maybe_reap_pending_udp_sniff(
+            state.clone(),
+            &pending_sniff,
+            &key_locks,
+            &mut last_pending_reap,
+        )
+        .await;
 
         if packet.len == 0 {
             continue;
@@ -876,7 +904,7 @@ pub async fn run_udp_port_forward(
     let packet_sem = Arc::new(tokio::sync::Semaphore::new(UDP_PACKET_TASK_LIMIT));
     let key_locks: UdpKeyLocks = Arc::new(DashMap::new());
     let pending_sniff = Arc::new(DashMap::new());
-    let mut last_pending_reap_secs = now_secs();
+    let mut last_pending_reap = Instant::now();
 
     loop {
         reset_udp_buf(&mut buf);
@@ -895,13 +923,13 @@ pub async fn run_udp_port_forward(
             }
         };
 
-        let now = now_secs();
-
-        if now.saturating_sub(last_pending_reap_secs) >= UDP_SNIFF_REAP_INTERVAL_SECS {
-            last_pending_reap_secs = now;
-            reap_pending_udp_sniff(state.clone(), pending_sniff.clone()).await;
-            reap_idle_udp_key_locks(&key_locks);
-        }
+        maybe_reap_pending_udp_sniff(
+            state.clone(),
+            &pending_sniff,
+            &key_locks,
+            &mut last_pending_reap,
+        )
+        .await;
 
         if n == 0 {
             continue;

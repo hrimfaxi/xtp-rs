@@ -121,10 +121,10 @@ pub enum QuicSniffMode {
     None,
     /// 只对每个流（同一 dst ip）的首个数据包尝试提取 SNI；
     /// 首包不足或失败即放弃，不再对后续包重试，牺牲少量识别率换取无额外延迟。
-    /// 这是 xray-core 的默认行为。
     BestEffort,
-    /// 使用 pending 缓存，凑够能提取出 SNI 的多个包后才放行，
-    /// 以 n 倍 RTT 的时延为代价换取更高识别率。
+    /// 使用 pending 缓存，仿效 xray-core full 模式：在 ~quic_sniff_pending_timeout_ms
+    /// （默认 200ms）预算窗口内累积多个 QUIC Initial 包，凑够能提取出 SNI 才放行；
+    /// 以最多约一个 pending 窗口的时延为代价换取更高识别率。
     Full,
 }
 
@@ -212,11 +212,21 @@ pub struct Config {
     ///
     /// - none：不做 QUIC sniff。
     /// - besteffort：只对每个流（同一目的 IP）的首包尝试提取 SNI，失败即放弃，
-    ///   不阻塞不重试（xray-core 默认行为）。
-    /// - full：用 pending 缓存，凑够能提取 SNI 的多个包才放行，牺牲时延换取识别率。
+    ///   不阻塞不重试。
+    /// - full：仿效 xray-core 的 QUIC sniffer（带 ~200ms 重组预算、可跨多包拼接
+    ///   SNI）——用 pending 缓存，凑够能提取 SNI 的多个包才放行，牺牲时延换取识别率。
     ///
     /// 默认 none。仅被动解析 QUIC Initial，不参与握手。
     pub quic_sniff_mode: QuicSniffMode,
+
+    #[serde(default = "default_quic_sniff_pending_timeout_ms")]
+    /// full 模式下，pending 等待凑齐 QUIC SNI 的最大时长（毫秒），默认 200。
+    ///
+    /// 对应 xray-core 的 `cacheDeadline`（~200ms）预算：在该窗口内持续累积
+    /// 多个 QUIC Initial 包以拼接出完整的 ClientHello SNI；超过窗口仍未凑出
+    /// 则放弃 pending，按原始 IP 转发。窗口内随时凑齐即立即转发，不额外等待。
+    /// 设为 0 时 pending 创建即失效，行为退化为近似 besteffort。
+    pub quic_sniff_pending_timeout_ms: u64,
 
     #[serde(default = "default_udp_session_idle_timeout_secs")]
     /// UDP session 建立后，如果在此时间内没收到任何回包，主动取消 session。
@@ -568,6 +578,10 @@ pub fn default_udp_session_idle_timeout_secs() -> u64 {
     5
 }
 
+pub fn default_quic_sniff_pending_timeout_ms() -> u64 {
+    200
+}
+
 pub fn default_tcp_peek_buffer_size() -> usize {
     32 * 1024
 }
@@ -901,6 +915,7 @@ mod tests {
             sniff_tls_sni: false,
             sniff_http_host: false,
             quic_sniff_mode: QuicSniffMode::None,
+            quic_sniff_pending_timeout_ms: 200,
             udp_session_idle_timeout_secs: 5,
             tcp_peek_buffer_size: 32 * 1024,
             tls_sniff_peek_len: 2048,
