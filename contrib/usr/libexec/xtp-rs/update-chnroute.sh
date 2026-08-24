@@ -15,8 +15,9 @@ set -eu
 # （或重启 xtp-rs 服务）才会生效。
 #
 # 【建议加入 cron 定期更新】列表每月都会有变动，建议每周更新一至两次，
-# 例如每周三、周日 04:30 各执行一次：
-#   30 4 * * 0,3 /usr/libexec/xtp-rs/update-chnroute.sh >/dev/null 2>&1
+# 例如每周三、周日 04:30 各执行一次。注意本脚本只生成数据文件，必须串联
+# 重跑 setup-xtp-rs.sh 才会应用到运行中的规则；&& 保证下载失败时不动现有规则：
+#   30 4 * * 0,3 { /usr/libexec/xtp-rs/update-chnroute.sh && /usr/libexec/xtp-rs/setup-xtp-rs.sh; } >/dev/null 2>&1
 # OpenWrt 上可直接将该行追加到 /etc/crontabs/root，
 # 然后执行 /etc/init.d/cron restart 使其生效。
 #

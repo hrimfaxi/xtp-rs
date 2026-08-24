@@ -143,8 +143,9 @@ uci commit xtp-rs
 # 3. 应用规则（或 /etc/init.d/xtp-rs restart）
 sudo ./setup-xtp-rs.sh
 
-# 4. 建议加入 cron 定期刷新列表（每周一两次即可）
-#    30 4 * * 0,3 /usr/libexec/xtp-rs/update-chnroute.sh >/dev/null 2>&1
+# 4. 建议加入 cron 定期刷新列表并重跑 setup 应用规则（每周一两次即可；
+#    只更新文件不重跑 setup 的话，新列表不会生效）
+#    30 4 * * 0,3 { /usr/libexec/xtp-rs/update-chnroute.sh && /usr/libexec/xtp-rs/setup-xtp-rs.sh; } >/dev/null 2>&1
 ```
 
 说明：
