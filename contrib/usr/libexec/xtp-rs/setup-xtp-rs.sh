@@ -118,11 +118,11 @@ RESERVED_IP_ELEMENTS="$(echo "$RESERVED_IP_ELEMENTS" | grep -v '^[[:space:]]*$')
 # 更新列表后需重跑本脚本（或重启 xtp-rs 服务）才会生效。
 #
 # 开关取值优先级：环境变量 XTP_BYPASS_CHNROUTE > uci 选项
-# xtp_rs.main.bypass_chnroute（/etc/config/xtp-rs）> 默认关闭。
+# xtp-rs.main.bypass_chnroute（/etc/config/xtp-rs）> 默认关闭。
 # -------------------------------------------------------------------------
 XTP_BYPASS_CHNROUTE="${XTP_BYPASS_CHNROUTE:-}"
 if [ -z "$XTP_BYPASS_CHNROUTE" ] && command -v uci >/dev/null 2>&1; then
-  XTP_BYPASS_CHNROUTE="$(uci -q get xtp_rs.main.bypass_chnroute || true)"
+  XTP_BYPASS_CHNROUTE="$(uci -q get xtp-rs.main.bypass_chnroute || true)"
 fi
 # 归一化布尔值（兼容 true/yes/on 等写法），防止 uci 侧填入意外值
 case "$XTP_BYPASS_CHNROUTE" in

@@ -137,7 +137,7 @@ TPROXY 会把被截获的流量导入本机 input 路径，这些流永远到不
 sudo ./update-chnroute.sh
 
 # 2. 开启开关（OpenWrt UCI；默认配置文件见 contrib/etc/config/xtp-rs）
-uci set xtp_rs.main.bypass_chnroute='1'
+uci set xtp-rs.main.bypass_chnroute='1'
 uci commit xtp-rs
 
 # 3. 应用规则（或 /etc/init.d/xtp-rs restart）
