@@ -1712,7 +1712,13 @@ mod tests {
             upstream_with_groups("c", vec!["office".to_string()]),
             upstream_with_groups("d", vec!["office".to_string()]),
         ];
-        let set = UpstreamSet::new(items, 50, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
+        let set = UpstreamSet::new(items.clone(), 50, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
+
+        // 全部标记已初始化，否则 pick_weighted 的探索分支会以小概率
+        // 无视 sticky 均匀随机选中 b/d，导致本测试偶发失败
+        for u in &items {
+            set_tcp_score(u, 500);
+        }
 
         // sticky default -> a, office -> c
         {
