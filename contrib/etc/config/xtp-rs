@@ -1,0 +1,9 @@
+config xtp_rs 'main'
+	# 中国大陆 IPv4 直连：开启后发往国内 IP 的流量不经过 TPROXY，
+	# 保持正常转发路径（fw4 flowtable 软/硬 offload 得以生效）。
+	# 前置条件：先用 /usr/libexec/xtp-rs/update-chnroute.sh 生成列表
+	# 文件 /etc/xtp-rs/chnroute.nft（建议加入 cron 定期刷新）。
+	# 改动后需重启服务或重跑 setup-xtp-rs.sh 才会生效。
+	option bypass_chnroute '0'
+
+# vim: set noexpandtab:
