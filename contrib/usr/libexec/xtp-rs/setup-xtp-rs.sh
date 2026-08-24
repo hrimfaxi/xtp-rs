@@ -105,17 +105,19 @@ fi
 RESERVED_IP_ELEMENTS="$(echo "$RESERVED_IP_ELEMENTS" | grep -v '^[[:space:]]*$')"
 
 # -------------------------------------------------------------------------
-# 可选：中国大陆 IPv4 目的地址直连（不经过 TPROXY）
+# 可选：中国大陆 IP（IPv4 + IPv6）目的地址直连（不经过 TPROXY）
 # -------------------------------------------------------------------------
-# 开启 XTP_BYPASS_CHNROUTE=1 后，目的地址命中 china_ips 集合的流量在
-# prerouting / output 中提前 return，保持正常转发路径：
+# 开启 XTP_BYPASS_CHNROUTE=1 后，目的地址命中 china_ips（IPv4）/
+# china_ip6s（IPv6）集合的流量在 prerouting / output 中提前 return，
+# 保持正常转发路径：
 #   - 国内流量不再被代理，延迟与 CPU 开销显著降低；
 #   - 这些流重新走 FORWARD 路径，fw4 flowtable 软/硬 offload 得以生效。
 #     （TPROXY 截走的流会被导入本机 input 路径，永远到不了 forward hook，
 #      对这些流 nat offload 是无效的。）
 # 列表由 update-chnroute.sh 下载生成（建议加入 cron 定期刷新），本脚本只
 # 消费不下载，开机不依赖网络；文件缺失或损坏时仅警告并继续，不影响其余功能。
-# 更新列表后需重跑本脚本（或重启 xtp-rs 服务）才会生效。
+# 两个地址族相互独立：任一列表缺失只跳过对应规则。更新列表后需重跑本脚本
+# （或重启 xtp-rs 服务）才会生效。
 #
 # 开关取值优先级：环境变量 XTP_BYPASS_CHNROUTE > uci 选项
 # xtp-rs.main.bypass_chnroute（/etc/config/xtp-rs）> 默认关闭。
@@ -130,15 +132,24 @@ case "$XTP_BYPASS_CHNROUTE" in
   *) XTP_BYPASS_CHNROUTE=0 ;;
 esac
 CHNROUTE_NFT_FILE="${XTP_CHNROUTE_FILE:-/etc/xtp-rs/chnroute.nft}"
+CHNROUTE6_NFT_FILE="${XTP_CHNROUTE6_FILE:-/etc/xtp-rs/chnroute6.nft}"
 
 CHNROUTE_INCLUDE=""
 CHNROUTE_RETURN=""
+CHNROUTE6_INCLUDE=""
+CHNROUTE6_RETURN=""
 if [ "$XTP_BYPASS_CHNROUTE" = "1" ]; then
   if [ -s "$CHNROUTE_NFT_FILE" ] && grep -q '^set china_ips' "$CHNROUTE_NFT_FILE"; then
     CHNROUTE_INCLUDE="include \"${CHNROUTE_NFT_FILE}\""
     CHNROUTE_RETURN="ip daddr @china_ips counter return"
   else
-    echo "xtp-rs: warning: XTP_BYPASS_CHNROUTE=1 but $CHNROUTE_NFT_FILE is missing or invalid, bypass disabled; run update-chnroute.sh first" >&2
+    echo "xtp-rs: warning: XTP_BYPASS_CHNROUTE=1 but $CHNROUTE_NFT_FILE is missing or invalid, IPv4 bypass disabled; run update-chnroute.sh first" >&2
+  fi
+  if [ -s "$CHNROUTE6_NFT_FILE" ] && grep -q '^set china_ip6s' "$CHNROUTE6_NFT_FILE"; then
+    CHNROUTE6_INCLUDE="include \"${CHNROUTE6_NFT_FILE}\""
+    CHNROUTE6_RETURN="ip6 daddr @china_ip6s counter return"
+  else
+    echo "xtp-rs: warning: XTP_BYPASS_CHNROUTE=1 but $CHNROUTE6_NFT_FILE is missing or invalid, IPv6 bypass disabled; run update-chnroute.sh first" >&2
   fi
 fi
 
@@ -269,6 +280,7 @@ ${RESERVED_IP_ELEMENTS}
   }
 
 ${CHNROUTE_INCLUDE}
+${CHNROUTE6_INCLUDE}
 
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
@@ -298,6 +310,7 @@ ${CHNROUTE_INCLUDE}
     meta l4proto tcp ip daddr 192.168.0.0/16 return
     ip daddr 192.168.0.0/16 udp dport != 53 return
     ip6 daddr @reserved_ip6 return
+    ${CHNROUTE6_RETURN}
     meta l4proto tcp ip6 daddr fd00::/8 return
     ip6 daddr fd00::/8 udp dport != 53 return
 
@@ -318,6 +331,7 @@ ${CHNROUTE_INCLUDE}
     meta l4proto tcp ip daddr 192.168.0.0/16 return
     ip daddr 192.168.0.0/16 udp dport != 53 return
     ip6 daddr @reserved_ip6 return
+    ${CHNROUTE6_RETURN}
     meta l4proto tcp ip6 daddr fd00::/8 return
     ip6 daddr fd00::/8 udp dport != 53 return
     meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 accept

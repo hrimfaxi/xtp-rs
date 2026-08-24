@@ -101,7 +101,7 @@ OpenWrt 软件包 Makefile 仓库：[openwrt-xtp-rs](https://github.com/hrimfaxi
 | `common.sh` | 公共函数库，供其他脚本引用 |
 | `setup-xtp-rs.sh` | 一键配置 nftables 规则和策略路由（需 root 权限） |
 | `unsetup-xtp-rs.sh` | 一键清理上述规则 |
-| `update-chnroute.sh` | 更新中国大陆 IPv4 直连列表（可选，配合 UCI 选项 `bypass_chnroute`） |
+| `update-chnroute.sh` | 更新中国大陆 IPv4/IPv6 直连列表（可选，配合 UCI 选项 `bypass_chnroute`） |
 
 ```bash
 cd contrib/usr/libexec/xtp-rs
@@ -129,11 +129,12 @@ sudo ./unsetup-xtp-rs.sh
 
 TPROXY 会把被截获的流量导入本机 input 路径，这些流永远到不了 forward hook，
 因此 **fw4 flowtable 软/硬 offload 对被代理流量无效**。开启本选项后，目的地址
-命中中国大陆 IPv4 列表的流量在 prerouting/output 中提前直连放行：国内流量
-不再被代理（更低延迟与 CPU 开销），且重新走 FORWARD 路径，offload 得以生效。
+命中中国大陆 IP 列表（IPv4 + IPv6）的流量在 prerouting/output 中提前直连放行：
+国内流量不再被代理（更低延迟与 CPU 开销），且重新走 FORWARD 路径，offload 得以生效。
 
 ```bash
-# 1. 下载并生成列表（需能访问 GitHub，或用 XTP_CHNROUTE_URL 指定镜像）
+# 1. 下载并生成列表（需能访问 GitHub，或用 XTP_CHNROUTE_URL /
+#    XTP_CHNROUTE6_URL 指定镜像）
 sudo ./update-chnroute.sh
 
 # 2. 开启开关（OpenWrt UCI；默认配置文件见 contrib/etc/config/xtp-rs）
@@ -149,8 +150,12 @@ sudo ./setup-xtp-rs.sh
 ```
 
 说明：
-- 列表文件位于 `/etc/xtp-rs/chnroute.nft`，仅 IPv4；更新后需重跑 `setup-xtp-rs.sh` 生效；
-- 文件缺失时 setup 仅告警并继续，不影响其余功能；
+- 列表文件位于 `/etc/xtp-rs/chnroute.nft`（IPv4）与
+  `/etc/xtp-rs/chnroute6.nft`（IPv6）；更新后需重跑 `setup-xtp-rs.sh` 生效；
+- IPv6 上游（`chn_ip_v6.txt`）每行为「起始地址 结束地址」区间对，脚本校验后
+  以 nft 区间元素原样写入，不做 CIDR 换算；
+- 两个地址族相互独立：任一列表缺失或下载失败只跳过对应规则/仅告警，
+  不影响其余功能；
 - 开关取值优先级：环境变量 `XTP_BYPASS_CHNROUTE` > UCI 选项 > 默认关闭。
   非 OpenWrt 环境（无 uci）直接用环境变量即可。
 
@@ -522,7 +527,7 @@ xtp-rs/
 │       ├── common.sh                   # 公共函数库
 │       ├── setup-xtp-rs.sh             # 透明代理环境安装脚本
 │       ├── unsetup-xtp-rs.sh           # 清理脚本
-│       ├── update-chnroute.sh          # 中国大陆 IPv4 直连列表更新脚本（可选）
+│       ├── update-chnroute.sh          # 中国大陆 IPv4/IPv6 直连列表更新脚本（可选）
 │       └── stats_reporter.sh           # ShadowQUIC 性能上报 daemon 主脚本
 ├── scripts/
 │   └── test_socks5_udp.py              # UDP 测试脚本
