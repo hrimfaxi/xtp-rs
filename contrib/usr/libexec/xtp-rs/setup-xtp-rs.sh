@@ -136,7 +136,7 @@ CHNROUTE_RETURN=""
 if [ "$XTP_BYPASS_CHNROUTE" = "1" ]; then
   if [ -s "$CHNROUTE_NFT_FILE" ] && grep -q '^set china_ips' "$CHNROUTE_NFT_FILE"; then
     CHNROUTE_INCLUDE="include \"${CHNROUTE_NFT_FILE}\""
-    CHNROUTE_RETURN="ip daddr @china_ips return"
+    CHNROUTE_RETURN="ip daddr @china_ips counter return"
   else
     echo "xtp-rs: warning: XTP_BYPASS_CHNROUTE=1 but $CHNROUTE_NFT_FILE is missing or invalid, bypass disabled; run update-chnroute.sh first" >&2
   fi
