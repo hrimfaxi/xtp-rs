@@ -154,6 +154,79 @@ if [ "$XTP_BYPASS_CHNROUTE" = "1" ]; then
 fi
 
 # -------------------------------------------------------------------------
+# 待代理端口配置（TCP / UDP 目的端口）
+# -------------------------------------------------------------------------
+# 默认拦截 TCP 80/443、UDP 53/443。端口列表可配置，取值优先级与
+# bypass_chnroute 相同：环境变量 XTP_TCP_PORTS / XTP_UDP_PORTS >
+# uci 选项 xtp-rs.main.tcp_ports / udp_ports（/etc/config/xtp-rs）>
+# 内置默认值。未安装 uci 的系统自动使用环境变量或内置默认值。
+# 列表为空白、逗号或分号分隔的端口号（1-65535）；非法项忽略并告警，
+# 全部无效时回退默认值，保证生成的 nft 集合永不为空。
+# 改动后需重跑本脚本（或重启 xtp-rs 服务）才会生效。
+# -------------------------------------------------------------------------
+normalize_port_list() (
+  # 在子 shell 中禁用 glob 并固定 IFS：防止用户输入的 '*' 等通配符被
+  # 展开成当前目录的文件名（如 CWD 恰有名为 443 的文件时会被误当端口），
+  # 且不污染调用方的 set -f / IFS 状态。
+  set -f
+  IFS=' '
+  _raw="$1"
+  _default="$2"
+  [ -n "$_raw" ] || _raw="$_default"
+  # 空白、制表符、换行统一为空格；逗号、分号也是合法分隔符
+  _raw="$(printf '%s\n' "$_raw" | tr ',;\t\r\n' '     ')"
+  _out=""
+  for _p in $_raw; do
+    case "$_p" in
+      *[!0-9]*|'')
+        echo "xtp-rs: warning: invalid port ignored: '$_p'" >&2
+        continue
+        ;;
+    esac
+    if [ "$_p" -lt 1 ] || [ "$_p" -gt 65535 ]; then
+      echo "xtp-rs: warning: port out of range (1-65535) ignored: $_p" >&2
+      continue
+    fi
+    # 去重（以冒号分隔暂存），保持首次出现的顺序
+    case ":$_out:" in
+      *":$_p:"*) continue ;;
+    esac
+    _out="$_out:$_p"
+  done
+  printf '%s\n' "${_out#:}" | tr ':' ' '
+)
+
+port_elements_nft() {
+  # 生成 nft set 元素串："      <port>," 每行一项（6 空格缩进）
+  for _p in $1; do
+    printf '      %s,\n' "$_p"
+  done
+}
+
+XTP_TCP_PORTS="${XTP_TCP_PORTS:-}"
+if [ -z "$XTP_TCP_PORTS" ] && command -v uci >/dev/null 2>&1; then
+  XTP_TCP_PORTS="$(uci -q get xtp-rs.main.tcp_ports || true)"
+fi
+XTP_UDP_PORTS="${XTP_UDP_PORTS:-}"
+if [ -z "$XTP_UDP_PORTS" ] && command -v uci >/dev/null 2>&1; then
+  XTP_UDP_PORTS="$(uci -q get xtp-rs.main.udp_ports || true)"
+fi
+
+XTP_TCP_PORT_LIST="$(normalize_port_list "$XTP_TCP_PORTS" "80 443")"
+if [ -z "$XTP_TCP_PORT_LIST" ]; then
+  echo "xtp-rs: warning: no valid TCP ports configured, falling back to defaults: 80 443" >&2
+  XTP_TCP_PORT_LIST="80 443"
+fi
+XTP_UDP_PORT_LIST="$(normalize_port_list "$XTP_UDP_PORTS" "53 443")"
+if [ -z "$XTP_UDP_PORT_LIST" ]; then
+  echo "xtp-rs: warning: no valid UDP ports configured, falling back to defaults: 53 443" >&2
+  XTP_UDP_PORT_LIST="53 443"
+fi
+
+TCP_PORT_ELEMENTS="$(port_elements_nft "$XTP_TCP_PORT_LIST")"
+UDP_PORT_ELEMENTS="$(port_elements_nft "$XTP_UDP_PORT_LIST")"
+
+# -------------------------------------------------------------------------
 # 1. 路由表（必须先于 rule 添加）
 # -------------------------------------------------------------------------
 # TPROXY 要求内核认为目标地址是"本机"，因此需要在独立路由表中声明
@@ -190,8 +263,9 @@ load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 # ==================================
 #
 # 本 nftables 表配合 Linux TPROXY 内核机制，实现无需修改客户端的透明
-# 流量劫持：将发往公网 TCP 80/443 的数据包重定向到本地 xtp-rs
-# 监听端口（默认 10810），由 xtp-rs 代为建立真实连接。
+# 流量劫持：将发往公网 TCP 目标端口（默认 80/443，可经 uci 配置）的
+# 数据包重定向到本地 xtp-rs 监听端口（默认 10810），由 xtp-rs 代为
+# 建立真实连接。
 #
 # -------------------------------------------------------------------------
 # 【为什么必须配置 ip rule + ip route local】
@@ -215,13 +289,14 @@ load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 # 【fwmark 1 —— 待代理流量】
 # -------------------------------------------------------------------------
 # output 链（route hook）：
-#   拦截本机进程发出的 tcp dport {80,443}，设置 fwmark=1。
+#   拦截本机进程发出的 tcp 目标端口（默认 {80,443}，uci 可配置），
+#   设置 fwmark=1。
 #   随后该包命中 ip rule → 表 100 → local route → 被 TPROXY 截获到
 #   127.0.0.1:10810 或 [::1]:10810。
 #
 # prerouting 链（mangle hook）：
 #   对于作为网关时转发的流量（或外部进入本机的流量），同样将 TCP
-#   80/443 标记 fwmark=1 并 TPROXY 到本地端口。
+#   默认端口 {80,443} 与 UDP {53,443} 标记 fwmark=1 并 TPROXY。
 #
 # -------------------------------------------------------------------------
 # 【fwmark 2 —— 已代理/绕过流量（防环路）】
@@ -249,8 +324,9 @@ load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 #
 # 【192.168.0.0/16 与 fd00::/8 特殊处理】
 # -------------------------------------------------------------------------
-# 内网 TCP 全部直连（return）；内网 UDP 仅放行非 53 端口。
-# 这样 UDP/53（DNS）仍可被代理/劫持，其余内网 UDP 直连。
+# 内网 TCP 全部直连（return）；内网 UDP 仅放行命中 xtp_udp_ports 集合的
+# 端口（默认 53/443），其余直连。这样 UDP/53（DNS）等仍可被代理/劫持。
+# 端口列表可由 uci xtp-rs.main.tcp_ports / udp_ports 自定义。
 #
 
 table inet xtp-rs {
@@ -276,6 +352,22 @@ ${RESERVED_IP_ELEMENTS}
       ::1/128,                 # Loopback
       fe80::/10,               # Link-Local
       fc00::/7,                # Unique Local Unicast (ULA)
+    }
+  }
+
+  # 待代理 TCP 目的端口（uci xtp-rs.main.tcp_ports，默认 80,443）
+  set xtp_tcp_ports {
+    type inet_service;
+    elements = {
+${TCP_PORT_ELEMENTS}
+    }
+  }
+
+  # 待代理 UDP 目的端口（uci xtp-rs.main.udp_ports，默认 53,443）
+  set xtp_udp_ports {
+    type inet_service;
+    elements = {
+${UDP_PORT_ELEMENTS}
     }
   }
 
@@ -308,16 +400,24 @@ ${CHNROUTE6_INCLUDE}
     ip daddr @reserved_ip return
     ${CHNROUTE_RETURN}
     meta l4proto tcp ip daddr 192.168.0.0/16 return
-    ip daddr 192.168.0.0/16 udp dport != 53 return
+    # 内网 UDP：命中 xtp_udp_ports 的端口继续落到下方 TPROXY 规则（DNS 等），
+    # 其余内网 UDP 直连。通过跳转子链实现"不在集合中则直连"语义：
+    #   - 子链 return 回到父链下一条规则，随即被 TPROXY；
+    #   - 子链 accept 终结本表对本包的处理（verdict 上传给父链），
+    #     与旧写法 udp dport != 53 return 等价的前提是本链 policy accept
+    #     （prerouting / output 均如此，base chain 里的 return 会落到
+    #     policy accept）；此写法不依赖集合负匹配（!= @set）这一较新的
+    #     内核语法，兼容性更好。
+    ip daddr 192.168.0.0/16 meta l4proto udp jump lan_udp_ports
     ip6 daddr @reserved_ip6 return
     ${CHNROUTE6_RETURN}
     meta l4proto tcp ip6 daddr fd00::/8 return
-    ip6 daddr fd00::/8 udp dport != 53 return
+    ip6 daddr fd00::/8 meta l4proto udp jump lan_udp_ports
 
-    meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
-    meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
-    meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
-    meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 tproxy ip6 to [::1]:10810 accept
+    meta l4proto tcp th dport @xtp_tcp_ports meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
+    meta l4proto tcp th dport @xtp_tcp_ports meta mark set 1 tproxy ip6 to [::1]:10810 accept
+    meta l4proto udp th dport @xtp_udp_ports meta mark set 1 tproxy ip to 127.0.0.1:10810 accept
+    meta l4proto udp th dport @xtp_udp_ports meta mark set 1 tproxy ip6 to [::1]:10810 accept
   }
 
   chain output {
@@ -329,13 +429,24 @@ ${CHNROUTE6_INCLUDE}
     ip daddr @reserved_ip return
     ${CHNROUTE_RETURN}
     meta l4proto tcp ip daddr 192.168.0.0/16 return
-    ip daddr 192.168.0.0/16 udp dport != 53 return
+    # 同 prerouting：内网 UDP 命中 xtp_udp_ports 才进入代理，其余直连
+    ip daddr 192.168.0.0/16 meta l4proto udp jump lan_udp_ports
     ip6 daddr @reserved_ip6 return
     ${CHNROUTE6_RETURN}
     meta l4proto tcp ip6 daddr fd00::/8 return
-    ip6 daddr fd00::/8 udp dport != 53 return
-    meta l4proto { tcp, } th dport { 80, 443, } meta mark set 1 accept
-    meta l4proto { udp, } th dport { 53, 443, } meta mark set 1 accept
+    ip6 daddr fd00::/8 meta l4proto udp jump lan_udp_ports
+    meta l4proto tcp th dport @xtp_tcp_ports meta mark set 1 accept
+    meta l4proto udp th dport @xtp_udp_ports meta mark set 1 accept
+  }
+
+  # 内网 UDP 端口判定子链（被 prerouting / output 共同调用）：
+  #   - dport ∈ xtp_udp_ports（默认含 DNS 53）→ return 回父链，
+  #     继续命中其后的 TPROXY / mark 规则；
+  #   - 其余内网 UDP → accept 终结本表处理，保持直连
+  #     （父链均 policy accept，与旧的 base-chain return 等价）。
+  chain lan_udp_ports {
+    udp dport @xtp_udp_ports counter return
+    counter accept
   }
 }
 NFTABLES

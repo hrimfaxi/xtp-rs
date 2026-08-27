@@ -8,4 +8,18 @@ config xtp_rs 'main'
 	# 改动后需重启服务或重跑 setup-xtp-rs.sh 才会生效。
 	option bypass_chnroute '0'
 
+	# 待代理的 TCP 目的端口列表（空白、逗号或分号分隔，1-65535）。
+	# UCI 路径：uci get xtp-rs.main.tcp_ports
+	# 未安装 uci 的系统可用环境变量 XTP_TCP_PORTS 覆盖；
+	# 两者均未设置时使用内置默认值。非法项忽略并告警，
+	# 全部无效时回退默认值。改动后需重启服务生效。
+	option tcp_ports '80 443'
+
+	# 待代理的 UDP 目的端口列表（格式同上）。
+	# 默认 DNS(53) 与 HTTP/3(443) 走代理，其余内网 UDP 直连；
+	# 从列表移除某端口后，该端口在内网也将改为直连。
+	# UCI 路径：uci get xtp-rs.main.udp_ports
+	# 无 uci 系统可用环境变量 XTP_UDP_PORTS 覆盖。
+	option udp_ports '53 443'
+
 # vim: set noexpandtab:
