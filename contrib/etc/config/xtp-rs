@@ -33,4 +33,29 @@ config xtp_rs 'main'
 	# 才会生效。
 	option ext_reserved_ip ''
 
+	# 源 IP 直连列表：这些源地址（如内网管理段 10.2.1.0/24）发出的流量
+	# 在 prerouting（转发流量）与 output（本机出站流量）中提前 return，
+	# 不经过 TPROXY，保持正常转发路径。
+	# UCI 路径：uci get xtp-rs.main.bypass_saddr
+	# 格式与 ext_reserved_ip 相同：空白、逗号或分号分隔的 IPv4 地址或
+	# CIDR 网段，如 '10.2.1.0/24 192.168.9.0/24'；也可用 list 语法逐条
+	# 定义，uci get 会以空格连接各条目，脚本处理方式相同。
+	# 无 uci 的系统可用环境变量 XTP_BYPASS_SADDR 覆盖。
+	# 非法项忽略并告警；默认为空。改动后需重启服务或重跑 setup-xtp-rs.sh
+	# 才会生效。
+	option bypass_saddr ''
+
+	# 按进程属主（uid）跳过代理：output 链中属主为该用户/uid 的本机出站
+	# 流量提前 return，不进入 TPROXY。防环路的替代方案——让 xtp-rs 以
+	# 专用用户运行并设置本选项，即使出站 socket 未设置 fwmark 也不会
+	# 自环。取值为用户名（如 'xtp-rs'）或数字 uid；用户名在应用规则时
+	# 解析为数字 uid，用户不存在则告警并忽略。
+	# UCI 路径：uci get xtp-rs.main.bypass_skuid
+	# 无 uci 的系统可用环境变量 XTP_BYPASS_SKUID 覆盖。
+	# 注意：uid 0（root）会放行所有 root 进程的本机出站流量，效果上
+	# 等于关闭本机出站代理，填 0 时脚本会额外告警；一般只应填专用
+	# 低权用户。数字写法的前导零会被归一化（'007' -> 7）。
+	# 默认为空（关闭）。改动后需重启服务或重跑 setup-xtp-rs.sh 才会生效。
+	option bypass_skuid ''
+
 # vim: set noexpandtab:

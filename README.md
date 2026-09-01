@@ -125,6 +125,22 @@ sudo ./unsetup-xtp-rs.sh
 >
 > 如需修改默认端口或 fwmark，可编辑 `common.sh` 中的 `XTP_TPROXY_PORT`、`XTP_FWMARK`、`XTP_BYPASS_MARK` 变量。
 
+#### UCI 选项一览（`/etc/config/xtp-rs`）
+
+所有选项位于 `xtp_rs 'main'` 段（默认模板见
+[contrib/etc/config/xtp-rs](./contrib/etc/config/xtp-rs)，各项均有注释说明）。
+改动后需重跑 `setup-xtp-rs.sh`（或重启服务）才会生效；未安装 uci 的系统
+直接用对应环境变量覆盖：
+
+| UCI 选项 | 环境变量覆盖 | 说明 |
+|----------|--------------|------|
+| `bypass_chnroute` | `XTP_BYPASS_CHNROUTE` | 中国大陆 IP 目的地址直连（见下文） |
+| `tcp_ports` | `XTP_TCP_PORTS` | 待代理 TCP 目的端口（默认 `80 443`） |
+| `udp_ports` | `XTP_UDP_PORTS` | 待代理 UDP 目的端口（默认 `53 443`） |
+| `ext_reserved_ip` | `XTP_EXT_RESERVED_IP` | 额外强制直连的目的地址（见下文） |
+| `bypass_saddr` | `XTP_BYPASS_SADDR` | 按源 IP 直连，跳过代理（见下文） |
+| `bypass_skuid` | `XTP_BYPASS_SKUID` | 按进程属主（uid）直连，防环路替代方案（见下文） |
+
 #### 可选：中国大陆 IP 直连（UCI 选项 `bypass_chnroute`）
 
 TPROXY 会把被截获的流量导入本机 input 路径，这些流永远到不了 forward hook，
@@ -158,6 +174,69 @@ sudo ./setup-xtp-rs.sh
   不影响其余功能；
 - 开关取值优先级：环境变量 `XTP_BYPASS_CHNROUTE` > UCI 选项 > 默认关闭。
   非 OpenWrt 环境（无 uci）直接用环境变量即可。
+
+#### 可选：额外直连网段（UCI 选项 `ext_reserved_ip`）
+
+在内置保留网段（RFC1918 等）之外，把指定**目的地址**强制直连（不进入
+TPROXY），例如上游 VPN 服务器 IP、内网服务器、指定公网 IP：
+
+```bash
+uci set xtp-rs.main.ext_reserved_ip='10.8.0.1 192.168.9.0/24'
+uci commit xtp-rs
+
+# 应用规则（或 /etc/init.d/xtp-rs restart）
+sudo ./setup-xtp-rs.sh
+```
+
+说明：
+- 格式：空白/逗号/分号分隔的 IPv4 地址或 CIDR 网段，也可用
+  `uci add_list xtp-rs.main.ext_reserved_ip='10.8.0.1'` 逐条添加；
+- 与内置保留网段一起写入 nftables `reserved_ip` 集合，对转发流量
+  （prerouting）与本机出站流量（output）同时生效；
+- 取值优先级：环境变量 `XTP_EXT_RESERVED_IP` > UCI 选项 > 默认为空；
+- 改动后需重跑 `setup-xtp-rs.sh`（或重启服务）生效。
+
+#### 可选：源 IP 直连（UCI 选项 `bypass_saddr`）
+
+源地址命中列表的流量（如内网管理段）在 prerouting / output 中提前 return
+直连放行，不进入 TPROXY；适合整个网段不需要代理的场景（这些流重新走
+FORWARD 路径，fw4 flowtable offload 得以生效）：
+
+```bash
+uci set xtp-rs.main.bypass_saddr='10.2.1.0/24 192.168.9.0/24'
+uci commit xtp-rs
+
+# 应用规则（或 /etc/init.d/xtp-rs restart）
+sudo ./setup-xtp-rs.sh
+```
+
+说明：
+- 格式与 `ext_reserved_ip` 相同：空白/逗号/分号分隔的 IPv4 地址或 CIDR，
+  也可用 `uci add_list xtp-rs.main.bypass_saddr='10.2.1.0/24'` 逐条添加；
+- 同时作用于转发流量（prerouting）与本机出站流量（output）；
+- 取值优先级：环境变量 `XTP_BYPASS_SADDR` > UCI 选项 > 默认为空；
+- 改动后需重跑 `setup-xtp-rs.sh`（或重启服务）生效。
+
+#### 可选：按进程属主跳过代理（UCI 选项 `bypass_skuid`）
+
+防环路的替代方案：让 xtp-rs 以专用用户运行并设置本选项后，output 链中
+属主为该用户/uid 的本机出站流量提前 return，即使出站 socket 未设置
+`fwmark` 也不会被再次劫持形成环路：
+
+```bash
+uci set xtp-rs.main.bypass_skuid='xtp-rs'   # 用户名或数字 uid
+uci commit xtp-rs
+
+# 应用规则（或 /etc/init.d/xtp-rs restart）
+sudo ./setup-xtp-rs.sh
+```
+
+说明：
+- 默认为空（关闭）；用户名在应用规则时解析为数字 uid，用户不存在则
+  告警并忽略，不影响其余规则加载；
+- 填 `0`（root）会放行**所有** root 进程的本机出站流量，效果上等于
+  关闭本机出站代理（脚本会额外告警），一般只应填专用低权用户；
+- 取值优先级：环境变量 `XTP_BYPASS_SKUID` > UCI 选项 > 默认为空。
 
 ### 2. 编写配置文件
 
