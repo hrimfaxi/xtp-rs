@@ -7,7 +7,7 @@ DEBUG="${DEBUG:-1}"
 DEBUG_LOG="${DEBUG_LOG:-/tmp/shadowquic-stats-report.debug.log}"
 SOCKET="${SOCKET:-/tmp/xtp-rs-report.sock}"
 REFRESH_INTERVAL="${REFRESH_INTERVAL:-30}"   # 刷新间隔（秒）
-REFRESH_URL="${REFRESH_URL:-http://www.google.com/}"   # 探测目标 URL
+REFRESH_URL="${REFRESH_URL:-http://cp.cloudflare.com/generate_204}"   # 探测目标 URL
 
 # REFRESH_INTERVAL 非数字、空或 0 时回退到默认值，
 # 避免 sleep 立即失败造成无间隔高速循环。
