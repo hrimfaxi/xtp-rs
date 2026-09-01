@@ -22,4 +22,15 @@ config xtp_rs 'main'
 	# 无 uci 系统可用环境变量 XTP_UDP_PORTS 覆盖。
 	option udp_ports '53 443'
 
+	# 额外保留 IP / 强制直连地址列表：追加进 nftables reserved_ip 集合，
+	# 这些目的地址不经过透明代理（如上游 VPN IP、内网服务器、指定公网 IP）。
+	# UCI 路径：uci get xtp-rs.main.ext_reserved_ip
+	# 格式：空白、逗号或分号分隔的 IPv4 地址或 CIDR 网段，
+	# 如 '10.8.0.1 192.168.9.0/24'；也可用 list 语法逐条定义，
+	# uci get 会以空格连接各条目，脚本处理方式相同。
+	# 无 uci 的系统可用环境变量 XTP_EXT_RESERVED_IP 覆盖。
+	# 非法项忽略并告警；默认为空。改动后需重启服务或重跑 setup-xtp-rs.sh
+	# 才会生效。
+	option ext_reserved_ip ''
+
 # vim: set noexpandtab:

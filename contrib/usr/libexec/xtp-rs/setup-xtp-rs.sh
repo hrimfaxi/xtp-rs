@@ -69,10 +69,96 @@ LOCAL_IPV4_ENTRIES="$(
     | sort -u
 )"
 
-# 定义外部文件路径
-EXT_RESERVED_IP_FILE="${EXT_RESERVED_IP_FILE:-$(dirname "$0")/ext_reserved_ip}"
+# -------------------------------------------------------------------------
+# 额外保留 IP（追加进 reserved_ip 集合，强制直连）
+# -------------------------------------------------------------------------
+# 在下方内置保留网段之外，允许用户追加自定义直连地址（如上游 VPN IP、
+# 内网服务器、指定公网 IP），这些目的地址不进入 TPROXY。
+# 取值优先级与 tcp_ports / udp_ports 相同：环境变量 XTP_EXT_RESERVED_IP >
+# uci 选项 xtp-rs.main.ext_reserved_ip（/etc/config/xtp-rs）> 默认为空。
+# 格式：空白、逗号或分号分隔的 IPv4 地址或 CIDR 网段（如 192.168.9.0/24）；
+# UCI 侧也可用 list 语法逐条定义（uci get 会以空格连接各条目，处理方式
+# 相同）。非法项忽略并告警。改动后需重跑本脚本（或重启服务）才会生效。
+# -------------------------------------------------------------------------
+XTP_EXT_RESERVED_IP="${XTP_EXT_RESERVED_IP:-}"
+if [ -z "$XTP_EXT_RESERVED_IP" ] && command -v uci >/dev/null 2>&1; then
+  XTP_EXT_RESERVED_IP="$(uci -q get xtp-rs.main.ext_reserved_ip || true)"
+fi
 
-# 构建 reserved_ip 元素列表（静态 + 动态）
+# 校验 IPv4 地址或 CIDR 网段：点分十进制 4 组八位组 + 可选 /0-32 前缀。
+# 拒绝非法字符、越界值与前导零，杜绝任意内容注入 nft 规则。
+# 仅应在已 set -f 的上下文中调用（见 normalize_ip_cidr_list）。
+is_valid_ipv4_cidr() {
+  _in="$1"
+  # 字符白名单：仅数字、点、斜杠合法（空白、字母、符号一律拒绝）
+  case "$_in" in
+    *[!0-9./]*|'') return 1 ;;
+  esac
+  _addr="${_in%%/*}"
+  _tail="${_in#*/}"
+  # 不含 '/' 时 ${_in#*/} 原样返回（_tail == _in），视为无前缀；
+  # 含多个 '/' 时 _tail 中仍有 '/'，非法
+  case "$_tail" in
+    */*) return 1 ;;
+  esac
+  [ -n "$_addr" ] || return 1
+  # 地址部分：恰好 4 个 0-255 的八位组，无前导零（"0" 合法，"01" 非法）
+  _octets="$(printf '%s\n' "$_addr" | tr '.' ' ')"
+  _n=0
+  for _o in $_octets; do
+    case "$_o" in
+      *[!0-9]*|'') return 1 ;;
+      [0-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+      *) return 1 ;;
+    esac
+    [ "$_o" -le 255 ] || return 1
+    _n=$((_n + 1))
+  done
+  [ "$_n" -eq 4 ] || return 1
+  # 前缀部分（可选）：0-32
+  if [ "$_tail" != "$_in" ]; then
+    case "$_tail" in
+      [0-9]|[12][0-9]|3[0-2]) ;;
+      *) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+# 归一化 IPv4 地址 / CIDR 列表：非法项告警并丢弃，去重后以空格分隔输出
+normalize_ip_cidr_list() (
+  # 在子 shell 中禁用 glob 并固定 IFS：防止用户输入的 '*' 等通配符在
+  # for 展开时被替换成当前目录的文件名，且不污染调用方的 set -f / IFS 状态。
+  set -f
+  IFS=' '
+  _raw="$1"
+  [ -n "$_raw" ] || return 0
+  # 空白、制表符、换行统一为空格；逗号、分号也是合法分隔符
+  _raw="$(printf '%s\n' "$_raw" | tr ',;\t\r\n' '     ')"
+  _out=""
+  for _e in $_raw; do
+    if ! is_valid_ipv4_cidr "$_e"; then
+      echo "xtp-rs: warning: invalid IPv4 address/CIDR ignored: '$_e'" >&2
+      continue
+    fi
+    # 去重（以冒号分隔暂存），保持首次出现的顺序
+    case ":$_out:" in
+      *":$_e:"*) continue ;;
+    esac
+    _out="$_out:$_e"
+  done
+  printf '%s\n' "${_out#:}" | tr ':' ' '
+)
+
+# 生成 nft set 元素串："      <item>," 每行一项（6 空格缩进）。
+# 入参须为 normalize_* 归一化后的空格分隔列表。
+set_elements_nft() {
+  for _p in $1; do
+    printf '      %s,\n' "$_p"
+  done
+}
+
+# 构建 reserved_ip 元素列表（内置保留网段 + 用户追加的 ext_reserved_ip）
 # ==============================================================
 # 私有地址、保留地址、以及需要直连（不经过代理）的特定服务器 IP
 # ==============================================================
@@ -85,24 +171,11 @@ RESERVED_IP_ELEMENTS="      10.0.0.0/8,
       224.0.0.0/4,
       240.0.0.0/4,"
 
-if [ -f "$EXT_RESERVED_IP_FILE" ]; then
-  while IFS= read -r line || [ -n "$line" ]; do
-    # 去除首尾空白
-    line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    # 跳过空行和注释行
-    case "$line" in
-      ''|'#'*) continue ;;
-    esac
-    # 若行末没有逗号则添加
-    [ "${line%,}" = "$line" ] && line="$line,"
-    # 追加到列表，保持缩进（6个空格）
-    RESERVED_IP_ELEMENTS="$RESERVED_IP_ELEMENTS
-      $line"
-  done < "$EXT_RESERVED_IP_FILE"
+EXT_RESERVED_IP_LIST="$(normalize_ip_cidr_list "$XTP_EXT_RESERVED_IP")"
+if [ -n "$EXT_RESERVED_IP_LIST" ]; then
+  RESERVED_IP_ELEMENTS="$RESERVED_IP_ELEMENTS
+$(set_elements_nft "$EXT_RESERVED_IP_LIST")"
 fi
-
-# ----- 关键：移除所有完全空的行，确保 nftables 集合元素列表不含空行 -----
-RESERVED_IP_ELEMENTS="$(echo "$RESERVED_IP_ELEMENTS" | grep -v '^[[:space:]]*$')"
 
 # -------------------------------------------------------------------------
 # 可选：中国大陆 IP（IPv4 + IPv6）目的地址直连（不经过 TPROXY）
@@ -196,13 +269,6 @@ normalize_port_list() (
   printf '%s\n' "${_out#:}" | tr ':' ' '
 )
 
-port_elements_nft() {
-  # 生成 nft set 元素串："      <port>," 每行一项（6 空格缩进）
-  for _p in $1; do
-    printf '      %s,\n' "$_p"
-  done
-}
-
 XTP_TCP_PORTS="${XTP_TCP_PORTS:-}"
 if [ -z "$XTP_TCP_PORTS" ] && command -v uci >/dev/null 2>&1; then
   XTP_TCP_PORTS="$(uci -q get xtp-rs.main.tcp_ports || true)"
@@ -223,8 +289,8 @@ if [ -z "$XTP_UDP_PORT_LIST" ]; then
   XTP_UDP_PORT_LIST="53 443"
 fi
 
-TCP_PORT_ELEMENTS="$(port_elements_nft "$XTP_TCP_PORT_LIST")"
-UDP_PORT_ELEMENTS="$(port_elements_nft "$XTP_UDP_PORT_LIST")"
+TCP_PORT_ELEMENTS="$(set_elements_nft "$XTP_TCP_PORT_LIST")"
+UDP_PORT_ELEMENTS="$(set_elements_nft "$XTP_UDP_PORT_LIST")"
 
 # -------------------------------------------------------------------------
 # 1. 路由表（必须先于 rule 添加）
@@ -319,8 +385,9 @@ load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 # -------------------------------------------------------------------------
 # 【保留地址（reserved_ip / reserved_ip6）】
 # -------------------------------------------------------------------------
-# RFC1918 私有网段、链路本地地址、环回地址，以及用户指定的直连服务器
-# IP，均不应进入代理，否则会导致内网服务不可达或流量绕远。
+# RFC1918 私有网段、链路本地地址、环回地址，以及用户通过 uci 选项
+# xtp-rs.main.ext_reserved_ip 追加的直连网段，均不应进入代理，否则会
+# 导致内网服务不可达或流量绕远。
 #
 # 【192.168.0.0/16 与 fd00::/8 特殊处理】
 # -------------------------------------------------------------------------
