@@ -558,10 +558,10 @@ async fn run_direct_udp_recv_loop(
     let mut buf = new_udp_buf();
     let _ = ready_tx.send(());
 
-    let idle_timeout_secs = state.config.udp_session_idle_timeout_secs;
-    let idle_deadline = make_idle_deadline(idle_timeout_secs);
-    tokio::pin!(idle_deadline);
-
+    // direct 出站不挂回包看门狗：socket 无状态，长时间无回包多半是单向流
+    // 或安静服务端，属正常现象；生命周期统一交给 GC loop 的双向空闲清理
+    // （udp_session_timeout_secs）。回包静默看门狗仅用于 SOCKS5 relay
+    // （run_socks5_udp_recv_loop），检测失效的僵尸 relay session。
     loop {
         reset_udp_buf(&mut buf);
         tokio::select! {
@@ -572,16 +572,6 @@ async fn run_direct_udp_recv_loop(
                     client = %key.client_addr,
                     target = %key.target_addr,
                     "direct UDP recv loop cancelled"
-                );
-                return Ok(());
-            }
-            _ = &mut idle_deadline, if idle_timeout_secs > 0 => {
-                warn!(
-                    kind = ?key.kind,
-                    client = %key.client_addr,
-                    target = %key.target_addr,
-                    timeout_secs = idle_timeout_secs,
-                    "direct UDP session idle timeout, cancelling"
                 );
                 return Ok(());
             }
@@ -597,7 +587,6 @@ async fn run_direct_udp_recv_loop(
                 };
 
                 session.touch();
-                reset_idle_deadline(idle_deadline.as_mut(), idle_timeout_secs);
 
                 let payload = &buf[..n];
 
@@ -630,7 +619,7 @@ async fn run_socks5_udp_recv_loop(
 
     // 空闲超时：每次收到回包后重置。如果在指定时间内没收到任何回包，
     // 说明 SOCKS5 UDP relay 可能失效，主动取消 session 以便客户端快速重试。
-    let idle_timeout_secs = state.config.udp_session_idle_timeout_secs;
+    let idle_timeout_secs = state.config.socks5_udp_reply_watchdog_secs;
     let idle_deadline = make_idle_deadline(idle_timeout_secs);
     tokio::pin!(idle_deadline);
     let mut recv_count: u64 = 0;

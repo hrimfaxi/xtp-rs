@@ -171,9 +171,11 @@ pub struct Config {
     #[serde(default = "default_udp_session_timeout_secs")]
     /// UDP 会话空闲超时时间，单位秒。
     ///
-    /// 超时后会清理：
+    /// 按双向活动判定：客户端发包和上游回包都会续期。超时后由 GC loop 清理：
     /// - UDP 会话状态
     /// - 用于伪造源地址回包的 fake UDP socket
+    ///
+    /// 对 direct 出站这是唯一的生命周期机制（无回包看门狗）。
     pub udp_session_timeout_secs: u64,
 
     #[serde(default = "default_connect_timeout_secs")]
@@ -228,12 +230,26 @@ pub struct Config {
     /// 设为 0 时 pending 创建即失效，行为退化为近似 besteffort。
     pub quic_sniff_pending_timeout_ms: u64,
 
-    #[serde(default = "default_udp_session_idle_timeout_secs")]
-    /// UDP session 建立后，如果在此时间内没收到任何回包，主动取消 session。
+    #[serde(
+        default = "default_socks5_udp_reply_watchdog_secs",
+        alias = "udp_session_idle_timeout_secs"
+    )]
+    /// SOCKS5 UDP relay 回包静默看门狗：session 建立后，如果在此时间内没收到
+    /// 任何回包，主动取消 session，让客户端下一个包触发重建（重新 ASSOCIATE），
+    /// 用于检测失效的僵尸 relay session。
     ///
-    /// 用于检测 SOCKS5 UDP relay 失效的僵尸 session。
-    /// 设为 0 则禁用此超时（仅依赖 udp_session_timeout_secs 清理）。
-    pub udp_session_idle_timeout_secs: u64,
+    /// 仅对 SOCKS5 出站生效；direct 出站不挂此看门狗，生命周期由
+    /// `udp_session_timeout_secs` 的双向空闲 GC 管理。
+    ///
+    /// 取值必须大于最大健康回包间隔：QUIC PING / WireGuard keepalive 的常见
+    /// 约定落在 15~30s，因此默认 31（30s 约定 + 余量）。调小会周期性误杀
+    /// 稀疏 keepalive 流（每 churn 重做一次 UDP ASSOCIATE），调大则 relay
+    /// 失效后自愈变慢。
+    /// 设为 0 则禁用此超时。注意：客户端持续发包会刷新 udp_session_timeout_secs
+    /// 的 last_seen，单向活跃的僵尸 relay session 只有此看门狗能清理，不建议禁用。
+    ///
+    /// 旧名 `udp_session_idle_timeout_secs` 保留为兼容 alias，建议迁移到新名。
+    pub socks5_udp_reply_watchdog_secs: u64,
 
     #[serde(default = "default_tcp_peek_buffer_size")]
     /// TCP 首包 sniff 使用的全局 peek 缓冲区上限。
@@ -555,7 +571,7 @@ pub fn default_fwmark() -> u32 {
 }
 
 pub fn default_udp_session_timeout_secs() -> u64 {
-    60
+    120
 }
 
 pub fn default_connect_timeout_secs() -> u64 {
@@ -574,8 +590,8 @@ pub fn default_sniff_http_host() -> bool {
     false
 }
 
-pub fn default_udp_session_idle_timeout_secs() -> u64 {
-    5
+pub fn default_socks5_udp_reply_watchdog_secs() -> u64 {
+    31
 }
 
 pub fn default_quic_sniff_pending_timeout_ms() -> u64 {
@@ -910,13 +926,13 @@ mod tests {
             socks5_password: None,
             fwmark: 2,
             mmdb_path: None,
-            udp_session_timeout_secs: 60,
+            udp_session_timeout_secs: 120,
             splice: false,
             sniff_tls_sni: false,
             sniff_http_host: false,
             quic_sniff_mode: QuicSniffMode::None,
             quic_sniff_pending_timeout_ms: 200,
-            udp_session_idle_timeout_secs: 5,
+            socks5_udp_reply_watchdog_secs: 31,
             tcp_peek_buffer_size: 32 * 1024,
             tls_sniff_peek_len: 2048,
             tls_sniff_max_len: 32 * 1024,
@@ -1150,6 +1166,28 @@ mod tests {
             let toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"\ngain = 2.5";
             let cfg: super::Config = toml::from_str(toml).unwrap();
             assert_eq!(cfg.upstream[0].gain, 2.5);
+        }
+
+        #[test]
+        fn deserialize_socks5_udp_reply_watchdog_default() {
+            let toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            let cfg: super::Config = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.socks5_udp_reply_watchdog_secs, 31);
+        }
+
+        #[test]
+        fn deserialize_socks5_udp_reply_watchdog_legacy_alias() {
+            // TOML 规则：顶层键必须放在 [[upstream]] 表头之前
+            let toml = "udp_session_idle_timeout_secs = 5\n[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            let cfg: super::Config = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.socks5_udp_reply_watchdog_secs, 5);
+        }
+
+        #[test]
+        fn deserialize_socks5_udp_reply_watchdog_new_name() {
+            let toml = "socks5_udp_reply_watchdog_secs = 40\n[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            let cfg: super::Config = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.socks5_udp_reply_watchdog_secs, 40);
         }
 
         #[test]

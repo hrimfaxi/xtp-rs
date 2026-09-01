@@ -28,9 +28,10 @@ fwmark = 2
 # 默认值：None
 mmdb_path = "/etc/xtp-rs/Country-only-cn-private.mmdb"
 
-# UDP 会话空闲超时（秒）
-# 默认值：60
-udp_session_timeout_secs = 60
+# UDP 会话空闲超时（秒）。按双向活动判定（客户端发包/上游回包都续期），
+# 由 GC loop 清理会话状态和 fake UDP socket；对 direct 出站是唯一的生命周期机制
+# 默认值：120
+udp_session_timeout_secs = 120
 
 # TCP 转发是否优先使用 splice 零拷贝
 # 默认值：false
@@ -113,10 +114,14 @@ quic_sniff_mode = "none"
 #   旧 sniff_quic_sni = true  →  quic_sniff_mode = "full"
 #   旧 sniff_quic_sni = false →  quic_sniff_mode = "none"
 
-# UDP session 建立后，如果在此时间内没收到任何回包，主动取消 session。
-# 用于检测 SOCKS5 UDP relay 失效的僵尸 session，避免等待整个 udp_session_timeout。
-# 设为 0 则禁用（仅依赖 udp_session_timeout_secs 清理）。
-# udp_session_idle_timeout_secs = 5
+# SOCKS5 UDP relay 回包静默看门狗（仅对 SOCKS5 出站生效；direct 出站无看门狗）。
+# session 建立后在此时间内没收到任何回包则取消 session，让客户端下一个包
+# 触发重建（重新 ASSOCIATE），用于检测失效的僵尸 relay session。
+# 取值必须大于最大健康回包间隔（QUIC PING / WireGuard keepalive 常见 15~30s），
+# 调小会周期性误杀稀疏 keepalive 流。设为 0 禁用（不推荐：单向活跃的僵尸
+# relay session 不会被 udp_session_timeout_secs 清理，会无限存活）。
+# 旧名 udp_session_idle_timeout_secs 仍被接受（兼容 alias），建议迁移到新名。
+# socks5_udp_reply_watchdog_secs = 31
 
 # -------------------------------
 # 全局 peek 缓冲区
