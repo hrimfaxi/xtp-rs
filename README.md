@@ -574,6 +574,7 @@ addr = "192.168.1.100:1080"     # SOCKS5 地址
 - `client_domain_routes`：按客户端源 IP + 域名模式分配分组，优先级高于 `client_routes`；
 - `client_dst_ip_routes`：按客户端源 IP + 目的 IP/CIDR 分配分组，优先级最高；
 - 域名匹配按后缀长度降序优先匹配，确保最长匹配优先；
+- 同一客户端命中多张 `client_domain_routes` 表（如同时匹配 `/32` 与 `/24`）时，按客户端前缀从长到短逐表查找，首个域名命中生效：更具体的表只覆盖它显式列出的域名，未列出的域名回退到更宽网段的表；
 - 分组查找顺序：`client_dst_ip_routes → client_domain_routes → client_routes → default`。
 
 ### 端口转发

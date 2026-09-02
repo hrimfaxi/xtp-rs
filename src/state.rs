@@ -106,6 +106,31 @@ impl<T: Clone> ClientCidrRoutes<T> {
                 .map(|(_, v)| v),
         }
     }
+
+    /// 按前缀长度从长到短遍历所有包含 `ip` 的网段对应的值。
+    ///
+    /// 与 [`Self::lookup`]（最长前缀单命中）不同，命中更具体的网段后
+    /// 仍会继续产出更宽网段的值，供调用方做"逐表回退"式查找，
+    /// 例如：`/32` 表只覆盖它显式列出的域名，未列出的域名回退到 `/24` 表。
+    ///
+    /// 顺序保证与 [`Self::lookup`] 的优先级一样，依赖 [`Self::finalize`]
+    /// 的前缀长度排序，须先调用。站点级路由表条目极少，线性扫描开销可忽略。
+    pub fn iter_matching(&self, ip: IpAddr) -> Box<dyn Iterator<Item = &T> + '_> {
+        match ip {
+            IpAddr::V4(ip) => Box::new(
+                self.v4
+                    .iter()
+                    .filter(move |(net, _)| net.contains(&ip))
+                    .map(|(_, v)| v),
+            ),
+            IpAddr::V6(ip) => Box::new(
+                self.v6
+                    .iter()
+                    .filter(move |(net, _)| net.contains(&ip))
+                    .map(|(_, v)| v),
+            ),
+        }
+    }
 }
 
 /// 客户端 IP 路由表：基于 CIDR 最长前缀匹配，映射到 upstream 分组名。
@@ -431,7 +456,8 @@ impl AppState {
     /// 根据客户端 IP、目的 IP 和可选域名查找 upstream group。
     ///
     /// 优先级：目的 IP 路由 client_dst_ip_routes > 域名路由 client_domain_routes
-    /// （仅在提供域名时）> 客户端 IP 路由 client_routes > "default"。
+    /// （仅在提供域名时；客户端前缀从长到短逐表查找，首个域名命中即胜出，
+    /// 更具体的网段只覆盖它显式列出的域名）> 客户端 IP 路由 client_routes > "default"。
     pub fn lookup_upstream_group(
         &self,
         client_ip: IpAddr,
@@ -449,8 +475,8 @@ impl AppState {
         if let Some(domain_str) = domain {
             self.runtime
                 .client_domain_routes
-                .lookup(client_ip)
-                .and_then(|t| t.lookup(domain_str))
+                .iter_matching(client_ip)
+                .find_map(|t| t.lookup(domain_str))
                 .or_else(|| {
                     self.runtime
                         .client_routes
@@ -1598,6 +1624,159 @@ mod tests {
                 .lookup("192.168.2.42".parse::<IpAddr>().unwrap())
                 .and_then(|t| t.lookup("youtube.com")),
             Some("broad")
+        );
+    }
+
+    /// 回归测试：客户端同时命中 /32 与 /24 两张 client_domain_routes 表时，
+    /// /32 表只覆盖它显式列出的域名，未列出的域名应回退到 /24 表，
+    /// 而不是整体落入 "default"（曾导致 gemini.google.com 不走 gemini 组）。
+    #[test]
+    fn lookup_upstream_group_domain_falls_back_across_client_prefixes() {
+        let mut state = minimal_app_state();
+
+        let mut domain_routes = ClientDomainRoutes::new();
+        domain_routes.insert(
+            "192.168.1.42/32".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact: HashMap::new(),
+                suffixes: vec![("youtube.com".to_string(), "narrow".to_string())],
+            },
+        );
+        domain_routes.insert(
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact: HashMap::new(),
+                suffixes: vec![("google.com".to_string(), "broad".to_string())],
+            },
+        );
+        domain_routes.finalize();
+
+        state.runtime = Arc::new(AppRuntime {
+            proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
+            udp: Arc::clone(&state.runtime.udp),
+            client_routes: ClientIpRoutes::new(),
+            client_domain_routes: domain_routes,
+            client_dst_ip_routes: ClientDstIpRoutes::new(),
+        });
+
+        let shadowed = "192.168.1.42".parse::<IpAddr>().unwrap();
+        let unshadowed = "192.168.1.100".parse::<IpAddr>().unwrap();
+        let dst = "8.8.8.8".parse::<IpAddr>().unwrap();
+
+        // /32 表未列出的域名回退到 /24 表
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, dst, Some("gemini.google.com")),
+            "broad"
+        );
+        // /32 表显式列出的域名按 /32 表生效（更具体的覆盖更宽的）
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, dst, Some("www.youtube.com")),
+            "narrow"
+        );
+        // 两表都未列出 → default
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, dst, Some("example.com")),
+            "default"
+        );
+        // 只命中 /24 的客户端不受影响
+        assert_eq!(
+            state.lookup_upstream_group(unshadowed, dst, Some("gemini.google.com")),
+            "broad"
+        );
+    }
+
+    /// iter_matching 的产出顺序必须按前缀长度从长到短——这是
+    /// "首个域名命中即胜出"回退语义的前提。以乱序插入构造，
+    /// 验证 finalize() 排序后 v4/v6 两个分支的顺序保证，且不产出无关网段。
+    #[test]
+    fn client_cidr_routes_iter_matching_yields_longest_prefix_first() {
+        let mut routes = ClientIpRoutes::new();
+        // 乱序插入：先宽后窄，再插不相关网段
+        routes.insert(
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+            "broad24".to_string(),
+        );
+        routes.insert(
+            "192.168.1.42/32".parse::<IpNet>().unwrap(),
+            "narrow32".to_string(),
+        );
+        routes.insert(
+            "10.0.0.0/8".parse::<IpNet>().unwrap(),
+            "unrelated".to_string(),
+        );
+        routes.insert(
+            "2001:db8:1::/48".parse::<IpNet>().unwrap(),
+            "v6broad48".to_string(),
+        );
+        routes.insert(
+            "2001:db8:1:1::5/128".parse::<IpNet>().unwrap(),
+            "v6narrow128".to_string(),
+        );
+        routes.finalize();
+
+        let v4 = "192.168.1.42".parse::<IpAddr>().unwrap();
+        let got: Vec<&str> = routes.iter_matching(v4).map(|s| s.as_str()).collect();
+        assert_eq!(got, ["narrow32", "broad24"]);
+
+        let v6 = "2001:db8:1:1::5".parse::<IpAddr>().unwrap();
+        let got: Vec<&str> = routes.iter_matching(v6).map(|s| s.as_str()).collect();
+        assert_eq!(got, ["v6narrow128", "v6broad48"]);
+    }
+
+    /// 同 lookup_upstream_group_domain_falls_back_across_client_prefixes，
+    /// 覆盖 IPv6 分支（v6 客户端前缀遮蔽同样需要跨表回退）。
+    #[test]
+    fn lookup_upstream_group_domain_falls_back_across_client_prefixes_v6() {
+        let mut state = minimal_app_state();
+
+        let mut domain_routes = ClientDomainRoutes::new();
+        domain_routes.insert(
+            "2001:db8:1:1::5/128".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact: HashMap::new(),
+                suffixes: vec![("youtube.com".to_string(), "narrow".to_string())],
+            },
+        );
+        domain_routes.insert(
+            "2001:db8:1::/48".parse::<IpNet>().unwrap(),
+            DomainRouteTable {
+                exact: HashMap::new(),
+                suffixes: vec![("google.com".to_string(), "broad".to_string())],
+            },
+        );
+        domain_routes.finalize();
+
+        state.runtime = Arc::new(AppRuntime {
+            proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
+            udp: Arc::clone(&state.runtime.udp),
+            client_routes: ClientIpRoutes::new(),
+            client_domain_routes: domain_routes,
+            client_dst_ip_routes: ClientDstIpRoutes::new(),
+        });
+
+        let shadowed = "2001:db8:1:1::5".parse::<IpAddr>().unwrap();
+        let unshadowed = "2001:db8:1:2::5".parse::<IpAddr>().unwrap();
+        let dst = "2001:4860:4860::8888".parse::<IpAddr>().unwrap();
+
+        // /128 表未列出的域名回退到 /48 表
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, dst, Some("gemini.google.com")),
+            "broad"
+        );
+        // /128 表显式列出的域名按 /128 表生效
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, dst, Some("www.youtube.com")),
+            "narrow"
+        );
+        // 两表都未列出 → default
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, dst, Some("example.com")),
+            "default"
+        );
+        // 只命中 /48 的客户端不受影响
+        assert_eq!(
+            state.lookup_upstream_group(unshadowed, dst, Some("gemini.google.com")),
+            "broad"
         );
     }
 
