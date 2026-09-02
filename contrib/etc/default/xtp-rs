@@ -1,0 +1,8 @@
+# 是否绕过中国路由（直连），默认不开启
+# XTP_BYPASS_CHNROUTE=1
+
+# 指定需要送往 TPROXY 的 TCP 端口（空格分隔）
+# XTP_TCP_PORTS=22 80 443
+
+# 指定需要送往 TPROXY 的 UDP 端口（空格分隔）
+# XTP_UDP_PORTS=443

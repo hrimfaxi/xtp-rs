@@ -9,6 +9,9 @@ ConditionFileNotEmpty=/etc/xtp-rs/config.toml
 [Service]
 Type=simple
 
+# ========== 可选的环境文件 ==========
+EnvironmentFile=-/etc/default/xtp-rs
+
 # ========== 启动前配置检查 ==========
 # 失败则中止启动，避免带错配置反复 respawn
 ExecStartPre=/usr/bin/xtp-rs --check -c /etc/xtp-rs/config.toml
