@@ -107,28 +107,36 @@ impl<T: Clone> ClientCidrRoutes<T> {
         }
     }
 
-    /// 按前缀长度从长到短遍历所有包含 `ip` 的网段对应的值。
+    /// 按前缀长度从长到短遍历所有包含 `ip` 的网段，对每个值执行 `f`，
+    /// 返回首个非 `None` 结果（"逐表回退"式查找，命中即短路）。
     ///
-    /// 与 [`Self::lookup`]（最长前缀单命中）不同，命中更具体的网段后
-    /// 仍会继续产出更宽网段的值，供调用方做"逐表回退"式查找，
-    /// 例如：`/32` 表只覆盖它显式列出的域名，未列出的域名回退到 `/24` 表。
+    /// 与 [`Self::lookup`]（最长前缀单命中）不同，命中更具体的网段后若
+    /// `f` 返回 `None`，仍会继续尝试更宽网段的值，例如：`/32` 表只覆盖
+    /// 它显式列出的域名，未列出的域名回退到 `/24` 表。
     ///
     /// 顺序保证与 [`Self::lookup`] 的优先级一样，依赖 [`Self::finalize`]
-    /// 的前缀长度排序，须先调用。站点级路由表条目极少，线性扫描开销可忽略。
-    pub fn iter_matching(&self, ip: IpAddr) -> Box<dyn Iterator<Item = &T> + '_> {
+    /// 的前缀长度排序，须先调用。闭包静态派发、迭代器全程在栈上、无堆
+    /// 分配，适合代理热路径。站点级路由表条目极少，线性扫描开销可忽略。
+    ///
+    /// 闭包参数生命周期须绑定到 `&self`：`f` 返回的引用允许从表中借用
+    /// （如 `|t| t.lookup(domain)` 返回 `&str`）。若写成高阶签名
+    /// `impl FnMut(&T) -> Option<R>`，`R` 无法捕获高阶区域，该形态编译不过。
+    pub fn find_map_matching<'a, R>(
+        &'a self,
+        ip: IpAddr,
+        mut f: impl FnMut(&'a T) -> Option<R>,
+    ) -> Option<R> {
         match ip {
-            IpAddr::V4(ip) => Box::new(
-                self.v4
-                    .iter()
-                    .filter(move |(net, _)| net.contains(&ip))
-                    .map(|(_, v)| v),
-            ),
-            IpAddr::V6(ip) => Box::new(
-                self.v6
-                    .iter()
-                    .filter(move |(net, _)| net.contains(&ip))
-                    .map(|(_, v)| v),
-            ),
+            IpAddr::V4(ip) => self
+                .v4
+                .iter()
+                .filter(|(net, _)| net.contains(&ip))
+                .find_map(|(_, v)| f(v)),
+            IpAddr::V6(ip) => self
+                .v6
+                .iter()
+                .filter(|(net, _)| net.contains(&ip))
+                .find_map(|(_, v)| f(v)),
         }
     }
 }
@@ -456,8 +464,13 @@ impl AppState {
     /// 根据客户端 IP、目的 IP 和可选域名查找 upstream group。
     ///
     /// 优先级：目的 IP 路由 client_dst_ip_routes > 域名路由 client_domain_routes
-    /// （仅在提供域名时；客户端前缀从长到短逐表查找，首个域名命中即胜出，
-    /// 更具体的网段只覆盖它显式列出的域名）> 客户端 IP 路由 client_routes > "default"。
+    /// （仅在提供域名时）> 客户端 IP 路由 client_routes > "default"。
+    ///
+    /// client_dst_ip_routes 与 client_domain_routes 均为"客户端前缀从长到短
+    /// 逐表查找，首个内层命中即胜出"：更具体的客户端网段只覆盖它显式列出的
+    /// 目的 IP / 域名，未列出的回退到更宽网段的表（如 /32 未命中回退 /24）。
+    /// client_routes 的值是叶子分组名，不存在"内层未命中"，
+    /// 最长前缀单命中即最终结果。
     pub fn lookup_upstream_group(
         &self,
         client_ip: IpAddr,
@@ -467,16 +480,14 @@ impl AppState {
         if let Some(group) = self
             .runtime
             .client_dst_ip_routes
-            .lookup(client_ip)
-            .and_then(|t| t.lookup(dst_ip))
+            .find_map_matching(client_ip, |t| t.lookup(dst_ip))
         {
             return group.as_str();
         }
         if let Some(domain_str) = domain {
             self.runtime
                 .client_domain_routes
-                .iter_matching(client_ip)
-                .find_map(|t| t.lookup(domain_str))
+                .find_map_matching(client_ip, |t| t.lookup(domain_str))
                 .or_else(|| {
                     self.runtime
                         .client_routes
@@ -1685,11 +1696,11 @@ mod tests {
         );
     }
 
-    /// iter_matching 的产出顺序必须按前缀长度从长到短——这是
-    /// "首个域名命中即胜出"回退语义的前提。以乱序插入构造，
-    /// 验证 finalize() 排序后 v4/v6 两个分支的顺序保证，且不产出无关网段。
+    /// find_map_matching 必须按前缀长度从长到短访问匹配的网段——这是
+    /// "首个命中即胜出"回退语义的前提。以乱序插入构造，验证 finalize()
+    /// 排序后 v4/v6 两个分支的访问顺序、不访问无关网段，以及命中后短路。
     #[test]
-    fn client_cidr_routes_iter_matching_yields_longest_prefix_first() {
+    fn client_cidr_routes_find_map_matching_visits_longest_prefix_first() {
         let mut routes = ClientIpRoutes::new();
         // 乱序插入：先宽后窄，再插不相关网段
         routes.insert(
@@ -1715,12 +1726,40 @@ mod tests {
         routes.finalize();
 
         let v4 = "192.168.1.42".parse::<IpAddr>().unwrap();
-        let got: Vec<&str> = routes.iter_matching(v4).map(|s| s.as_str()).collect();
-        assert_eq!(got, ["narrow32", "broad24"]);
+        // 永不命中：记录完整访问顺序
+        let mut visited = Vec::new();
+        let hit = routes.find_map_matching(v4, |s| {
+            visited.push(s.as_str());
+            None::<&str>
+        });
+        assert_eq!(hit, None);
+        assert_eq!(visited, ["narrow32", "broad24"]);
+
+        // 首个（最长前缀）命中即短路，不再访问更宽网段
+        let mut visited = Vec::new();
+        let hit = routes.find_map_matching(v4, |s| {
+            visited.push(s.as_str());
+            Some(s.as_str())
+        });
+        assert_eq!(hit, Some("narrow32"));
+        assert_eq!(visited, ["narrow32"]);
 
         let v6 = "2001:db8:1:1::5".parse::<IpAddr>().unwrap();
-        let got: Vec<&str> = routes.iter_matching(v6).map(|s| s.as_str()).collect();
-        assert_eq!(got, ["v6narrow128", "v6broad48"]);
+        let mut visited = Vec::new();
+        let hit = routes.find_map_matching(v6, |s| {
+            visited.push(s.as_str());
+            None::<&str>
+        });
+        assert_eq!(hit, None);
+        assert_eq!(visited, ["v6narrow128", "v6broad48"]);
+
+        let mut visited = Vec::new();
+        let hit = routes.find_map_matching(v6, |s| {
+            visited.push(s.as_str());
+            Some(s.as_str())
+        });
+        assert_eq!(hit, Some("v6narrow128"));
+        assert_eq!(visited, ["v6narrow128"]);
     }
 
     /// 同 lookup_upstream_group_domain_falls_back_across_client_prefixes，
@@ -1958,6 +1997,123 @@ mod tests {
                 .lookup("2001:db8::1".parse::<IpAddr>().unwrap())
                 .and_then(|t| t.lookup("2001:dead::1".parse::<IpAddr>().unwrap())),
             None
+        );
+    }
+
+    /// 回归测试：客户端同时命中 /32 与 /24 两张 client_dst_ip_routes 表时，
+    /// /32 表只覆盖它显式列出的目的网段，未列出的目的 IP 应回退到 /24 表，
+    /// 而不是整体落入 "default"（与 client_domain_routes 的回退语义一致）。
+    #[test]
+    fn lookup_upstream_group_dst_ip_falls_back_across_client_prefixes() {
+        let mut state = minimal_app_state();
+
+        let mut dst_ip = ClientDstIpRoutes::new();
+
+        let mut narrow = ClientIpRoutes::new();
+        narrow.insert(
+            "172.253.118.0/24".parse::<IpNet>().unwrap(),
+            "narrow".to_string(),
+        );
+        narrow.finalize();
+        dst_ip.insert("192.168.1.42/32".parse::<IpNet>().unwrap(), narrow);
+
+        let mut broad = ClientIpRoutes::new();
+        broad.insert(
+            "172.253.0.0/16".parse::<IpNet>().unwrap(),
+            "broad".to_string(),
+        );
+        broad.finalize();
+        dst_ip.insert("192.168.1.0/24".parse::<IpNet>().unwrap(), broad);
+        dst_ip.finalize();
+
+        state.runtime = Arc::new(AppRuntime {
+            proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
+            udp: Arc::clone(&state.runtime.udp),
+            client_routes: ClientIpRoutes::new(),
+            client_domain_routes: ClientDomainRoutes::new(),
+            client_dst_ip_routes: dst_ip,
+        });
+
+        let shadowed = "192.168.1.42".parse::<IpAddr>().unwrap();
+        let unshadowed = "192.168.1.100".parse::<IpAddr>().unwrap();
+
+        // /32 表未列出的目的 IP 回退到 /24 表
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, "172.253.200.1".parse().unwrap(), None),
+            "broad"
+        );
+        // /32 表显式列出的目的 IP 按 /32 表生效（更具体的覆盖更宽的）
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, "172.253.118.5".parse().unwrap(), None),
+            "narrow"
+        );
+        // 两表都未列出 → default
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, "8.8.8.8".parse().unwrap(), None),
+            "default"
+        );
+        // 只命中 /24 的客户端不受影响
+        assert_eq!(
+            state.lookup_upstream_group(unshadowed, "172.253.200.1".parse().unwrap(), None),
+            "broad"
+        );
+    }
+
+    /// 同 lookup_upstream_group_dst_ip_falls_back_across_client_prefixes，
+    /// 覆盖 IPv6 分支（v6 客户端前缀遮蔽同样需要跨表回退）。
+    #[test]
+    fn lookup_upstream_group_dst_ip_falls_back_across_client_prefixes_v6() {
+        let mut state = minimal_app_state();
+
+        let mut dst_ip = ClientDstIpRoutes::new();
+
+        let mut narrow = ClientIpRoutes::new();
+        narrow.insert(
+            "2001:4860:1::/48".parse::<IpNet>().unwrap(),
+            "narrow".to_string(),
+        );
+        narrow.finalize();
+        dst_ip.insert("2001:db8:1:1::5/128".parse::<IpNet>().unwrap(), narrow);
+
+        let mut broad = ClientIpRoutes::new();
+        broad.insert(
+            "2001:4860::/32".parse::<IpNet>().unwrap(),
+            "broad".to_string(),
+        );
+        broad.finalize();
+        dst_ip.insert("2001:db8:1::/48".parse::<IpNet>().unwrap(), broad);
+        dst_ip.finalize();
+
+        state.runtime = Arc::new(AppRuntime {
+            proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
+            udp: Arc::clone(&state.runtime.udp),
+            client_routes: ClientIpRoutes::new(),
+            client_domain_routes: ClientDomainRoutes::new(),
+            client_dst_ip_routes: dst_ip,
+        });
+
+        let shadowed = "2001:db8:1:1::5".parse::<IpAddr>().unwrap();
+        let unshadowed = "2001:db8:1:2::5".parse::<IpAddr>().unwrap();
+
+        // /128 表未列出的目的 IP 回退到 /48 表
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, "2001:4860:2::1".parse().unwrap(), None),
+            "broad"
+        );
+        // /128 表显式列出的目的 IP 按 /128 表生效
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, "2001:4860:1::1".parse().unwrap(), None),
+            "narrow"
+        );
+        // 两表都未列出 → default
+        assert_eq!(
+            state.lookup_upstream_group(shadowed, "2001:dead::1".parse().unwrap(), None),
+            "default"
+        );
+        // 只命中 /48 的客户端不受影响
+        assert_eq!(
+            state.lookup_upstream_group(unshadowed, "2001:4860:2::1".parse().unwrap(), None),
+            "broad"
         );
     }
 

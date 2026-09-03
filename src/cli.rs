@@ -530,11 +530,16 @@ pub struct Config {
 
     #[serde(default)]
     /// 客户端源 IP → {域名模式 → upstream 分组}
+    /// 客户端前缀从长到短逐表查找，更具体的网段只覆盖它显式列出的域名，
+    /// 未列出的域名回退到更宽网段的表（如 /32 未命中回退 /24）。
     pub client_domain_routes: HashMap<String, HashMap<String, String>>,
 
     #[serde(default)]
     /// 客户端源 IP → {目的 IP/CIDR → upstream 分组}
     /// 优先级最高（高于 client_domain_routes / client_routes）。
+    /// 与 client_domain_routes 一样，客户端前缀从长到短逐表查找：
+    /// 更具体的网段只覆盖它显式列出的目的网段，
+    /// 未列出的目的 IP 回退到更宽网段的表（如 /32 未命中回退 /24）。
     pub client_dst_ip_routes: HashMap<String, HashMap<String, String>>,
 
     #[serde(default = "default_route_cache_ttl_secs")]

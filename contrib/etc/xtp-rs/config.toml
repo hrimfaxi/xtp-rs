@@ -304,6 +304,8 @@ addr = "127.0.0.1:20808"
 # 优先级高于 client_routes，支持两种域名匹配模式：
 #   - ".example.com"：后缀匹配，匹配 example.com 及其所有子域名
 #   - "example.com"：精确匹配，仅匹配 example.com
+# 客户端前缀从长到短逐表查找，更具体的网段只覆盖它显式列出的域名，
+# 未列出的域名回退到更宽网段的表（如 /32 未命中回退 /24）。
 # [client_domain_routes."192.168.1.100"]
 # ".google.com" = "proxy_group"
 # "example.com" = "direct_group"
@@ -311,5 +313,7 @@ addr = "127.0.0.1:20808"
 # 按客户端源 IP + 目的 IP/CIDR 分配 upstream 分组
 # 优先级最高（高于 client_domain_routes / client_routes）。
 # 与 client_domain_routes 同构：外层客户端，内层目的网段。
+# 客户端前缀从长到短逐表查找，更具体的网段只覆盖它显式列出的目的网段，
+# 未列出的目的 IP 回退到更宽网段的表（如 /32 未命中回退 /24）。
 # [client_dst_ip_routes."192.168.1.0/24"]
 # "172.253.118.0/24" = "proxy_group"
