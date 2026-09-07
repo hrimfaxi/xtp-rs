@@ -61,9 +61,10 @@ cleanup() {
     fi
 
     if [ -n "$REFRESH_PID" ]; then
-        # 直接终止刷新循环本身。若其当前正在运行 curl，curl 受
-        # --max-time 2 限制；若正在 sleep，则 sleep 最多持续至本轮
-        # 剩余刷新间隔。它们均不会进入下一次刷新循环。
+        # 直接终止刷新循环本身。若其当前正在运行 curl（多实例并发探测
+        # 时可能有多个在途 curl），curl 受 --max-time 2 限制；若正在
+        # sleep，则 sleep 最多持续至本轮剩余刷新间隔。它们均不会进入
+        # 下一次刷新循环。
         kill "$REFRESH_PID" 2>/dev/null
         wait "$REFRESH_PID" 2>/dev/null
         REFRESH_PID=""
@@ -84,7 +85,7 @@ if [ "$DEBUG" = "1" ]; then
     dbg "script started: socket=$SOCKET fifo=$FIFO"
 fi
 
-# ---------- 提取配置文件路径（供刷新和 get_instance_id 共用） ----------
+# ---------- 提取配置文件路径（供刷新和 get_config_name 共用） ----------
 get_config_path() {
     local pid="$1"
     local cmdline_file="/proc/$pid/cmdline"
@@ -141,10 +142,13 @@ get_config_path() {
     '
 }
 
-get_instance_id() {
+# 从 /proc/PID/cmdline 提取配置文件名（去扩展名），作为 upstream_id 的基名。
+# 多实例日志带 instance{n=N} 时由调用方追加 _N 后缀（如 combine_0）；
+# 单实例/旧版日志无 instance 字段，直接使用基名（向后兼容）。
+get_config_name() {
     local pid="$1"
     local cmdline_file="/proc/$pid/cmdline"
-    local cmdline cfg_file instance
+    local cmdline cfg_file cfg_name
 
     if [ ! -r "$cmdline_file" ]; then
         dbg "PID=$pid: cannot read $cmdline_file"
@@ -165,17 +169,17 @@ get_instance_id() {
         return 1
     fi
 
-    instance=$(basename "$cfg_file")
-    instance=${instance%.*}
+    cfg_name=$(basename "$cfg_file")
+    cfg_name=${cfg_name%.*}
 
-    if [ -z "$instance" ]; then
-        dbg "PID=$pid: empty instance derived from cfg_file=$cfg_file"
+    if [ -z "$cfg_name" ]; then
+        dbg "PID=$pid: empty config name derived from cfg_file=$cfg_file"
         printf 'unknown-%s\n' "$pid"
         return 1
     fi
 
-    dbg "PID=$pid: cfg_file=$cfg_file instance_id=$instance"
-    printf '%s\n' "$instance"
+    dbg "PID=$pid: cfg_file=$cfg_file config_name=$cfg_name"
+    printf '%s\n' "$cfg_name"
     return 0
 }
 
@@ -219,13 +223,15 @@ send_json() {
 }
 
 # ---------- 刷新功能 ----------
-# 从配置提取 bind-addr 的 host 和 port，输出 "host port"。
+# 从配置提取所有 bind-addr，每行输出 "host port"。
+# 多实例配置含多个 inbound（每个实例一个），需全部探测；
+# 兼容顶层键与 YAML 列表项（"- bind-addr:"）两种写法，
 # 支持引号、行尾注释、IPv6 方括号（如 [::1]:1080）。
-parse_bind_addr() {
+parse_bind_addrs() {
     awk '
-        /^[[:space:]]*bind-addr:/ {
+        /^[[:space:]]*-[[:space:]]*bind-addr:/ || /^[[:space:]]*bind-addr:/ {
             v = $0
-            sub(/^[[:space:]]*bind-addr:[[:space:]]*/, "", v)
+            sub(/^[[:space:]]*(-[[:space:]]*)?bind-addr:[[:space:]]*/, "", v)
             sub(/[[:space:]]*#.*$/, "", v)
             gsub(/["'\''[:space:]]/, "", v)
 
@@ -233,20 +239,20 @@ parse_bind_addr() {
                 sub(/^\[/, "", v)
                 split(v, a, /]:/)
                 print a[1], a[2]
-                exit
+                next
             }
             if (v ~ /^[^:]+:[0-9]+$/) {
                 split(v, a, /:/)
                 print a[1], a[2]
-                exit
             }
-            exit
         }
     ' "$1" 2>/dev/null
 }
 
 refresh_connections() {
-    local pids pid config_path addr host port proxy
+    # host/port/proxy 在管道 while（子 shell）内赋值，正常 POSIX sh 下
+    # 不会外泄；仍声明为 local，防止 lastpipe/未来重构时泄漏为全局。
+    local pids pid config_path addrs host port proxy
 
     # [s]hadowquic 避免 pgrep 匹配到本脚本自身的命令行。
     # 不依赖配置文件后缀（.yaml/.yml/.conf 均可命中）。
@@ -268,51 +274,59 @@ refresh_connections() {
             continue
         fi
 
-        addr=$(parse_bind_addr "$config_path")
-        if [ -z "$addr" ]; then
+        # 多实例配置有多个 bind-addr，全部探测。探测仅用于触发流量，
+        # 让每个实例都向 syslog 输出 stats，无需 instance ↔ 端口映射。
+        addrs=$(parse_bind_addrs "$config_path")
+        if [ -z "$addrs" ]; then
             dbg "refresh: PID=$pid no valid bind-addr in $config_path"
             continue
         fi
 
-        host=${addr% *}
-        port=${addr##* }
+        printf '%s\n' "$addrs" | while read -r host port; do
+            [ -n "$host" ] || continue
 
-        case "$port" in
-            ''|*[!0-9]*)
-                dbg "refresh: PID=$pid invalid bind port: ${port:-missing}"
+            case "$port" in
+                ''|*[!0-9]*)
+                    dbg "refresh: PID=$pid invalid bind port: ${port:-missing}"
+                    continue
+                    ;;
+            esac
+            if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                dbg "refresh: PID=$pid bind port out of range: $port"
                 continue
-                ;;
-        esac
-        if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-            dbg "refresh: PID=$pid bind port out of range: $port"
-            continue
-        fi
+            fi
 
-        # 通配监听地址不可直连，探测时回落到回环地址。
-        case "$host" in
-            0.0.0.0) host=127.0.0.1 ;;
-            "::") host="::1" ;;
-        esac
+            # 通配监听地址不可直连，探测时回落到回环地址。
+            case "$host" in
+                0.0.0.0) host=127.0.0.1 ;;
+                "::") host="::1" ;;
+            esac
 
-        # IPv6 主机在代理 URL 中需要加方括号。
-        case "$host" in
-            *:*) proxy="socks5h://[$host]:$port" ;;
-            *) proxy="socks5h://$host:$port" ;;
-        esac
+            # IPv6 主机在代理 URL 中需要加方括号。
+            case "$host" in
+                *:*) proxy="socks5h://[$host]:$port" ;;
+                *) proxy="socks5h://$host:$port" ;;
+            esac
 
-        dbg "refresh: probing PID=$pid via $proxy"
-        # 发送 HEAD 请求触发新连接，忽略输出，超时 2 秒。
-        # --noproxy '' 强制不使用 NO_PROXY/no_proxy 规则，确保探测
-        # 一定经过 SOCKS5（否则可能绕过 Shadowquic 直连，线报不刷新）。
-        # -- 防止异常的 REFRESH_URL（如以 - 开头）被 curl 当作选项解析。
-        if ! curl --proxy "$proxy" \
-            --noproxy '' \
-            --connect-timeout 1 --max-time 2 \
-            --silent --output /dev/null \
-            --head \
-            -- "$REFRESH_URL" 2>/dev/null; then
-            dbg "refresh: probe failed: PID=$pid proxy=$proxy"
-        fi
+            dbg "refresh: probing PID=$pid via $proxy"
+            # 发送 HEAD 请求触发新连接，忽略输出，超时 2 秒。
+            # --noproxy '' 强制不使用 NO_PROXY/no_proxy 规则，确保探测
+            # 一定经过 SOCKS5（否则可能绕过 Shadowquic 直连，线报不刷新）。
+            # -- 防止异常的 REFRESH_URL（如以 - 开头）被 curl 当作选项解析。
+            # 并发探测：多实例配置有多个 bind-addr，串行时每个失败探测
+            # 最多阻塞 2 秒，逐个累加会拉长整轮刷新周期；后台并行执行，
+            # 失败日志由子 shell 写入，curl 受 --max-time 2 自行限时。
+            (
+                if ! curl --proxy "$proxy" \
+                    --noproxy '' \
+                    --connect-timeout 1 --max-time 2 \
+                    --silent --output /dev/null \
+                    --head \
+                    -- "$REFRESH_URL" 2>/dev/null; then
+                    dbg "refresh: probe failed: PID=$pid proxy=$proxy"
+                fi
+            ) &
+        done
     done
 }
 
@@ -414,6 +428,19 @@ while IFS= read -r line; do
             else
                 exit
 
+            # 多实例日志带 instance{n=N}: 前缀，提取 N；
+            # 单实例/旧版日志无此字段，inst 保持空。
+            # 用 index/substr 而非 brace 正则，避免 busybox awk 兼容问题；
+            # 数字后必须紧跟 "}" 才认定为实例序号，防止日志其他位置
+            # 恰好出现 "instance{n=" 字样时误提取。
+            inst = ""
+            i = index($0, "instance{n=")
+            if (i > 0) {
+                rest = substr($0, i + length("instance{n="))
+                if (match(rest, /^[0-9]+/) && substr(rest, RLENGTH + 1, 1) == "}")
+                    inst = substr(rest, 1, RLENGTH)
+            }
+
             rtt = ""
             if (match($0, /rtt=[0-9.]+ms/)) {
                 # 去掉 rtt= 和 ms。
@@ -431,7 +458,7 @@ while IFS= read -r line; do
                 mtu = substr($0, RSTART + 4, RLENGTH - 4)
             }
 
-            printf "%s|%s|%s|%s|%s\n", pid, rtt, loss, mtu, link
+            printf "%s|%s|%s|%s|%s|%s\n", pid, rtt, loss, mtu, link, inst
         }'
     )
 
@@ -440,7 +467,7 @@ while IFS= read -r line; do
         continue
     fi
 
-    IFS='|' read -r pid rtt loss_rate mtu link <<EOF
+    IFS='|' read -r pid rtt loss_rate mtu link inst_n <<EOF
 $parsed_data
 EOF
 
@@ -448,16 +475,35 @@ EOF
     [ -n "$loss_rate" ] || loss_rate=0
     [ -n "$mtu" ] || mtu=0
 
-    dbg "parsed: pid=$pid rtt=$rtt loss_rate=$loss_rate mtu=$mtu link=$link"
+    dbg "parsed: pid=$pid rtt=$rtt loss_rate=$loss_rate mtu=$mtu link=$link instance=${inst_n:-none}"
 
-    instance_id=$(get_instance_id "$pid")
-    instance_rc=$?
+    cfg_name=$(get_config_name "$pid")
+    cfg_rc=$?
 
-    dbg "instance lookup: pid=$pid instance_id=$instance_id rc=$instance_rc"
+    dbg "config name lookup: pid=$pid cfg_name=$cfg_name rc=$cfg_rc"
+
+    # 进程刚退出（cmdline 已消失）等场景拿不到配置名，拼出的
+    # unknown-* id 在 xtp-rs 侧必然匹配不上，直接跳过本次上报。
+    if [ "$cfg_rc" -ne 0 ] || [ -z "$cfg_name" ]; then
+        dbg "skip report: no config name for pid=$pid"
+        continue
+    fi
+
+    # upstream_id 推导：
+    # - 多实例日志带 instance{n=N}：配置名_N（如 combine_0），
+    #   与 xtp-rs 配置中该实例的 upstream id 对应。
+    # - 单实例/旧版日志无 instance 字段：直接用配置名，向后兼容。
+    if [ -n "$inst_n" ]; then
+        upstream_id="${cfg_name}_${inst_n}"
+    else
+        upstream_id="$cfg_name"
+    fi
+
+    dbg "upstream_id=$upstream_id"
 
     json_string=$(
         printf '{"upstream_id":"%s","peer":"%s","rtt_ms":%.3f,"loss_rate":%.4f,"mtu":%d,"link":"%s"}' \
-            "$instance_id" \
+            "$upstream_id" \
             "$pid" \
             "$rtt" \
             "$loss_rate" \
@@ -466,7 +512,7 @@ EOF
     )
 
     if ! send_json "$json_string"; then
-        dbg "ERROR: failed to report pid=$pid instance=$instance_id"
+        dbg "ERROR: failed to report pid=$pid upstream_id=$upstream_id"
     fi
 done < "$FIFO"
 

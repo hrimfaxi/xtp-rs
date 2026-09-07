@@ -485,24 +485,31 @@ chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
 
 | 字段 | 说明 |
 |------|------|
-| `upstream_id` | 从 ShadowQUIC 的 `-c` / `--config` 参数推导的实例名（配置文件名去扩展名，见下例） |
+| `upstream_id` | 从 ShadowQUIC 的 `-c` / `--config` 参数推导的实例名（配置文件名去扩展名；多实例配置追加 `_N` 后缀，见下例） |
 | `peer` | ShadowQUIC 进程 PID |
 | `rtt_ms` | 链路 RTT（毫秒） |
 | `loss_rate` | 丢包率（小数，0.37 = 37%） |
 | `mtu` | 链路 MTU |
 | `link` | 方向：`uplink` / `downlink` |
 
-`upstream_id` 的推导规则：读取 `/proc/PID/cmdline`，找到 `-c` / `-c=` / `--config` / `--config=` 参数对应的路径，取 basename 并去掉扩展名。例如：
+`upstream_id` 的推导规则：读取 `/proc/PID/cmdline`，找到 `-c` / `-c=` / `--config` / `--config=` 参数对应的路径，取 basename 并去掉扩展名；若日志行带多实例前缀 `instance{n=N}:`，则追加 `_N` 后缀。例如：
 
-| 启动命令 | `upstream_id` |
-|----------|---------------|
-| `shadowquic -c /etc/shadowquic/bbr.yaml` | `bbr` |
-| `shadowquic -c /etc/shadowquic/brutal.yaml` | `brutal` |
-| `shadowquic --config=/etc/shadowquic/poe.yaml` | `poe` |
-| 找不到 `-c` 参数 | `unknown-<PID>` |
+| 启动命令 | 日志行 instance 字段 | `upstream_id` |
+|----------|---------------------|---------------|
+| `shadowquic -c /etc/shadowquic/bbr.yaml` | 无（单实例/旧版） | `bbr` |
+| `shadowquic -c /etc/shadowquic/combine.yaml` | `instance{n=0}:` | `combine_0` |
+| `shadowquic -c /etc/shadowquic/combine.yaml` | `instance{n=1}:` | `combine_1` |
+| `shadowquic --config=/etc/shadowquic/poe.yaml` | 无（单实例/旧版） | `poe` |
+| 找不到 `-c` 参数 / cmdline 不可读 | — | 跳过该次上报（仅 debug 日志记录） |
+
+xtp-rs 侧需将 upstream 的 `id` 配置为与之一致的值：单实例配置对应 `id = "bbr"`；多实例配置 `combine.yaml` 的第 N 个实例对应 `id = "combine_N"`。
 
 > [!NOTE]
-> xtp-stats-reporter 仅解析 ShadowQUIC 格式的 syslog 条目（匹配 `shadowquic[PID]:` 前缀 + `uplink stats` / `downlink stats` 关键字）。其他进程的日志会被忽略。
+> - 单实例（旧版 fork，或新版只配置一个实例）的日志没有 `instance{n=X}` 字段，`upstream_id` 保持为配置名本身，与旧版部署完全兼容。
+> - 实例序号 N 以 ShadowQUIC 实际输出的日志为准。增删实例或调整其在配置中的顺序都会重排 N，需同步修改 xtp-rs 侧对应的 upstream id。
+> - 刷新探测的 `bind-addr` 解析仅支持块式 YAML（顶层 `bind-addr:` 或列表项 `- bind-addr:`）；flow 风格（`{bind-addr: ...}`）不识别，对应实例不会被周期探测，stats 仅在有真实流量时上报。
+> - 配置中出现的所有 `bind-addr` 都会被周期探测，多实例的每个 inbound 均会被覆盖。
+> - xtp-stats-reporter 仅解析 ShadowQUIC 格式的 syslog 条目（匹配 `shadowquic[PID]:` 前缀 + `uplink stats` / `downlink stats` 关键字）。其他进程的日志会被忽略。
 
 ### 健康检查
 

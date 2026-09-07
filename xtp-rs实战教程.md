@@ -776,6 +776,20 @@ chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
 
 **验证**：`logread | grep xtp-stats-reporter` 应能看到解析日志；如果 ShadowQUIC 正在运行且链路有流量，xtp-rs 的 debug 日志中会出现 QUIC 探针分数更新。
 
+**多实例配置的 id 对应关系**：新版 ShadowQUIC 支持单个配置文件声明多个实例，日志会带 `instance{n=N}:` 前缀（如 `instance{n=0}: uplink stats ...`）。此时上报的 `upstream_id` 为「配置文件名_N」，例如 `/etc/shadowquic/combine.yaml` 的实例 0、1 分别上报 `combine_0`、`combine_1`，xtp-rs 侧的 upstream `id` 须与之对应：
+
+```toml
+[[upstream]]
+id = "combine_0"   # combine.yaml 的实例 0
+# ...
+
+[[upstream]]
+id = "combine_1"   # combine.yaml 的实例 1
+# ...
+```
+
+单实例（旧版 fork，或新版只配置一个实例）的日志没有 `instance{n=X}` 字段，`upstream_id` 仍为配置文件名本身（如 `id = "niyaou"` 对应 `niyaou.yaml`），旧部署无需改动。
+
 > [!NOTE]
 > 不使用 ShadowQUIC 时无需部署此 daemon。xtp-rs 的 TCP 吞吐评分（基于 `TCP_INFO`）始终自动生效，不依赖任何外部组件。
 
