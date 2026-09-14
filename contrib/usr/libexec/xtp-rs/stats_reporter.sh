@@ -3,7 +3,7 @@
 # 可由 procd 的：
 # procd_set_param env DEBUG=0
 # 覆盖。
-DEBUG="${DEBUG:-1}"
+DEBUG="${DEBUG:-0}"
 DEBUG_LOG="${DEBUG_LOG:-/tmp/shadowquic-stats-report.debug.log}"
 SOCKET="${SOCKET:-/tmp/xtp-rs-report.sock}"
 REFRESH_INTERVAL="${REFRESH_INTERVAL:-30}"   # 刷新间隔（秒）
