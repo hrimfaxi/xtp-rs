@@ -412,12 +412,96 @@ flowchart TD
 | `log_level` | string | 环境变量，否则 `info` | 日志级别：`error` / `warn` / `info` / `debug` / `trace` |
 | `udp_session_timeout_secs` | u64 | `60` | UDP 会话空闲超时时间（秒） |
 | `connect_timeout_secs` | u64 | `20` | 上游连接超时时间（秒） |
-| `splice` | bool | `false` | TCP 转发是否优先使用 splice 零拷贝 |
+| `splice` | bool | `false` | TCP 转发是否优先使用 splice 零拷贝（为 `true` 时半关闭看门狗不生效，见下文） |
+| `half_close_timeout` | u64 | `600` | TCP relay 半关闭静默超时（秒），`0` 禁用。仅在一方已半关闭后计时 |
 | `route_cache_ttl_secs` | u64 | `5` | 路由结果缓存 TTL（秒），0 禁用缓存 |
 | `route_cache_max` | usize | `4096` | 路由结果缓存最大条目数 |
 
 > [!NOTE]
 > 嗅探功能默认均为关闭，需手动开启。编译时默认包含所有嗅探代码，运行时开启不会带来额外性能损失（仅处理非直连流量的首包）。
+
+### TCP relay 半关闭静默超时
+
+`copy_bidirectional` 只在**两个方向都读到 EOF** 后才返回。若对端只关闭写半边
+（half-close）后永不关闭读半边，relay 会永久挂起，连接长期停留在 `CLOSE-WAIT` /
+`FIN-WAIT-2`，慢性泄漏 fd、内核 socket、conntrack 表项与 ephemeral port。
+
+`half_close_timeout` 为该场景兜底：**一方已半关闭**，且此后双向静默超过该时长时，
+主动回收会话。
+
+| 行为 | 说明 |
+|------|------|
+| 触发条件 | 必须先有半关闭（`copy_bidirectional` 在某个方向读到 EOF 后关闭对向写半边） |
+| 计时起点 | 第一次半关闭的时刻，不是连接建立时刻 |
+| 计时重置 | 半关闭后转发层仍有进展（relay 成功读出/写入字节）就重新计时 |
+| 空闲长连接 | 双方都未半关闭时**永不**触发，交互式登录等正常空转不受影响 |
+| 关闭方式 | 两侧 socket 设 `SO_LINGER=0` 后 drop，直接发 **RST**（避免 FIN 无人 ACK 再挂一段） |
+| 禁用 | `half_close_timeout = 0`，行为与未引入该机制时完全一致（可用于回滚验证） |
+| 生效前提 | `splice = false` |
+| RST 范围 | **仅看门狗触发这一条路径**；普通转发 I/O 错误不额外发 RST，行为与 `half_close_timeout = 0` 时一致 |
+
+> [!NOTE]
+> “静默”的判定依据是 **relay 自身的转发进展**（一个方向成功读出、或对向成功写入
+> 字节），不是“内核接收缓冲里还有数据”。若某一端停止读取造成反压、转发层无法推进，
+> 即使对端仍在发包，超过 `half_close_timeout` 仍会被回收——此时连接确实已经没有
+> 端到端进展了。
+
+> [!IMPORTANT]
+> `splice = true` 时**看门狗不生效**。zero-copy 由内核在 fd 之间搬运数据，不经过
+> `poll_read` / `poll_write`，看门狗依赖的活动观测无法工作；而
+> `tokio_splice::Stream` 只对具体的 `TcpStream` / `UnixStream` 实现，包一层观测
+> 包装后就不再满足约束。xtp-rs 不静默改掉用户显式开启的优化，改为在启动/热重载时
+> **WARN 一次**提示 `half_close_timeout` 已被忽略。需要该保护请设 `splice = false`。
+
+#### 日志与计数器
+
+每次看门狗触发输出一条 `WARN`（不做采样，便于据日志反推回收速率）：
+
+```
+WARN TCP relay half-closed and silent, session reclaimed with RST
+     target=1.2.3.4:443 upstream_id=u1 silent_secs=600 duration_ms=3600000 total=17
+```
+
+字段：`target`（原始目标）、`upstream_id`（可选）、`silent_secs`（静默时长）、
+`duration_ms`（连接总时长）、`total`（累计触发次数）。
+
+xtp-rs 没有 metrics 框架（`/tmp/xtp-rs-report.sock` 是单向接收 shadowquic 上报的
+入口，不是可抓取端点），因此计数器以进程内 `AtomicU64` 暴露，并把累计值直接带在
+日志里：
+
+| 计数器 | 含义 |
+|--------|------|
+| `tcp_relay_half_close_timeout_total` | 半关闭看门狗触发次数（`total` 字段） |
+| `tcp_relay_copy_error_total` | `copy_bidirectional` 返回错误次数（`copy_errors_total` 字段） |
+
+> [!NOTE]
+> `tcp_relay_copy_error_total` 统计的是 `copy_bidirectional`（即 `splice = false`）的错误，
+> **不含**看门狗路径，也**不含** `splice = true` 时 `zero_copy_bidirectional` 的错误——
+> 那是另一个函数。所以在 `splice = true` 的部署下该计数恒为 0，日志里
+> `copy_errors_total = 0` 属正常，不代表没有 relay 错误。
+
+#### 实现说明
+
+看门狗由 `src/activity_stream.rs` 提供，三块拼起来：
+
+| 组件 | 作用 |
+|------|------|
+| `Activity` | 两侧共享的原子状态：最后一次字节流动的时刻、第一次半关闭的时刻（`0` 表示尚未半关闭） |
+| `ActivityGuard<S>` | 包装 `AsyncRead + AsyncWrite`，在 `poll_read` / `poll_write` 记录流动字节，在 `poll_shutdown` 成功时记录半关闭 |
+| `half_close_watchdog` | 按有界步长轮询，半关闭后静默达到宽限期即返回 |
+
+`relay_tcp_streams`（`src/util.rs`）在 `half_close_timeout > 0` 且 `splice = false` 时
+把两侧套上 `ActivityGuard`，与看门狗赛跑，并用 `biased` 让正常跑完优先。
+
+两个容易踩的点：
+
+- **EOF 不算活动**：`poll_read` 只有真正读到字节才 `touch()`。理由是语义上的——EOF 不是
+  转发进展，只说明这个方向没有更多数据了。它并**不是**「若计入就会破坏计时」：EOF 每个
+  方向只发生一次，且与对向 `poll_shutdown` 记录半关闭几乎同刻，而
+  `quiet_since_half_close()` 取两者较晚者，所以计入与否对计时没有影响。
+- **半关闭只记一次**：`half_closed()` 用 `compare_exchange(0, …)`，后续 shutdown 不覆盖
+  首次时刻。
+
 
 ### 上游动态评分
 
@@ -642,6 +726,18 @@ cargo test
 ```
 
 部分测试需要 `tokio` 运行时环境（会自动处理）。
+
+`src/activity_stream.rs` 的看门狗单元测试依赖 `tokio` 的 `test-util`
+（暂停时钟），已放在 `[dev-dependencies]`，不会进入发布二进制。
+
+TCP relay 的半关闭回收用真实 loopback socket 做集成测试（`src/tcp.rs` 的 `mod tests`），
+**不需要 root 或 TPROXY**，5 个用例覆盖：
+
+1. 半关闭且静默 → 按时回收，且对端未观察到正常 EOF（Linux 上为 `ECONNRESET`）
+2. `half_close_timeout = 0` → 不回收，计数器不增长
+3. 正常双向关闭 → 不走看门狗、计数器不增长
+4. 半关闭后**持续有进展** → 不回收；停止进展后才回收
+5. 128 个并发半关闭会话 → 全部回收且各自恰好计一次
 
 ---
 

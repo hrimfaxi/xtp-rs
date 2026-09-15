@@ -3,16 +3,21 @@ use ipnet::IpNet;
 use iptrie::{Ipv4Prefix, Ipv4RTrieSet, Ipv6Prefix, Ipv6RTrieSet};
 use nix::errno::Errno;
 use nix::sys::socket::{setsockopt, sockopt};
+use portable_atomic::AtomicU64;
 use socket2::Socket;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsFd;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::bytes::BytesMut;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
+
+use crate::activity_stream::{Activity, ActivityGuard, half_close_watchdog};
 
 pub const UDP_RECV_BUF_SIZE: usize = 65_536;
 
@@ -68,23 +73,145 @@ pub fn is_anyhow_emsgsize(e: &anyhow::Error) -> bool {
     })
 }
 
-pub async fn splice_or_copy_bidirectional<A, B>(
+/// 把配置里的秒数转成看门狗宽限期。
+///
+/// `0` 表示禁用，返回 `None`。不能把 `0` 直接转成 `Some(Duration::ZERO)`：
+/// 那会让看门狗在第一次半关闭的瞬间就触发，把每个正常结束的会话都当成泄漏回收。
+pub fn half_close_grace(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// `tcp_relay_half_close_timeout_total`：半关闭看门狗触发次数。
+///
+/// xtp-rs 没有 metrics 框架，`/tmp/xtp-rs-report.sock` 是只收不发的上报入口，
+/// 因此计数器以进程内原子量暴露，由调用方在触发时打 WARN 日志，便于长期监控
+/// 泄漏速率。用 `portable_atomic` 是因为 32 位 MIPS 没有原生 64 位原子。
+static TCP_RELAY_HALF_CLOSE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// `tcp_relay_copy_error_total`：`copy_bidirectional` 返回错误次数（不含看门狗路径）。
+static TCP_RELAY_COPY_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+pub fn tcp_relay_half_close_timeouts() -> u64 {
+    TCP_RELAY_HALF_CLOSE_TIMEOUTS.load(Ordering::Relaxed)
+}
+
+pub fn tcp_relay_copy_errors() -> u64 {
+    TCP_RELAY_COPY_ERRORS.load(Ordering::Relaxed)
+}
+
+/// TCP relay 的结束方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayEnd {
+    /// 两个方向都读到 EOF，正常结束。
+    Finished { sent: u64, recv: u64 },
+    /// 一方已半关闭、另一方静默超过宽限期，看门狗主动回收。
+    ///
+    /// 此时两侧 socket 已被设为 `SO_LINGER=0`，调用方 drop 它们即可发出 RST。
+    HalfCloseTimeout { silent_secs: u64 },
+}
+
+/// 对已建立的 TCP 连接做双向转发，并按需启用半关闭静默看门狗。
+///
+/// `client` 是下游连接，`upstream` 是出站连接（直连目标或 SOCKS5 代理）。
+///
+/// 三条路径：
+/// - `splice = true`：zero-copy，**不做看门狗**。数据由内核在 fd 之间搬运，不经过
+///   `poll_read`/`poll_write`，看门狗依赖的 `ActivityGuard` 观测不到字节流动，
+///   且 `tokio_splice::Stream` 只对具体的 `TcpStream`/`UnixStream` 实现，包一层
+///   guard 就不再满足约束。用户显式开启的优化不被静默改掉，代价是该路径无保护。
+/// - `grace = None`（配置 `half_close_timeout = 0`）：纯 `copy_bidirectional`，
+///   与改造前逐字一致，用于回滚验证。
+/// - `grace = Some(_)`：两侧套 `ActivityGuard` 并与 `half_close_watchdog` 赛跑。
+///   看门狗在第一次半关闭之前不会触发，因此“双方都未半关闭的空闲长连接”
+///   （交互式登录等）永不被误杀。
+///
+/// 只有看门狗胜出这一条路径会发 RST。普通 `copy_bidirectional` 错误（`Some(Err)`）
+/// 与 `grace = None` 走法一致，不做任何额外处理：错误本身已经意味着这条连接不可用，
+/// 而对端未必有问题（例如只是我方出站 write 失败），此处强制 RST 会连带打死可能还
+/// 健康的一侧，并让 `half_close_timeout > 0` 悄悄改变普通错误路径的语义。
+pub async fn relay_tcp_streams(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
     splice: bool,
-    client: &mut A,
-    upstream: &mut B,
-) -> Result<(u64, u64)>
-where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + tokio_splice::Stream,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + tokio_splice::Stream,
-{
+    grace: Option<Duration>,
+) -> Result<RelayEnd> {
     if splice {
-        tokio_splice::zero_copy_bidirectional(client, upstream)
+        let (sent, recv) = tokio_splice::zero_copy_bidirectional(client, upstream)
             .await
-            .map_err(|e| anyhow!("splice error: {}", e))
-    } else {
-        tokio::io::copy_bidirectional(client, upstream)
-            .await
-            .map_err(Into::into)
+            .map_err(|e| anyhow!("splice error: {}", e))?;
+        return Ok(RelayEnd::Finished { sent, recv });
+    }
+
+    let Some(grace) = grace else {
+        return match tokio::io::copy_bidirectional(client, upstream).await {
+            Ok((sent, recv)) => Ok(RelayEnd::Finished { sent, recv }),
+            Err(e) => {
+                count_copy_error();
+                Err(e.into())
+            }
+        };
+    };
+
+    let activity = Activity::new();
+
+    // 两块 guard 可变借用 client/upstream，`copy` 又借用两块 guard。
+    // 用块把它们的生命周期收窄：块结束时 future 先于 guard drop，guard 再先于
+    // 对外层引用的借用结束，之后才能拿回 client/upstream 去设 SO_LINGER。
+    let outcome = {
+        let mut left = ActivityGuard::new(&mut *client, activity.clone());
+        let mut right = ActivityGuard::new(&mut *upstream, activity.clone());
+        let copy = tokio::io::copy_bidirectional(&mut left, &mut right);
+        tokio::pin!(copy);
+
+        tokio::select! {
+            // biased：正常跑完优先于看门狗。默认的随机公平选择会在“最后一个 EOF
+            // 刚到达”与“看门狗恰好到期”同时可轮询时有一半概率选到看门狗，把一个
+            // 本该正常 FIN 结束的会话按泄漏回收掉。语义是“超过宽限期仍未结束才
+            // 回收”，所以必须让已完成的那一侧先赢。
+            biased;
+            res = &mut copy => Some(res),
+            _ = half_close_watchdog(&activity, grace) => None,
+        }
+    };
+
+    match outcome {
+        Some(Ok((sent, recv))) => Ok(RelayEnd::Finished { sent, recv }),
+        Some(Err(e)) => {
+            count_copy_error();
+            Err(e.into())
+        }
+        None => {
+            TCP_RELAY_HALF_CLOSE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            let silent_secs = activity.quiet_since_half_close().unwrap_or(grace).as_secs();
+            abort_with_rst(client, upstream);
+            Ok(RelayEnd::HalfCloseTimeout { silent_secs })
+        }
+    }
+}
+
+fn count_copy_error() {
+    TCP_RELAY_COPY_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 放弃会话：对两侧 socket 设 `SO_LINGER=0`，由调用方随后的 drop 发出 RST。
+///
+/// 只在看门狗判定“半关闭后已静默超时”时使用。普通 drop 只发 FIN，此时对端本
+/// 就在半关闭后不读不收，FIN 无人 ACK，连接会继续挂在 FIN-WAIT-2 上——回收就
+/// 没意义了。
+fn abort_with_rst(client: &mut TcpStream, upstream: &mut TcpStream) {
+    set_linger_zero(client);
+    set_linger_zero(upstream);
+}
+
+/// 把 socket 的 `SO_LINGER` 设为 0，使 `close()` 丢弃发送缓冲并直接发 RST。
+///
+/// 失败不致命：退化为普通 FIN，只是对端若不 ACK 会多挂一段。
+fn set_linger_zero(stream: &TcpStream) {
+    if let Err(e) = socket2::SockRef::from(stream).set_linger(Some(Duration::ZERO)) {
+        debug!(
+            error = format!("{:#}", e),
+            "SO_LINGER=0 failed, closing will fall back to FIN"
+        );
     }
 }
 
@@ -510,6 +637,19 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let t2 = now_secs();
         assert!(t2 >= t1);
+    }
+
+    // ---- half_close_grace ----
+    #[test]
+    fn half_close_grace_zero_disables_the_watchdog() {
+        // 0 必须是 None：Some(Duration::ZERO) 会让看门狗在第一个半关闭瞬间触发。
+        assert_eq!(half_close_grace(0), None);
+    }
+
+    #[test]
+    fn half_close_grace_positive_is_that_many_seconds() {
+        assert_eq!(half_close_grace(1), Some(Duration::from_secs(1)));
+        assert_eq!(half_close_grace(600), Some(Duration::from_secs(600)));
     }
 
     #[test]

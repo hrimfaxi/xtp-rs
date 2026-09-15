@@ -48,6 +48,12 @@ dashmap = "6.2.1"
 portable-atomic = { version = "1", features = ["fallback"] }
 mimalloc = { version = "0.1", optional = true }
 
+[dev-dependencies]
+# `test-util` 提供 `#[tokio::test(start_paused = true)]` 与暂停时钟，
+# activity_stream 的看门狗单元测试依赖它。
+# 放在 dev-dependencies 里，避免它进入发布二进制。
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 opt-level = "z"      # 比 "s" 更激进的体积优化
 lto = true           # 全链接期优化

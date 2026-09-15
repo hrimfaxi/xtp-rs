@@ -189,7 +189,27 @@ pub struct Config {
     ///
     /// - `true`：优先调用 `tokio_splice::zero_copy_bidirectional`
     /// - `false`：回退到 `tokio::io::copy_bidirectional`
+    ///
+    /// 注意：`splice = true` 时**半关闭看门狗不生效**。zero-copy 走内核 fd 搬运，
+    /// 数据不经过 `poll_read`/`poll_write`，看门狗依赖的 `ActivityGuard` 无法观测
+    /// 字节流动，因此该路径跳过看门狗并在启动时 WARN 一次。见 `half_close_timeout`。
     pub splice: bool,
+
+    #[serde(default = "default_half_close_timeout")]
+    /// TCP relay 半关闭静默超时，单位秒。`0` 表示禁用（保持改造前行为）。
+    ///
+    /// 语义：仅当**一方已半关闭**（`copy_bidirectional` 在某个方向读到 EOF 后
+    /// 关闭对向写半边），且此后双向静默超过该时长时，才主动回收会话并发 RST。
+    ///
+    /// - 双方都未半关闭的正常空闲长连接**永不**被杀，该项对它们无影响；
+    /// - 半关闭后只要转发层仍在推进（relay 成功读出或写入字节）就重新计时。
+    ///   计时依据是 **relay 自身的转发进展**，不是“内核接收缓冲里还有数据”：
+    ///   若某一端停止读取造成反压、转发无法推进，静默超过该时长仍会被回收。
+    /// - 默认 600：与 shadowquic 对齐。窗口给足是为了让“慢但对端仍活着”的
+    ///   半关闭会话不被误杀；真正的泄漏只要求最终被回收，不要求回收得多快。
+    ///
+    /// 生效前提：`splice = false`。`splice = true` 时该配置被忽略。
+    pub half_close_timeout: u64,
 
     #[serde(default = "default_sniff_tls_sni")]
     /// 是否对“非直连 TCP 连接”启用 TLS ClientHello SNI sniff。
@@ -587,6 +607,15 @@ pub fn default_splice() -> bool {
     false
 }
 
+/// TCP relay 半关闭静默超时的默认值（秒）。
+///
+/// 600 秒，与 shadowquic 保持一致：半关闭后静默 600 秒的对端，与“永不关闭”
+/// 已无法区分；而正常的请求/响应型长连接（HTTP keep-alive、数据库连接池等）
+/// 在半关闭后既不会静默这么久，也不会一直不关读半边。取 `0` 可完全禁用。
+pub fn default_half_close_timeout() -> u64 {
+    600
+}
+
 pub fn default_sniff_tls_sni() -> bool {
     false
 }
@@ -933,6 +962,7 @@ mod tests {
             mmdb_path: None,
             udp_session_timeout_secs: 120,
             splice: false,
+            half_close_timeout: default_half_close_timeout(),
             sniff_tls_sni: false,
             sniff_http_host: false,
             quic_sniff_mode: QuicSniffMode::None,
@@ -1193,6 +1223,23 @@ mod tests {
             let toml = "socks5_udp_reply_watchdog_secs = 40\n[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
             let cfg: super::Config = toml::from_str(toml).unwrap();
             assert_eq!(cfg.socks5_udp_reply_watchdog_secs, 40);
+        }
+
+        // 旧配置里没有 half_close_timeout 时必须落到默认值，否则升级会直接失败。
+        #[test]
+        fn deserialize_half_close_timeout_defaults_to_600() {
+            let toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            let cfg: super::Config = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.half_close_timeout, super::default_half_close_timeout());
+            assert_eq!(cfg.half_close_timeout, 600);
+        }
+
+        #[test]
+        fn deserialize_half_close_timeout_accepts_zero_to_disable() {
+            let toml =
+                "half_close_timeout = 0\n[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            let cfg: super::Config = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.half_close_timeout, 0);
         }
 
         #[test]

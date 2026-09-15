@@ -1249,7 +1249,7 @@ fn is_must_direct_local_ipv6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{QuicSniffMode, UpstreamConfig};
+    use crate::cli::{QuicSniffMode, UpstreamConfig, default_half_close_timeout};
     use crate::upstream::Upstream;
     use std::net::IpAddr;
 
@@ -1363,6 +1363,7 @@ mod tests {
             mmdb_path: None,
             udp_session_timeout_secs: 120,
             splice: false,
+            half_close_timeout: default_half_close_timeout(),
             sniff_tls_sni: false,
             sniff_http_host: false,
             quic_sniff_mode: QuicSniffMode::None,

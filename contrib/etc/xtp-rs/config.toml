@@ -35,7 +35,24 @@ udp_session_timeout_secs = 120
 
 # TCP 转发是否优先使用 splice 零拷贝
 # 默认值：false
+#
+# 注意：splice = true 时半关闭看门狗不生效（zero-copy 数据不经过 poll_read/
+# poll_write，看门狗观测不到），half_close_timeout 会被忽略并在启动时 WARN。
 splice = false
+
+# TCP relay 半关闭静默超时（秒）。0 表示禁用。
+#
+# 场景：对端只关闭写半边（half-close）后永不关闭读半边时，copy_bidirectional
+# 不会返回，连接永久停留在 CLOSE-WAIT / FIN-WAIT-2，泄漏 fd、内核 socket、
+# conntrack 表项与 ephemeral port。
+#
+# 语义：仅当一方已半关闭、且此后双向静默超过该时长时，才主动回收会话并发 RST。
+# - 双方都未半关闭的正常空闲长连接（交互式登录等）永远不会被回收；
+# - 半关闭后只要转发层仍在推进（relay 成功读出或写入字节）就重新计时；
+# - 仅在 splice = false 时生效。
+#
+# 默认值：600
+half_close_timeout = 600
 
 # -------------------------------
 # TLS SNI 嗅探（TCP）
