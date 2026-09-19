@@ -484,7 +484,7 @@ pub struct Config {
 
     /// QUIC 探针在最终选路分数中的权重百分比（0-100）。
     /// 越高越依赖 RTT/丢包率/MTU 探针，越低越依赖实际 TCP 吞吐。
-    /// 默认 70（即 TCP:QUIC = 3:7）。
+    /// 默认 40（即 TCP:QUIC = 6:4），见 [`default_quic_weight`]。
     #[serde(default = "default_quic_weight")]
     pub quic_weight: u32,
 

@@ -9,28 +9,23 @@
 [![GitHub Release](https://img.shields.io/github/v/release/hrimfaxi/xtp-rs)](https://github.com/hrimfaxi/xtp-rs/releases)
 [![Rust Edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](./Cargo.toml)
 
-将所有入站 TCP/UDP 流量经由一个或多个 **SOCKS5** 上游转发，
+将所有入站 TCP / UDP 流量经由一个或多个 **SOCKS5** 上游转发，
 支持 **GeoIP2 / geosite / 自定义 CIDR / 本地地址** 智能分流、
 **TLS · HTTP · QUIC 域名嗅探**、**动态上游评分** 与 **热重载**。
-
-📖 **[xtp-rs 实战教程](./xtp-rs实战教程.md)** — 从零到生产的完整指南：透明代理部署、GeoIP/geosite 分流、域名嗅探、多上游动态竞争（BBR vs Brutal）、YouTube/Poe 专线、IPv4/IPv6 双栈全覆盖
 
 </div>
 
 ---
 
-## 📑 目录
+## 📚 文档
 
-- [✨ 特性](#-特性)
-- [📦 安装与构建](#-安装与构建)
-- [🚀 快速开始](#-快速开始)
-- [🧠 工作原理](#-工作原理)
-- [⚙️ 配置参考](#️-配置参考)
-- [📂 目录结构](#-目录结构)
-- [🧪 测试](#-测试)
-- [⚠️ 注意事项](#️-注意事项)
-- [📄 许可证](#-许可证)
-- [🙏 致谢](#-致谢)
+| 文档 | 内容 |
+|------|------|
+| 📖 [实战教程](./docs/xtp-rs实战教程.md) | 由浅入深：从零到生产的完整指南（分流、嗅探、多上游竞争、YouTube / Poe 专线、IPv4 / IPv6 双栈） |
+| 🧠 [工作原理](./docs/工作原理.md) | 整体架构、路由优先级、TCP / UDP 处理流程、动态评分机制 |
+| ⚙️ [配置参考](./docs/配置.md) | 全部 TOML 配置项、默认值与校验规则 |
+| 🐧 [通用 Linux 部署](./docs/部署.md) | `sudo` + nftables + 策略路由 + systemd |
+| 📦 [OpenWrt 部署](./docs/OpenWrt.md) | OpenWrt 专项：`uci`、procd、ujail、交叉编译、stats-reporter |
 
 ---
 
@@ -41,12 +36,13 @@
 | 🔁 **透明代理（TPROXY）** | IPv4 / IPv6 双栈，TCP 与 UDP 流量全量拦截转发，客户端零配置 |
 | 🧭 **智能路由** | 按 GeoIP2 国家归属（MaxMind MMDB）、geosite 域名分类、自定义 CIDR、本地地址类型自动判定直连 / 代理；支持域名强制规则（`force_direct_domains` / `force_socks5_domains`）覆盖 geosite 与 IP 规则 |
 | 📡 **多 SOCKS5 上游** | 配置多个上游服务器，支持用户名 / 密码认证、分组路由与增益系数 |
-| 📈 **动态上游评分** | 基于 `TCP_INFO` 实时吞吐监控与 QUIC 探针（RTT / 丢包率 / MTU）报告综合评分，平方加权随机选择最优上游；支持跨链路相对归一化评分与冷启动加速（新上游立即参与竞争）；粘性切换容忍度避免频繁抖动 |
+| 📈 **动态上游评分** | 基于 `TCP_INFO` 实时吞吐监控与 QUIC 探针（RTT / 丢包率 / MTU）报告综合评分，平方加权随机选择最优上游；支持跨链路相对归一化评分与冷启动加速；粘性切换容忍度避免频繁抖动 |
 | 👃 **域名嗅探** | TLS SNI（HTTPS）、HTTP Host（明文 HTTP）、QUIC SNI（QUIC Initial）三种协议嗅探；默认关闭，按需开启 |
-| ⚙️ **端口转发** | 将本地 TCP/UDP 端口强制经 SOCKS5 转发到指定目标（可用于 DNS over SOCKS5、远程访问等） |
+| ⚙️ **端口转发** | 将本地 TCP / UDP 端口强制经 SOCKS5 转发到指定目标（可用于 DNS over SOCKS5 等） |
 | 🔄 **热重载** | `SIGHUP` 重载配置无需重启；`SIGUSR1` 在 smart → global → bypass 间循环切换代理模式 |
 | 🧹 **健康检查** | 可选主动健康检查（HTTP HEAD）结合被动性能监控，自动隔离故障上游 |
-| 🔀 **客户端路由** | 按客户端源 IP（可叠加域名模式）分配不同 upstream 分组，实现精细化流量管理 |
+| 🧵 **半关闭回收** | TCP relay 对端只关闭写半边后长期静默时主动回收（发 RST），避免 fd / conntrack 慢性泄漏（`half_close_timeout`，默认 600 秒） |
+| 🔀 **客户端路由** | 按客户端源 IP（可叠加域名或目的 IP 模式）分配不同 upstream 分组 |
 | 📦 **一键部署** | 提供 `setup-xtp-rs.sh` / `unsetup-xtp-rs.sh` 脚本，快速完成 nftables + 策略路由配置 |
 
 ---
@@ -75,9 +71,9 @@ cargo build --release
 cargo build --release --no-default-features --features "sniff-tls,sniff-http,geosite"
 ```
 
-### 方式三：OpenWrt 编译安装
+### 方式三：OpenWrt
 
-OpenWrt 软件包 Makefile 仓库：[openwrt-xtp-rs](https://github.com/hrimfaxi/openwrt-xtp-rs)
+软件包仓库：[openwrt-xtp-rs](https://github.com/hrimfaxi/openwrt-xtp-rs)；交叉编译与安装细节见 [OpenWrt 部署](./docs/OpenWrt.md)。
 
 ### 编译 Features
 
@@ -88,20 +84,17 @@ OpenWrt 软件包 Makefile 仓库：[openwrt-xtp-rs](https://github.com/hrimfaxi
 | `sniff-quic` | QUIC SNI 嗅探（默认启用） |
 | `geosite` | geosite.dat 分流支持（默认启用） |
 
+> 编译未开启某个 sniff feature 但配置中启用了对应嗅探时，启动会给出警告（不是编译错误）。
+
 ---
 
-## 🚀 快速开始
+## 🚀 快速开始（Linux 通用）
+
+> 本节命令适用于通用 Linux（Debian / Ubuntu / 软路由等），使用 `sudo`。**OpenWrt 请改用 [OpenWrt 部署](./docs/OpenWrt.md) 的 `uci` / `/etc/init.d` 命令。**
 
 ### 1. 部署透明代理环境
 
-项目 `contrib/usr/libexec/xtp-rs/` 目录下提供了四个辅助脚本：
-
-| 脚本 | 作用 |
-|------|------|
-| `common.sh` | 公共函数库，供其他脚本引用 |
-| `setup-xtp-rs.sh` | 一键配置 nftables 规则和策略路由（需 root 权限） |
-| `unsetup-xtp-rs.sh` | 一键清理上述规则 |
-| `update-chnroute.sh` | 更新中国大陆 IPv4/IPv6 直连列表（可选，配合 UCI 选项 `bypass_chnroute`） |
+`contrib/usr/libexec/xtp-rs/` 下提供 `setup-xtp-rs.sh`（配置 nftables + 策略路由）、`unsetup-xtp-rs.sh`（清理）、`common.sh`（公共库）等脚本：
 
 ```bash
 cd contrib/usr/libexec/xtp-rs
@@ -116,131 +109,16 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 sudo ./unsetup-xtp-rs.sh
 ```
 
-> [!IMPORTANT]
-> `setup-xtp-rs.sh` 会自动配置：
-> - 路由表 ID `100`，添加 `local default dev lo` 路由；
-> - 策略规则：`fwmark 1` 查找路由表 `100`；
-> - nftables 表 `inet xtp-rs`：在 `prerouting` 链（转发的入站流量）和 `output` 链（本机出站流量）中匹配 TCP 80/443 与 UDP 53/443，**打 `fwmark = 1`** 使其走策略路由；
-> - xtp-rs 自身出站连接设置 `SO_MARK = 2`（`XTP_BYPASS_MARK`），nftables 遇 `meta mark 2` 直接放行，**避免代理流量被再次劫持形成环路**。
+脚本会自动配置路由表 `100`、`fwmark 1` 策略规则、nftables 表 `inet xtp-rs`，并为 xtp-rs 的出站连接打 `fwmark 2` 防止环路。
+
+> [!WARNING]
+> 配置中的 `fwmark` 必须与脚本的 `XTP_BYPASS_MARK` 一致，默认均为 `2`，且不得与 nftables 打标用的 `XTP_FWMARK`（默认 `1`）相同。配置错误可能使程序自身的出站流量被再次截获，形成代理环路，导致相关连接无法正常建立。
 >
-> 如需修改默认端口或 fwmark，可编辑 `common.sh` 中的 `XTP_TPROXY_PORT`、`XTP_FWMARK`、`XTP_BYPASS_MARK` 变量。
-
-#### UCI 选项一览（`/etc/config/xtp-rs`）
-
-所有选项位于 `xtp_rs 'main'` 段（默认模板见
-[contrib/etc/config/xtp-rs](./contrib/etc/config/xtp-rs)，各项均有注释说明）。
-改动后需重跑 `setup-xtp-rs.sh`（或重启服务）才会生效；未安装 uci 的系统
-直接用对应环境变量覆盖：
-
-| UCI 选项 | 环境变量覆盖 | 说明 |
-|----------|--------------|------|
-| `bypass_chnroute` | `XTP_BYPASS_CHNROUTE` | 中国大陆 IP 目的地址直连（见下文） |
-| `tcp_ports` | `XTP_TCP_PORTS` | 待代理 TCP 目的端口（默认 `80 443`） |
-| `udp_ports` | `XTP_UDP_PORTS` | 待代理 UDP 目的端口（默认 `53 443`） |
-| `ext_reserved_ip` | `XTP_EXT_RESERVED_IP` | 额外强制直连的目的地址（见下文） |
-| `bypass_saddr` | `XTP_BYPASS_SADDR` | 按源 IP 直连，跳过代理（见下文） |
-| `bypass_skuid` | `XTP_BYPASS_SKUID` | 按进程属主（uid）直连，防环路替代方案（见下文） |
-
-#### 可选：中国大陆 IP 直连（UCI 选项 `bypass_chnroute`）
-
-TPROXY 会把被截获的流量导入本机 input 路径，这些流永远到不了 forward hook，
-因此 **fw4 flowtable 软/硬 offload 对被代理流量无效**。开启本选项后，目的地址
-命中中国大陆 IP 列表（IPv4 + IPv6）的流量在 prerouting/output 中提前直连放行：
-国内流量不再被代理（更低延迟与 CPU 开销），且重新走 FORWARD 路径，offload 得以生效。
-
-```bash
-# 1. 下载并生成列表（需能访问 GitHub，或用 XTP_CHNROUTE_URL /
-#    XTP_CHNROUTE6_URL 指定镜像）
-sudo ./update-chnroute.sh
-
-# 2. 开启开关（OpenWrt UCI；默认配置文件见 contrib/etc/config/xtp-rs）
-uci set xtp-rs.main.bypass_chnroute='1'
-uci commit xtp-rs
-
-# 3. 应用规则（或 /etc/init.d/xtp-rs restart）
-sudo ./setup-xtp-rs.sh
-
-# 4. 建议加入 cron 定期刷新列表并重跑 setup 应用规则（每周一两次即可；
-#    只更新文件不重跑 setup 的话，新列表不会生效）
-#    30 4 * * 0,3 { /usr/libexec/xtp-rs/update-chnroute.sh && /usr/libexec/xtp-rs/setup-xtp-rs.sh; } >/dev/null 2>&1
-```
-
-说明：
-- 列表文件位于 `/etc/xtp-rs/chnroute.nft`（IPv4）与
-  `/etc/xtp-rs/chnroute6.nft`（IPv6）；更新后需重跑 `setup-xtp-rs.sh` 生效；
-- IPv6 上游（`chn_ip_v6.txt`）每行为「起始地址 结束地址」区间对，脚本校验后
-  以 nft 区间元素原样写入，不做 CIDR 换算；
-- 两个地址族相互独立：任一列表缺失或下载失败只跳过对应规则/仅告警，
-  不影响其余功能；
-- 开关取值优先级：环境变量 `XTP_BYPASS_CHNROUTE` > UCI 选项 > 默认关闭。
-  非 OpenWrt 环境（无 uci）直接用环境变量即可。
-
-#### 可选：额外直连网段（UCI 选项 `ext_reserved_ip`）
-
-在内置保留网段（RFC1918 等）之外，把指定**目的地址**强制直连（不进入
-TPROXY），例如上游 VPN 服务器 IP、内网服务器、指定公网 IP：
-
-```bash
-uci set xtp-rs.main.ext_reserved_ip='10.8.0.1 192.168.9.0/24'
-uci commit xtp-rs
-
-# 应用规则（或 /etc/init.d/xtp-rs restart）
-sudo ./setup-xtp-rs.sh
-```
-
-说明：
-- 格式：空白/逗号/分号分隔的 IPv4 地址或 CIDR 网段，也可用
-  `uci add_list xtp-rs.main.ext_reserved_ip='10.8.0.1'` 逐条添加；
-- 与内置保留网段一起写入 nftables `reserved_ip` 集合，对转发流量
-  （prerouting）与本机出站流量（output）同时生效；
-- 取值优先级：环境变量 `XTP_EXT_RESERVED_IP` > UCI 选项 > 默认为空；
-- 改动后需重跑 `setup-xtp-rs.sh`（或重启服务）生效。
-
-#### 可选：源 IP 直连（UCI 选项 `bypass_saddr`）
-
-源地址命中列表的流量（如内网管理段）在 prerouting / output 中提前 return
-直连放行，不进入 TPROXY；适合整个网段不需要代理的场景（这些流重新走
-FORWARD 路径，fw4 flowtable offload 得以生效）：
-
-```bash
-uci set xtp-rs.main.bypass_saddr='10.2.1.0/24 192.168.9.0/24'
-uci commit xtp-rs
-
-# 应用规则（或 /etc/init.d/xtp-rs restart）
-sudo ./setup-xtp-rs.sh
-```
-
-说明：
-- 格式与 `ext_reserved_ip` 相同：空白/逗号/分号分隔的 IPv4 地址或 CIDR，
-  也可用 `uci add_list xtp-rs.main.bypass_saddr='10.2.1.0/24'` 逐条添加；
-- 同时作用于转发流量（prerouting）与本机出站流量（output）；
-- 取值优先级：环境变量 `XTP_BYPASS_SADDR` > UCI 选项 > 默认为空；
-- 改动后需重跑 `setup-xtp-rs.sh`（或重启服务）生效。
-
-#### 可选：按进程属主跳过代理（UCI 选项 `bypass_skuid`）
-
-防环路的替代方案：让 xtp-rs 以专用用户运行并设置本选项后，output 链中
-属主为该用户/uid 的本机出站流量提前 return，即使出站 socket 未设置
-`fwmark` 也不会被再次劫持形成环路：
-
-```bash
-uci set xtp-rs.main.bypass_skuid='xtp-rs'   # 用户名或数字 uid
-uci commit xtp-rs
-
-# 应用规则（或 /etc/init.d/xtp-rs restart）
-sudo ./setup-xtp-rs.sh
-```
-
-说明：
-- 默认为空（关闭）；用户名在应用规则时解析为数字 uid，用户不存在则
-  告警并忽略，不影响其余规则加载；
-- 填 `0`（root）会放行**所有** root 进程的本机出站流量，效果上等于
-  关闭本机出站代理（脚本会额外告警），一般只应填专用低权用户；
-- 取值优先级：环境变量 `XTP_BYPASS_SKUID` > UCI 选项 > 默认为空。
+> 可调参数（端口、保留网段、中国大陆 IP 直连等）见 [通用 Linux 部署](./docs/部署.md) 与 [OpenWrt 部署](./docs/OpenWrt.md)。
 
 ### 2. 编写配置文件
 
-默认配置文件路径为 `config.toml`（可通过 `-c` 指定）。最小化示例：
+默认配置文件路径为 `config.toml`（可用 `-c` 指定）。最小化示例：
 
 ```toml
 # config.toml
@@ -257,7 +135,7 @@ remote = "8.8.8.8:53"
 network = "udp"
 ```
 
-包含全部可选项的完整模板见 [contrib/etc/xtp-rs/config.toml](./contrib/etc/xtp-rs/config.toml)。
+包含全部可选项的完整模板见 [contrib/etc/xtp-rs/config.toml](./contrib/etc/xtp-rs/config.toml)，逐项说明见 [配置参考](./docs/配置.md)。
 
 ### 3. 运行
 
@@ -279,440 +157,44 @@ sudo xtp-rs -c /etc/xtp-rs/config.toml
 
 ---
 
-## 🧠 工作原理
-
-### 整体架构
+## 🧠 工作原理速览
 
 ```mermaid
 flowchart LR
-    subgraph HOOK["流量拦截（nftables + 策略路由）"]
-        C["客户端 / 本机出站流量"] --> N["nftables 表 inet xtp-rs<br/>prerouting + output 链"]
-        N -->|"TCP 80/443 · UDP 53/443<br/>打 fwmark = 1"| R["策略路由<br/>fwmark 1 → 路由表 100<br/>local default dev lo"]
-        R --> X["xtp-rs<br/>TPROXY 监听 [::]:10810"]
-        N -->|"meta mark 2"| OUT["直接放行<br/>（避免代理环路）"]
-    end
+    C["客户端 / 本机出站流量"] --> N["nftables<br/>prerouting + output"]
+    N -->|"TCP 80/443 · UDP 53/443<br/>打 fwmark = 1"| R["策略路由 → 路由表 100"]
+    R --> X["xtp-rs<br/>TPROXY 监听 [::]:10810"]
     X --> D{"智能路由决策<br/>GeoIP · geosite · CIDR · 域名嗅探"}
     D -->|"直连"| T1["目标服务器"]
     D -->|"代理"| U["SOCKS5 上游"] --> T2["目标服务器"]
 ```
 
-> [!WARNING]
-> **fwmark 约定**：`fwmark = 1`（`XTP_FWMARK`）由 nftables 设置，标记“待代理”的入站流量；`fwmark = 2`（`XTP_BYPASS_MARK`）由 xtp-rs 设置，标记“已代理 / 直连”的出站流量。因此配置文件中的 `fwmark` **必须为 2**，绝不能与 `XTP_FWMARK` 相同，否则程序自身的请求会被再次劫持形成环路。
-
-### 路由优先级
-
-在 `smart` 模式下，路由决策按以下优先级从高到低执行（命中即返回）：
-
-1. **域名强制规则** — `force_socks5_domains` → `force_direct_domains`
-2. **geosite 域名分类** — `proxy_geosite_tags` → `direct_geosite_tags`
-3. **路由缓存** — 缓存由 IP 规则和 GeoIP 得出的结果（域名规则不写缓存）
-4. **IP 强制规则** — `force_socks5_ips` → `force_direct_ips`
-5. **本地地址** — `direct_local_ip` 控制的回环 / 链路本地地址
-6. **GeoIP 国家判定** — `direct_countries` 中的国家代码
-
-域名规则支持两种格式：
-
-| 格式 | 匹配方式 |
-|------|----------|
-| `.example.com` | 后缀匹配：匹配 `example.com` 及其所有子域名 |
-| `example.com` | 精确匹配：仅匹配 `example.com` |
-
-> [!TIP]
-> 例如排除 PlayStation 流量不走代理：
->
-> ```toml
-> force_direct_domains = [".playstation.com", ".sony.com", ".playstation.net"]
-> ```
-
-### TCP 连接处理流程
-
-```mermaid
-flowchart TD
-    S(["TCP 连接到达（TPROXY）"]) --> M{"proxy_mode"}
-    M -->|"global"| PX["选择上游并走代理"]
-    M -->|"bypass"| DR["直连：连接原始目标 IP:Port"]
-    M -->|"smart"| IP{"IP-only 初判<br/>force_socks5_ips → force_direct_ips<br/>→ 本地地址 → GeoIP →（默认代理）"}
-    IP -->|"判定直连"| Q1{"需要域名嗅探？"}
-    IP -->|"判定代理"| Q2{"需要域名嗅探？"}
-    Q1 -->|"否（快速路径）"| DR
-    Q1 -->|"是"| SN["条件嗅探：TLS SNI → HTTP Host<br/>任一成功即停止"]
-    Q2 -->|"否"| PX
-    Q2 -->|"是"| SN
-    SN --> FJ{"最终判定<br/>域名 / geosite 规则覆盖 IP-only 结果"}
-    FJ -->|"直连"| DR
-    FJ -->|"代理"| PX
-    PX --> UP["分组查找：client_dst_ip_routes → client_domain_routes → client_routes → default<br/>组内按动态评分平方加权随机选择<br/>失败则尝试同组其他上游，最终回退 default 组"]
-    UP --> CT{"SOCKS5 CONNECT"}
-    CT -->|"嗅探成功"| DN["携带域名（交由上游解析）"]
-    CT -->|"嗅探失败"| IA["携带原始目标 IP"]
-    DR --> DONE(["转发数据"])
-    DN --> DONE
-    IA --> DONE
-```
-
-**触发域名嗅探的条件**（满足任一即需要）：
-
-- 配置了域名强制规则（`force_direct_domains` 或 `force_socks5_domains` 非空）；
-- 配置了 geosite 且处于 `smart` 模式；
-- 配置了 `client_domain_routes` 且当前客户端 IP 命中其中的 CIDR。
-
-**路由结果缓存**：由 IP 规则与 GeoIP 得出的路由结果会写入缓存（TTL 由 `route_cache_ttl_secs` 控制，容量由 `route_cache_max` 控制），后续相同目标的连接直接复用；域名规则的结果不写缓存。
-
-### UDP 数据包处理流程
-
-```mermaid
-flowchart TD
-    S(["UDP 数据包到达（TPROXY）"]) --> SE{"已有活跃会话？"}
-    SE -->|"是"| FW["直接转发（不重新路由）"]
-    SE -->|"否"| IP{"IP-only 判定（基于目标 IP）"}
-    IP -->|"直连"| LO["本地 UDP socket 直接发送"]
-    IP -->|"非直连"| Q{"QUIC SNI 嗅探开启？"}
-    Q -->|"否"| FW2["立即转发（按 IP 路由）"]
-    Q -->|"是"| WT["缓存数据包，直到嗅探完成<br/>随后携带嗅探到的域名转发"]
-    FW2 --> UA
-    WT --> UA
-    UA --> UP["上游选择：分组查找 + 动态评分"]
-    FW --> DONE(["转发"])
-    LO --> DONE
-    UP --> DONE
-```
-
-> [!NOTE]
-> **TCP 与 UDP 嗅探的关键差异**：TCP 嗅探结果会参与**直连 / 代理决策**（通过 geosite / 域名规则）；UDP 嗅探结果仅影响**上游分组选择**，直连 / 代理判定始终基于 IP-only 结果。
-
----
-
-## ⚙️ 配置参考
-
-### 核心参数
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `listen` | string | `"[::]:10810"` | TPROXY 监听地址（需与部署脚本中的端口一致） |
-| `udp` | bool | `true` | 是否启用 UDP 转发 |
-| `fwmark` | u32 | `2` | 直连 / SOCKS5 出站 socket 使用的 fwmark（必须与脚本中的 `XTP_BYPASS_MARK` 一致，见上文警告） |
-| `socks5_user` | string | 无 | SOCKS5 认证用户名（需与 `socks5_password` 同时配置） |
-| `socks5_password` | string | 无 | SOCKS5 认证密码（需与 `socks5_user` 同时配置） |
-| `mmdb_path` | string | 无 | GeoIP2 Country 数据库路径（留空禁用国家判定） |
-| `direct_countries` | [string] | `["CN"]` | 直连的国家代码（ISO 3166-1 alpha-2） |
-| `force_socks5_ips` | [string] | `[]` | 强制走代理的 IP/CIDR（IP 规则中最高优先级） |
-| `force_direct_ips` | [string] | `[]` | 强制直连的 IP/CIDR（优先级低于 force_socks5） |
-| `force_socks5_ips_file` | string | 无 | 额外的强制 SOCKS5 IP/CIDR 文件路径（每行一个） |
-| `force_direct_ips_file` | string | 无 | 额外的强制直连 IP/CIDR 文件路径（每行一个） |
-| `force_socks5_domains` | [string] | `[]` | 强制走代理的域名（域名规则中优先级最高） |
-| `force_direct_domains` | [string] | `[]` | 强制直连的域名（优先级高于 geosite，低于 force_socks5_domains） |
-| `direct_local_ip` | bool | `true` | 回环 / 链路本地地址是否强制直连 |
-| `sniff_tls_sni` | bool | `false` | 是否启用 TLS SNI 嗅探（仅非直连 TCP） |
-| `sniff_http_host` | bool | `false` | 是否启用 HTTP Host 嗅探 |
-| `quic_sniff_mode` | string | `"none"` | QUIC SNI 嗅探档位：`none` / `besteffort` / `full` |
-| `proxy_mode` | string | `"smart"` | 代理模式：`smart` / `global` / `bypass` |
-| `geosite_path` | string | 无 | geosite.dat 文件路径（需编译 geosite feature） |
-| `proxy_geosite_tags` | [string] | `[]` | 走代理的 geosite 分类（如 `gfw`） |
-| `direct_geosite_tags` | [string] | `[]` | 走直连的 geosite 分类（如 `geolocation-cn`） |
-| `log_level` | string | 环境变量，否则 `info` | 日志级别：`error` / `warn` / `info` / `debug` / `trace` |
-| `udp_session_timeout_secs` | u64 | `60` | UDP 会话空闲超时时间（秒） |
-| `connect_timeout_secs` | u64 | `20` | 上游连接超时时间（秒） |
-| `splice` | bool | `false` | TCP 转发是否优先使用 splice 零拷贝（为 `true` 时半关闭看门狗不生效，见下文） |
-| `half_close_timeout` | u64 | `600` | TCP relay 半关闭静默超时（秒），`0` 禁用。仅在一方已半关闭后计时 |
-| `route_cache_ttl_secs` | u64 | `5` | 路由结果缓存 TTL（秒），0 禁用缓存 |
-| `route_cache_max` | usize | `4096` | 路由结果缓存最大条目数 |
-
-> [!NOTE]
-> 嗅探功能默认均为关闭，需手动开启。编译时默认包含所有嗅探代码，运行时开启不会带来额外性能损失（仅处理非直连流量的首包）。
-
-### TCP relay 半关闭静默超时
-
-`copy_bidirectional` 只在**两个方向都读到 EOF** 后才返回。若对端只关闭写半边
-（half-close）后永不关闭读半边，relay 会永久挂起，连接长期停留在 `CLOSE-WAIT` /
-`FIN-WAIT-2`，慢性泄漏 fd、内核 socket、conntrack 表项与 ephemeral port。
-
-`half_close_timeout` 为该场景兜底：**一方已半关闭**，且此后双向静默超过该时长时，
-主动回收会话。
-
-| 行为 | 说明 |
-|------|------|
-| 触发条件 | 必须先有半关闭（`copy_bidirectional` 在某个方向读到 EOF 后关闭对向写半边） |
-| 计时起点 | 第一次半关闭的时刻，不是连接建立时刻 |
-| 计时重置 | 半关闭后转发层仍有进展（relay 成功读出/写入字节）就重新计时 |
-| 空闲长连接 | 双方都未半关闭时**永不**触发，交互式登录等正常空转不受影响 |
-| 关闭方式 | 两侧 socket 设 `SO_LINGER=0` 后 drop，直接发 **RST**（避免 FIN 无人 ACK 再挂一段） |
-| 禁用 | `half_close_timeout = 0`，行为与未引入该机制时完全一致（可用于回滚验证） |
-| 生效前提 | `splice = false` |
-| RST 范围 | **仅看门狗触发这一条路径**；普通转发 I/O 错误不额外发 RST，行为与 `half_close_timeout = 0` 时一致 |
-
-> [!NOTE]
-> “静默”的判定依据是 **relay 自身的转发进展**（一个方向成功读出、或对向成功写入
-> 字节），不是“内核接收缓冲里还有数据”。若某一端停止读取造成反压、转发层无法推进，
-> 即使对端仍在发包，超过 `half_close_timeout` 仍会被回收——此时连接确实已经没有
-> 端到端进展了。
-
-> [!IMPORTANT]
-> `splice = true` 时**看门狗不生效**。zero-copy 由内核在 fd 之间搬运数据，不经过
-> `poll_read` / `poll_write`，看门狗依赖的活动观测无法工作；而
-> `tokio_splice::Stream` 只对具体的 `TcpStream` / `UnixStream` 实现，包一层观测
-> 包装后就不再满足约束。xtp-rs 不静默改掉用户显式开启的优化，改为在启动/热重载时
-> **WARN 一次**提示 `half_close_timeout` 已被忽略。需要该保护请设 `splice = false`。
-
-#### 日志与计数器
-
-每次看门狗触发输出一条 `WARN`（不做采样，便于据日志反推回收速率）：
-
-```
-WARN TCP relay half-closed and silent, session reclaimed with RST
-     target=1.2.3.4:443 upstream_id=u1 silent_secs=600 duration_ms=3600000 total=17
-```
-
-字段：`target`（原始目标）、`upstream_id`（可选）、`silent_secs`（静默时长）、
-`duration_ms`（连接总时长）、`total`（累计触发次数）。
-
-xtp-rs 没有 metrics 框架（`/tmp/xtp-rs-report.sock` 是单向接收 shadowquic 上报的
-入口，不是可抓取端点），因此计数器以进程内 `AtomicU64` 暴露，并把累计值直接带在
-日志里：
-
-| 计数器 | 含义 |
-|--------|------|
-| `tcp_relay_half_close_timeout_total` | 半关闭看门狗触发次数（`total` 字段） |
-| `tcp_relay_copy_error_total` | `copy_bidirectional` 返回错误次数（`copy_errors_total` 字段） |
-
-> [!NOTE]
-> `tcp_relay_copy_error_total` 统计的是 `copy_bidirectional`（即 `splice = false`）的错误，
-> **不含**看门狗路径，也**不含** `splice = true` 时 `zero_copy_bidirectional` 的错误——
-> 那是另一个函数。所以在 `splice = true` 的部署下该计数恒为 0，日志里
-> `copy_errors_total = 0` 属正常，不代表没有 relay 错误。
-
-#### 实现说明
-
-看门狗由 `src/activity_stream.rs` 提供，三块拼起来：
-
-| 组件 | 作用 |
-|------|------|
-| `Activity` | 两侧共享的原子状态：最后一次字节流动的时刻、第一次半关闭的时刻（`0` 表示尚未半关闭） |
-| `ActivityGuard<S>` | 包装 `AsyncRead + AsyncWrite`，在 `poll_read` / `poll_write` 记录流动字节，在 `poll_shutdown` 成功时记录半关闭 |
-| `half_close_watchdog` | 按有界步长轮询，半关闭后静默达到宽限期即返回 |
-
-`relay_tcp_streams`（`src/util.rs`）在 `half_close_timeout > 0` 且 `splice = false` 时
-把两侧套上 `ActivityGuard`，与看门狗赛跑，并用 `biased` 让正常跑完优先。
-
-两个容易踩的点：
-
-- **EOF 不算活动**：`poll_read` 只有真正读到字节才 `touch()`。理由是语义上的——EOF 不是
-  转发进展，只说明这个方向没有更多数据了。它并**不是**「若计入就会破坏计时」：EOF 每个
-  方向只发生一次，且与对向 `poll_shutdown` 记录半关闭几乎同刻，而
-  `quiet_since_half_close()` 取两者较晚者，所以计入与否对计时没有影响。
-- **半关闭只记一次**：`half_closed()` 用 `compare_exchange(0, …)`，后续 shutdown 不覆盖
-  首次时刻。
-
-
-### 上游动态评分
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `disable_upstream_score` | bool | `false` | 禁用上游动态评分（启用后完全随机选择） |
-| `upstream_switch_tolerance` | u32 | `0` | 粘性切换容忍度（分），0 表示不启用粘性 |
-| `quic_weight` | u32 | `40` | QUIC 探针在选路分数中的权重（0-100） |
-| `quic_stale_secs` | u64 | `180` | QUIC 探针分数过期阈值（秒），超期后线性衰减到最低分（10） |
-| `enable_relative_scoring` | bool | `false` | 启用跨链路相对归一化评分（见下方说明） |
-| `relative_rescore_interval_secs` | u64 | `2` | 相对归一化评分重算间隔（秒），仅相对模式生效 |
-| `upstream_score_debug_interval_secs` | u64 | `0` | 分数调试打印间隔（秒），仅在 debug 级别启用时生效，设置为 0 禁用 |
-
-**评分机制说明**（默认绝对分段模式）：
-
-- **TCP 分数**：基于 `TCP_INFO` 实时吞吐量（bytes_received + bytes_acked），每 2 秒采样更新，采用 50/50 历史与新数据混合。
-- **QUIC 分数**：基于 ShadowQUIC 探针报告的 RTT、丢包率、MTU 综合计算，采用 30/70 历史与新数据混合，支持上行/下行双链路独立评分。
-- **QUIC 衰减**：QUIC 探针分数在 `quic_stale_secs`（默认 180 秒）未更新后线性衰减到最低分（10 分），避免因探针断流导致 upstream 被"饿死"而无法被选中更新。
-- **综合评分**：最终分数 = TCP 分数 × (100 - quic_weight) + QUIC 分数 × quic_weight，任一分数无效时退化为另一方；两路都无效时按基础分 75 处理。
-- **惩罚与基础分**：新 upstream 与连接失败被惩罚的 upstream 统一使用基础分 75，有效分下限 1 保证所有 upstream 都有机会被选中。
-- **选路权重**：effective_score = score × gain，采用平方加权随机选择（高分优势放大）。
-
-**相对归一化模式**（`enable_relative_scoring = true`，默认关闭）：
-
-绝对分段模式按固定吞吐阈值（≥50 MiB/s = 1000 分）打分，光纤链路稳定拿满分，4G/卫星链路被压得抬不起头。相对模式把吞吐速率与探针质量**相对同组最大值**归一化到 0~1000，自动适配任意网络环境：
-
-- 每个 `relative_rescore_interval_secs`（默认 2 秒）跨链路重算一次：组内最快/最优的链路得满分，其余按比例得分，评分口径与绝对量纲无关。
-- **冷启动种子**：尚无吞吐样本的新链路用探针相对分预置初始分；连探针报告都拿不到（新链路还没分到流量，ShadowQUIC 只在有流量时上报）时，用组内最优的一半做乐观先验，避免「无样本 → 无分数 → 无流量」的饥饿死锁。
-- **未初始化探索**：存在无任何测量样本的上游时，选路以 5% 概率从中均匀选取，保证新链路必能分到流量产生样本（对绝对模式同样生效）。
-- 坏链路成本有上限：连接失败即惩罚到基础分 75 并标记为已测量，探索与种子立即停止向它倾斜。
-
-### xtp-stats-reporter（ShadowQUIC 性能上报 daemon）
-
-`xtp-stats-reporter` 是一个 **ShadowQUIC 专用**的性能上报 daemon，运行在 OpenWrt 路由器上。ShadowQUIC 原生支持将链路质量（RTT、丢包率、MTU）输出到 syslog，xtp-stats-reporter 从 syslog 中实时捕获这些日志，解析后通过本地 Unix 数据报 socket（`/tmp/xtp-rs-report.sock`）以 JSON 格式上报给 xtp-rs，供上游动态评分使用。无需对 ShadowQUIC 做任何修改。
-
-**工作流程**：
-
-```mermaid
-flowchart LR
-    SQ["ShadowQUIC 隧道客户端"] -->|"syslog: rtt=152ms<br/>packet_loss_rate=37%<br/>mtu=1280"| LOG["logd (syslog)"]
-    LOG -->|"logread -f"| R["xtp-stats-reporter<br/>（stats_reporter.sh）"]
-    R -->|"Unix datagram socket<br/>JSON 上报"| X["xtp-rs<br/>/tmp/xtp-rs-report.sock"]
-```
-
-**部署**：
-
-```bash
-# 安装到 OpenWrt
-cp contrib/etc/init.d/xtp-stats-reporter /etc/init.d/
-cp contrib/usr/libexec/xtp-rs/stats_reporter.sh /usr/libexec/xtp-rs/
-chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
-
-# 启用并启动
-/etc/init.d/xtp-stats-reporter enable
-/etc/init.d/xtp-stats-reporter start
-```
-
-**依赖**：`socat`（用于发送 Unix 数据报）、`logread`（OpenWrt 自带）。
-
-**上报 JSON 格式**：
-
-```json
-{"upstream_id": "bbr_tunnel", "peer": "1234", "rtt_ms": 152.300, "loss_rate": 0.3700, "mtu": 1280, "link": "downlink"}
-```
-
-| 字段 | 说明 |
-|------|------|
-| `upstream_id` | 从 ShadowQUIC 的 `-c` / `--config` 参数推导的实例名（配置文件名去扩展名；多实例配置追加 `_N` 后缀，见下例） |
-| `peer` | ShadowQUIC 进程 PID |
-| `rtt_ms` | 链路 RTT（毫秒） |
-| `loss_rate` | 丢包率（小数，0.37 = 37%） |
-| `mtu` | 链路 MTU |
-| `link` | 方向：`uplink` / `downlink` |
-
-`upstream_id` 的推导规则：读取 `/proc/PID/cmdline`，找到 `-c` / `-c=` / `--config` / `--config=` 参数对应的路径，取 basename 并去掉扩展名；若日志行带多实例前缀 `instance{n=N}:`，则追加 `_N` 后缀。例如：
-
-| 启动命令 | 日志行 instance 字段 | `upstream_id` |
-|----------|---------------------|---------------|
-| `shadowquic -c /etc/shadowquic/bbr.yaml` | 无（单实例/旧版） | `bbr` |
-| `shadowquic -c /etc/shadowquic/combine.yaml` | `instance{n=0}:` | `combine_0` |
-| `shadowquic -c /etc/shadowquic/combine.yaml` | `instance{n=1}:` | `combine_1` |
-| `shadowquic --config=/etc/shadowquic/poe.yaml` | 无（单实例/旧版） | `poe` |
-| 找不到 `-c` 参数 / cmdline 不可读 | — | 跳过该次上报（仅 debug 日志记录） |
-
-xtp-rs 侧需将 upstream 的 `id` 配置为与之一致的值：单实例配置对应 `id = "bbr"`；多实例配置 `combine.yaml` 的第 N 个实例对应 `id = "combine_N"`。
-
-> [!NOTE]
-> - 单实例（旧版 fork，或新版只配置一个实例）的日志没有 `instance{n=X}` 字段，`upstream_id` 保持为配置名本身，与旧版部署完全兼容。
-> - 实例序号 N 以 ShadowQUIC 实际输出的日志为准。增删实例或调整其在配置中的顺序都会重排 N，需同步修改 xtp-rs 侧对应的 upstream id。
-> - 刷新探测的 `bind-addr` 解析仅支持块式 YAML（顶层 `bind-addr:` 或列表项 `- bind-addr:`）；flow 风格（`{bind-addr: ...}`）不识别，对应实例不会被周期探测，stats 仅在有真实流量时上报。
-> - 配置中出现的所有 `bind-addr` 都会被周期探测，多实例的每个 inbound 均会被覆盖。
-> - xtp-stats-reporter 仅解析 ShadowQUIC 格式的 syslog 条目（匹配 `shadowquic[PID]:` 前缀 + `uplink stats` / `downlink stats` 关键字）。其他进程的日志会被忽略。
-
-### 健康检查
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `health_check_interval_secs` | u64 | `0` | 主动健康检查间隔（秒），0 表示禁用 |
-| `health_check_timeout_secs` | u64 | `5` | 单次健康检查超时（秒） |
-| `health_check_fail_threshold` | u32 | `2` | 连续失败次数阈值 |
-| `health_check_url` | string | `"cp.cloudflare.com"` | 健康检查目标 URL |
-
-### TLS 嗅探
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `tcp_peek_buffer_size` | usize | `32768` | TCP 首包 sniff 全局缓冲区上限（字节） |
-| `tls_sniff_peek_len` | usize | `2048` | TLS sniff 首次 peek 长度（字节） |
-| `tls_sniff_max_len` | usize | `32768` | TLS sniff 最大探测长度（字节） |
-| `tls_sniff_max_retries` | usize | `5` | TLS sniff 最大重试次数 |
-| `tls_sniff_wait_more_ms` | u64 | `100` | TLS sniff 等待更多数据时间（毫秒） |
-| `tls_sniff_timeout_ms` | u64 | `1000` | TLS sniff 总超时时间（毫秒） |
-
-### HTTP 嗅探
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `http_sniff_peek_len` | usize | `512` | HTTP sniff 首次 peek 长度（字节） |
-| `http_sniff_max_len` | usize | `16384` | HTTP sniff 最大探测长度（字节） |
-| `http_sniff_max_retries` | usize | `5` | HTTP sniff 最大重试次数 |
-| `http_sniff_wait_more_ms` | u64 | `100` | HTTP sniff 等待更多数据时间（毫秒） |
-| `http_sniff_timeout_ms` | u64 | `1000` | HTTP sniff 总超时时间（毫秒） |
-
-### 上游配置
-
-```toml
-[[upstream]]
-id = "server1"                  # 唯一标识
-addr = "192.168.1.100:1080"     # SOCKS5 地址
-# groups = ["default"]          # 所属分组，未设置则自动属于 ["default"]
-# gain = 1.0                    # 乘数因子，用于放大或缩小该 upstream 的动态分数
-```
-
-- 至少配置一个 `upstream`，可配置多个，系统会动态评分并加权随机选择；
-- `gain` 必须大于 0，用于调整该 upstream 的选路权重；
-- `groups` 用于配合 `client_routes` 实现分组路由。
-
-### 客户端路由配置
-
-```toml
-# 按客户端源 IP 分配 upstream 分组
-[client_routes]
-"192.168.1.100" = "group_a"
-"192.168.2.0/24" = "group_b"
-
-# 按客户端源 IP + 域名模式分配 upstream 分组
-# 支持两种域名匹配模式：
-#   ".example.com"：后缀匹配，匹配 example.com 及其所有子域名
-#   "example.com" ：精确匹配，仅匹配 example.com
-[client_domain_routes."192.168.1.100"]
-".google.com" = "proxy_group"    # 后缀匹配
-"example.com" = "direct_group"   # 精确匹配
-
-# 按客户端源 IP + 目的 IP/CIDR 分配 upstream 分组
-# 优先级最高（高于 client_domain_routes / client_routes）
-[client_dst_ip_routes."192.168.1.0/24"]
-"172.253.118.0/24" = "proxy_group"
-```
-
-- `client_routes`：按客户端源 IP 分配 upstream 分组，支持单 IP 和 CIDR；
-- `client_domain_routes`：按客户端源 IP + 域名模式分配分组，优先级高于 `client_routes`；
-- `client_dst_ip_routes`：按客户端源 IP + 目的 IP/CIDR 分配分组，优先级最高；
-- 域名匹配按后缀长度降序优先匹配，确保最长匹配优先；
-- 同一客户端命中多张 `client_domain_routes` 表（如同时匹配 `/32` 与 `/24`）时，按客户端前缀从长到短逐表查找，首个域名命中生效：更具体的表只覆盖它显式列出的域名，未列出的域名回退到更宽网段的表；
-- 分组查找顺序：`client_dst_ip_routes → client_domain_routes → client_routes → default`。
-
-### 端口转发
-
-```toml
-[[port_forward]]
-name = "dns-via-socks5"       # 可选，仅用于日志
-bind = "127.0.0.1:5353"       # 本地监听地址
-remote = "8.8.8.8:53"         # 远端目标（必须是 IP:PORT）
-network = "both"              # tcp / udp / both
-```
+在 `smart` 模式下，路由决策按优先级命中即返回：**域名强制规则 → geosite → 路由缓存 → IP 强制规则 → 本地地址 / GeoIP**。完整流程（含 TCP / UDP 嗅探差异、上游动态评分机制）见 **[工作原理](./docs/工作原理.md)**。
 
 ---
 
 ## 📂 目录结构
 
-```
+```text
 xtp-rs/
+├── docs/                               # 文档
+│   ├── 配置.md                          # 完整配置参考
+│   ├── 工作原理.md                       # 架构与流程
+│   ├── 部署.md                          # 通用 Linux 部署
+│   ├── OpenWrt.md                      # OpenWrt 部署
+│   └── xtp-rs实战教程.md                 # 实战教程
 ├── contrib/
-│   ├── etc/
-│   │   ├── config/xtp-rs                # OpenWrt UCI 默认配置（bypass_chnroute 等）
-│   │   ├── capabilities/xtp-rs.json    # Linux capabilities 配置
-│   │   ├── init.d/
-│   │   │   ├── xtp-rs                  # OpenWrt init 脚本
-│   │   │   └── xtp-stats-reporter      # ShadowQUIC 性能上报 daemon 的 init 脚本
-│   │   └── xtp-rs/
-│   │       ├── config.toml                     # 完整配置模板
-│   │       └── Country-only-cn-private.mmdb    # GeoIP 数据库示例
-│   └── usr/libexec/xtp-rs/
-│       ├── common.sh                   # 公共函数库
-│       ├── setup-xtp-rs.sh             # 透明代理环境安装脚本
-│       ├── unsetup-xtp-rs.sh           # 清理脚本
-│       ├── update-chnroute.sh          # 中国大陆 IPv4/IPv6 直连列表更新脚本（可选）
-│       └── stats_reporter.sh           # ShadowQUIC 性能上报 daemon 主脚本
+│   ├── etc/                            # config.toml 模板、init.d / systemd、capabilities
+│   └── usr/libexec/xtp-rs/             # setup / unsetup / update-chnroute / stats_reporter
 ├── scripts/
 │   └── test_socks5_udp.py              # UDP 测试脚本
 ├── src/
-│   ├── cli.rs                          # 命令行和配置结构
-│   ├── main.rs                         # 程序入口
-│   ├── sniff/                          # 协议嗅探（tls, http, quic）
-│   ├── socks5.rs                       # SOCKS5 客户端实现
-│   ├── socket_factory.rs               # Socket 创建工厂
-│   ├── tcp.rs                          # TCP 透明代理处理
-│   ├── udp/                            # UDP 会话管理与转发
+│   ├── cli.rs                          # 命令行与配置结构
+│   ├── state.rs                        # 全局状态与路由决策
+│   ├── tcp.rs / udp/                   # TCP / UDP 透明代理
+│   ├── sniff/                          # 协议嗅探（tls / http / quic）
 │   ├── upstream.rs                     # 上游评分与选择
-│   ├── state.rs                        # 全局状态与生命周期
-│   └── util.rs                         # 工具函数
+│   └── socks5.rs / socket_factory.rs   # SOCKS5 客户端与 socket 创建
 ├── Cargo.toml
 └── README.md
 ```
@@ -727,33 +209,19 @@ cargo test
 
 部分测试需要 `tokio` 运行时环境（会自动处理）。
 
-`src/activity_stream.rs` 的看门狗单元测试依赖 `tokio` 的 `test-util`
-（暂停时钟），已放在 `[dev-dependencies]`，不会进入发布二进制。
-
-TCP relay 的半关闭回收用真实 loopback socket 做集成测试（`src/tcp.rs` 的 `mod tests`），
-**不需要 root 或 TPROXY**，5 个用例覆盖：
-
-1. 半关闭且静默 → 按时回收，且对端未观察到正常 EOF（Linux 上为 `ECONNRESET`）
-2. `half_close_timeout = 0` → 不回收，计数器不增长
-3. 正常双向关闭 → 不走看门狗、计数器不增长
-4. 半关闭后**持续有进展** → 不回收；停止进展后才回收
-5. 128 个并发半关闭会话 → 全部回收且各自恰好计一次
+`src/activity_stream.rs` 的半关闭看门狗单测依赖 `tokio` 的 `test-util`（暂停时钟，位于 `[dev-dependencies]`，不进入发布二进制）。TCP relay 半关闭回收的集成测试使用真实 loopback socket，**不需要 root 或 TPROXY**，机制与用例见 [工作原理 · TCP relay 半关闭静默超时](./docs/工作原理.md#六tcp-relay-半关闭静默超时)。
 
 ---
 
 ## ⚠️ 注意事项
 
 1. **权限要求** — 透明代理需要 root 权限（或 `CAP_NET_ADMIN` + `CAP_NET_RAW` + `CAP_NET_BIND_SERVICE`）。
-2. **splice 零拷贝** — 若系统启用了 IP 转发（`net.ipv4.ip_forward=1`），使用 `splice` 可能导致性能下降，参见 [splice 与转发路径的注意事项](https://github.com/XTLS/Xray-core/discussions/59)。建议保持默认 `splice = false`。
-3. **QUIC SNI 嗅探** — 三档（`quic_sniff_mode`，默认 `none`）：
-   - `none`：不嗅探，UDP 包立即按 IP 路由转发（零延迟、零 CPU 开销）；
-   - `besteffort`：只对每个流（同一目的 IP）的首包尝试提取 SNI，首包不足或失败即放弃、不再对后续包重试，无额外延迟（xray-core 默认行为）；
-   - `full`：按域名分组更准。需要嗅探的 QUIC 数据包缓存在 pending 中直到嗅探出域名再转发，但会牺牲约 n*RTT 时延（仅当 ClientHello 跨多个包时缓存等待补齐，典型约 1 秒、最坏 5 秒；单包内装下的 ClientHello 仍立即转发）。
-   解析 QUIC Initial 会增加 CPU 开销，可按需选择档位。
-4. **配置文件路径** — 默认读取当前工作目录下的 `config.toml`，可通过 `-c` 参数指定；`xtp-rs -T` 可在启动前校验配置。
-5. **热重载限制** — `SIGHUP` 重载时，端口转发监听地址若发生改变，旧地址上的监听 socket 会被关闭、新地址重新绑定；若新旧地址冲突可能导致短暂失败，建议避免频繁变动。
-6. **客户端路由** — 使用 `client_routes` 和 `client_domain_routes` 时，确保引用的 upstream 分组已在 `[[upstream]]` 中配置；未配置 `groups` 的 upstream 默认属于 `default` 组。
-7. **OpenWrt 部署** — 使用 `contrib/etc/init.d/xtp-rs` 脚本可集成到 OpenWrt 的 procd 服务管理，支持 ujail 沙箱和 capabilities 限制。
+2. **splice 零拷贝** — 默认关闭。历史讨论曾报告部分开启 IP 转发的环境存在性能下降，但不宜直接推广到所有环境；如需启用，建议在实际环境中对比吞吐量与 CPU 占用。
+3. **fwmark 不要配错** — 见上文快速开始的警告；配置错误可能形成代理环路。
+4. **配置校验** — 默认读取当前工作目录下的 `config.toml`，可用 `-c` 指定；`xtp-rs -T` 可在启动前校验配置。
+5. **热重载限制** — `SIGHUP` 重载时，端口转发监听地址若改变会先关旧 socket 再绑新地址，频繁变动可能短暂失败。
+
+更多排障见 [实战教程 · 排障 FAQ](./docs/xtp-rs实战教程.md#第-11-章-排障-faq)。
 
 ---
 

@@ -2,7 +2,7 @@
 
 > 一份由浅入深的 xtp-rs 使用指南：从「能跑起来」到「让网关自己思考」。
 >
-> 读完你将掌握：TPROXY 透明代理、GeoIP / geosite 分流、域名嗅探、DNS 转发、多上游动态竞争（BBR vs Brutal）、YouTube / Poe 专属线路、IPv4/IPv6 双栈全覆盖。
+> 读完你将掌握：TPROXY 透明代理、GeoIP / geosite 分流、域名嗅探、DNS 转发、多上游动态竞争（BBR vs Brutal）、YouTube / Poe 专属线路、IPv4 / IPv6 双栈全覆盖。
 
 ## 目录
 
@@ -17,7 +17,7 @@
 - [第 9 章 运维与调优](#第-9-章-运维与调优)
 - [第 10 章 毕业设计：一份生产配置全解剖](#第-10-章-毕业设计一份生产配置全解剖)
 - [第 11 章 排障 FAQ](#第-11-章-排障-faq)
-- [结语：xtp-rs 的思维层级](#结语xtp-rs的思维层级)
+- [结语：xtp-rs 的思维层级](#结语xtp-rs-的思维层级)
 
 ---
 
@@ -25,7 +25,7 @@
 
 ### 1.1 一句话定位
 
-xtp-rs 是一个跑在网关（路由器 / 旁路由 / 软路由）上的 **TPROXY 透明代理与流量调度器**。它把局域网设备的 TCP/UDP 流量无感接管过来，根据 **IP 归属地、geosite 域名分类、嗅探到的域名、客户端来源、上游实时质量** 决定每一股流量：直连，还是交给某个 SOCKS5 上游。
+xtp-rs 是一个跑在网关（路由器 / 旁路由 / 软路由）上的 **TPROXY 透明代理与流量调度器**。它把局域网设备的 TCP / UDP 流量无感接管过来，根据 **IP 归属地、geosite 域名分类、嗅探到的域名、客户端来源、上游实时质量** 决定每一股流量：直连，还是交给某个 SOCKS5 上游。
 
 它 **不实现任何翻墙协议**。协议层（ShadowQUIC、TUIC、Hysteria、Xray、sing-box……）交给专业工具，这些工具在本机暴露标准 SOCKS5 端口，xtp-rs 只负责「指挥交通」：
 
@@ -134,7 +134,7 @@ curl -4 ifconfig.co   # 国内站点直连时应显示本地宽带 IP
 
 两个值得注意的细节：
 
-- **域名规则永远压过 IP 规则**：哪怕一个域名解析到 CN IP，只要它在 `force_socks5_domains` 或 `proxy_geosite_tags` 里，照样走代理。
+- **在取得域名并执行域名判定时，域名规则优先于 IP 规则**：哪怕一个域名解析到 CN IP，只要它在 `force_socks5_domains` 或 `proxy_geosite_tags` 里，仍会走代理（UDP 路径存在跳过嗅探的情况，见第 4 章）。
 - **geosite 内部是先 proxy 后 direct**：同一个域名同时命中两边时，代理胜出。所以 `direct_geosite_tags` 要保守，宁可少写。
 
 ### 3.2 GeoIP：按 IP 归属地分流
@@ -210,7 +210,7 @@ IP 版本同理：`force_direct_ips` / `force_socks5_ips` 支持 CIDR，量大�
 |------|------|--------------|
 | `sniff_tls_sni` | TCP | TLS ClientHello 的 SNI 字段（HTTPS） |
 | `sniff_http_host` | TCP | HTTP/1.x 请求头的 Host 字段（明文 HTTP） |
-| `quic_sniff_mode` | UDP | QUIC SNI 嗅探档位：`none` / `besteffort` / `full` |
+| `quic_sniff_mode` | UDP | QUIC SNI 嗅探模式：`none` / `besteffort` / `full` |
 
 **默认全部关闭**（`quic_sniff_mode` 默认 `none`），需要显式打开：
 
@@ -221,41 +221,48 @@ quic_sniff_mode = "full"     # 或 "besteffort"，见 4.4
 tls_sniff_peek_len = 4096    # ClientHello 较大时更稳妥（默认 2048）
 ```
 
-运行时开销很小：只对「非直连」流量的**首包**做一次解析，之后的包零成本。
+开销取决于协议与嗅探模式：TCP 通常在首包解析，QUIC 的 `full` 模式可能需要缓存多个包。
 
-### 4.2 什么时候才会触发嗅探
+### 4.2 TCP 嗅探的触发条件
 
-不是每条连接都嗅探。满足以下**任一**条件才启动（仅针对代理路径上的流量，直连流量永远不嗅探）：
+在对应嗅探功能已编译且运行配置已开启的前提下，TCP 路径按以下条件判断是否需要嗅探，满足任一条件即可：
 
 1. 配置了域名强制规则（`force_direct_domains` / `force_socks5_domains` 非空）；
-2. 配置了 geosite 且处于 `smart` 模式；
+2. 配置了 geosite（`geosite_path` 非空）且 `proxy_geosite_tags` 或 `direct_geosite_tags` 非空，且处于 `smart` 模式；
 3. 配置了 `client_domain_routes`，且当前客户端 IP 命中其中的条目。
+
+第 1、2 条在直连与代理路径上都会触发，用于纠正 IP 层误判；第 3 条仅在 IP 初判为非直连时触发。
+
+UDP 的 QUIC 嗅探流程与此不同，见下一节。
 
 第 3 条到第 7 章会变得重要：你给电视盒子配了 YouTube 专线，盒子的连接就会触发嗅探，从而拿到域名去匹配 `.googlevideo.com`。
 
 ### 4.3 TCP 与 UDP 嗅探的关键差异（高级）
 
-- **TCP 嗅探**参与「直连 / 代理」决策：拿到域名后重新过一遍 geosite / force 规则，可以把 IP 层的误判纠正过来。
-- **UDP 嗅探只影响「走哪个上游分组」**，不影响直连 / 代理。UDP 的直连判定永远基于 IP-only 结果。
+- **TCP 嗅探**参与「直连 / 代理」决策：拿到域名后重新按 geosite 和域名强制规则判定，可以纠正 IP 层的误判。
+- **UDP 嗅探同样参与「直连 / 代理」决策**：建 UDP 会话时会按嗅探到的域名再跑一遍 `should_direct`，域名规则可以将「IP 初判代理」的判定结果改为直连；嗅探结果还决定 SOCKS5 UDP 目标地址用域名还是 IP、以及走哪个上游分组。
+- 但 **IP 初判为直连的 UDP 流会短路跳过嗅探**（内网、保留地址等），所以嗅探无法将「IP 直连」的判定结果改为代理；会话建立后，所采用的路由和目标地址形式（域名或 IP）不再改变。
 
-所以 YouTube 这种 QUIC 大户必须把 QUIC 嗅探打开（`besteffort` 或 `full`）：TCP 443 走 TLS 嗅探能进 youtube 组，UDP 443（HTTP/3）要靠 QUIC 嗅探才能进同一个组。不开的话，同一个视频的 TCP 走专线、QUIC 走默认池，体验割裂。
+如果希望 YouTube 的 QUIC 流量也按域名进入指定上游组，需要开启 QUIC 嗅探（`besteffort` 或 `full`）：TCP 443 走 TLS 嗅探能进 youtube 组，UDP 443（HTTP/3）则要靠 QUIC 嗅探才能进同一个组。未开启或未成功取得域名时，这部分流量会按 IP 和其他适用规则选择路由，不一定与 TCP 流量进入同一组。
 
-### 4.4 QUIC 嗅探的转发行为（三档）
+### 4.4 QUIC 嗅探的转发行为（三种模式）
 
-QUIC 的 ClientHello 可能跨多个包（分片），SNI 不一定在首包就能拿到。针对三种取舍提供三档 `quic_sniff_mode`：
+QUIC 的 ClientHello 可能跨多个包（分片），SNI 不一定在首包就能拿到。`quic_sniff_mode` 提供三种模式，用于在域名识别能力与嗅探等待之间取舍：
 
-- **`none`**：不做 QUIC sniff。UDP 包立即按 IP 路由转发，零延迟、零 CPU 开销。
-- **`besteffort`**：只对每个流（同一目的 IP）的**首个数据包**尝试提取 SNI，成功就用域名分组；首包不足或失败就**直接放弃**——不再创建 pending、不再对后续包重试，立即按 IP 转发。无额外延迟，代价是跨包 ClientHello 的 QUIC 流量识别不到域名。这是 xray-core 的默认行为。
+- **`none`**：不执行 QUIC 嗅探，也不引入嗅探等待，UDP 包按 IP 路由转发。
+- **`besteffort`**：对每个新建 UDP 会话的**首个数据包**尝试提取 SNI；成功时把域名用于直连 / 代理判定，需要代理时再用于上游分组选择；首包不足或解析失败就**直接放弃**——不再创建 pending、不再对后续包重试，按 IP 路由。代价是跨包 ClientHello 的 QUIC 流量识别不到域名。
   > 命中 best-effort 放弃时，debug 日志会打印 `UDP sniff best-effort: SNI not found in first packet, giving up`，明确说明不再尝试。
-- **`full`**：用 pending 缓存。首个包 `NeedMore` 时把包缓存进 pending，凑够能提取出 SNI 的多个包后再带域名一起转发，路由完全准确；代价是牺牲约 **n×RTT** 时延（n 为凑齐 SNI 所需的包数），仅当 ClientHello 跨多个包时才缓存等待补齐（典型约 1 秒、最坏 5 秒），单包内装下的 ClientHello 仍立即转发、零延迟。
+- **`full`**：首包不足以完成嗅探、需要继续收集数据时，把数据包暂存进 pending 缓存；成功提取 SNI 后按域名完成路由判定并转发缓存的数据包，超时或解析失败则按 IP 转发。缓存等待时限由 `quic_sniff_pending_timeout_ms` 控制（默认 **200 毫秒**，与 xray-core 的 `cacheDeadline` 同量级）：窗口内凑齐即转发，首包即可完成嗅探时不进入 pending。跨包识别率更高，但可能引入等待。
 
 ```toml
-quic_sniff_mode = "besteffort"   # 首选：零延迟 + 尽可能识别（xray 默认）
-quic_sniff_mode = "full"         # 分组最准，但跨包 ClientHello 会多花 n 倍 RTT
-quic_sniff_mode = "none"         # 完全不嗅探，QUIC 一律按 IP 路由
+# 三选一
+quic_sniff_mode = "besteffort"   # 不等待后续包，尽量识别
+
+# quic_sniff_mode = "full"       # 支持跨包嗅探，可能引入等待
+# quic_sniff_mode = "none"       # 不执行 QUIC 嗅探
 ```
 
-看视频场景：若要求 QUIC 握手零延迟、且你的 QUIC 大户走的路由与 IP 判定一致，用 `besteffort` 或 `none` 换零延迟；若必须确保每个视频都进对组、能接受几十毫秒起步的时延，用 `full`。
+看视频场景：若不希望为嗅探等待、且 QUIC 大户走的路由与 IP 判定一致，用 `besteffort` 或 `none`；若更重视按域名分组的命中率，并能接受嗅探等待，可使用 `full`——等待时限默认为 200 ms，超时或解析失败时仍按 IP 路由。
 
 ---
 
@@ -263,7 +270,7 @@ quic_sniff_mode = "none"         # 完全不嗅探，QUIC 一律按 IP 路由
 
 ### 5.1 解决什么问题
 
-`[[port_forward]]` 在本地起一个 TCP/UDP 端口，把收到的数据**无条件**经 SOCKS5 转发到固定目标。最经典的用途是 DNS：
+`[[port_forward]]` 在本地起一个 TCP / UDP 端口，把收到的数据**无条件**经 SOCKS5 转发到固定目标。最经典的用途是 DNS：
 
 ```toml
 [[port_forward]]
@@ -428,7 +435,7 @@ xtp-rs 给每条上游维护一个 0–1000 的动态分，来自两个信息源
 **② QUIC 探针分（被动接收）**：ShadowQUIC 原生支持将链路质量（RTT、丢包率、MTU）输出到 syslog，无需任何修改。配套的 `xtp-stats-reporter` daemon（`contrib/usr/libexec/xtp-rs/stats_reporter.sh`）实时捕获这些日志，解析后通过本地 Unix 数据报 socket `/tmp/xtp-rs-report.sock` 以 JSON 格式上报给 xtp-rs：
 
 ```json
-{"upstream_id": "bbr_tunnel", "peer": "vps:1443", "rtt_ms": 152.3, "loss_rate": 0.37, "mtu": 1280, "link": "downlink"}
+{"upstream_id": "bbr_tunnel", "peer": "1234", "rtt_ms": 152.3, "loss_rate": 0.37, "mtu": 1280, "link": "downlink"}
 ```
 
 基础分 1000，按丢包率和 RTT 逐级扣分；每 5 秒最多刷新一次，新旧分按 3:7 混合（新数据占七成，响应快又不至于抖动）。`loss_rate` 是小数（0.37 = 37%）；`link` 可标 `downlink` / 上行，双向都有报告时取平均。
@@ -491,7 +498,7 @@ health_check_fail_threshold = 2
 health_check_url = "cp.cloudflare.com"
 ```
 
-每条上游周期发起 HTTP HEAD 探测，连续失败 2 次标记为不可用、移出竞争池；恢复后自动归队。和被动评分（吞吐 + 探针）互补：被动机制发现「变慢」，主动检查发现「挂了」。
+每条上游周期发起 HTTP HEAD 探测，连续失败 2 次标记为不可用、移出竞争池；恢复后重新参与上游选择。和被动评分（吞吐 + 探针）互补：被动机制发现「变慢」，主动检查发现「挂了」。
 
 ### 6.9 实测效果
 
@@ -532,7 +539,7 @@ groups = ["youtube"]
 ```
 
 - 一个 upstream 可以属于多个组：`groups = ["youtube", "default"]`；
-- 组内多条上游自动按第 6 章的评分机制竞争——**youtube 组 = 一套独立的 BBR/Brutal 竞争池**，和默认池互不干扰；
+- 组内多条上游自动按第 6 章的评分机制竞争——**youtube 组 = 一套独立的 BBR / Brutal 竞争池**，和默认池互不干扰；
 - 组里只有一条上游时，它就是固定专线，无竞争可言。
 
 ### 7.2 client_routes：按「谁访问」派单
@@ -546,8 +553,8 @@ groups = ["youtube"]
 "2409::/16"      = "group_b"     # v6 运营商大段（见第 8.3 节）也可以
 ```
 
-- 键支持任意 **IP/CIDR（v4 或 v6）**，按最长前缀匹配；
-- 它是分组查找链路里兜底的客户端级规则——命中就整台设备进这个组，不再细分域名/目的 IP；
+- 键支持任意 **IP / CIDR（v4 或 v6）**，按最长前缀匹配；
+- 它是分组查找链路里兜底的客户端级规则——命中就整台设备进这个组，不再细分域名 / 目的 IP；
 - 只按来源分流；如果同一设备的流量里既有要走专线的、又有要走默认的，就用下面优先级更高的 `client_domain_routes` / `client_dst_ip_routes` 去细分。
 
 ### 7.3 client_domain_routes：按「谁访问 + 访问什么」派单
@@ -584,11 +591,11 @@ flowchart TD
 
 1. **域名从嗅探来**——必须开 `sniff_tls_sni` / `quic_sniff_mode!=none`（见第 4 章），且客户端 IP 命中 `client_domain_routes` 才会触发嗅探；改为 `client_dst_ip_routes` 后不依赖嗅探，目的 IP 直判即可；
 2. **引用的组必须存在且有 upstream**，启动时 `-T` 自检会报不存在的组；
-3. **域名匹配按最长后缀优先**——`.googlevideo.com` 和 `.com` 同时配了，前者赢；IP/CIDR 同样按最长前缀优先。
+3. **域名匹配按最长后缀优先**——`.googlevideo.com` 和 `.com` 同时配了，前者赢；IP / CIDR 同样按最长前缀优先。
 
 ### 7.4 client_dst_ip_routes：按「谁访问 + 目的 IP」派单
 
-当目标地址**只知道 IP、拿不到或不想依赖域名**时，用 `client_dst_ip_routes`——它和外层的客户端源 IP 一起，按**目的 IP/CIDR** 决定分组，且优先级最高，不依赖任何嗅探：
+当目标地址**只知道 IP、拿不到或不想依赖域名**时，用 `client_dst_ip_routes`——它和外层的客户端源 IP 一起，按**目的 IP / CIDR** 决定分组，且优先级最高，不依赖任何嗅探：
 
 ```toml
 [client_dst_ip_routes."192.168.1.0/24"]     # 整个家里网段
@@ -596,7 +603,7 @@ flowchart TD
 "8.8.8.8"          = "dns_group"            # 单个 IP 也可以
 ```
 
-和 `client_domain_routes` 的区别：内层键前者是**域名**（需要嗅探），后者是**目的 IP/CIDR**（无需嗅探，任何 TCP/UDP 直达）。因为优先级最高，即使同一客户端同时命中域名规则，只要目的 IP 命中这里，就以这里为准。
+和 `client_domain_routes` 的区别：内层键前者是**域名**（需要嗅探），后者是**目的 IP / CIDR**（无需嗅探，任何 TCP / UDP 直达）。因为优先级最高，即使同一客户端同时命中域名规则，只要目的 IP 命中这里，就以这里为准。
 
 ### 7.5 实战一：YouTube 专线
 
@@ -636,7 +643,7 @@ groups = ["poe"]
 >
 > （哪台设备要用 Poe，就给哪台配上；所有设备都要用，见第 8 章的 CIDR 写法。）
 
-想让 Poe 也有 BBR/Brutal 竞争能力？再加一条上游进 poe 组即可，机制与第 6 章完全相同。
+想让 Poe 也有 BBR / Brutal 竞争能力？再加一条上游进 poe 组即可，机制与第 6 章完全相同。
 
 ---
 
@@ -667,7 +674,7 @@ groups = ["poe"]
 
 ### 8.3 解法：用运营商大段一把罩住所有 IPv6 客户端
 
-`client_domain_routes` 的键支持任意 **IP/CIDR（v4 或 v6）**，按最长前缀匹配。家庭宽带下，所有设备的公网 v6 都落在运营商分配的前缀段内，所以：
+`client_domain_routes` 的键支持任意 **IP / CIDR（v4 或 v6）**，按最长前缀匹配。家庭宽带下，所有设备的公网 v6 都落在运营商分配的前缀段内，所以：
 
 ```toml
 # 中国移动宽带：所有设备的公网 v6 都在 2409::/16 里
@@ -701,10 +708,10 @@ groups = ["poe"]
 YouTube / Google 系在 v6 上几乎全是 QUIC（UDP 443）。v6 流量进了 TPROXY、客户端也命中了 2409::/16 之后，还差最后一步——**从 QUIC Initial 里解析出域名**才能匹配 `.googlevideo.com`：
 
 ```toml
-quic_sniff_mode = "besteffort"   # 通常足够；要 100% 命中跨包 ClientHello 再上 "full"
+quic_sniff_mode = "besteffort"   # 通常足够；需要提高跨包 ClientHello 的识别率时可用 "full"
 ```
 
-回忆第 4 章：UDP 嗅探不影响直连/代理（那是 IP 层定的），只决定**进哪个分组**——这正是本场景需要的。
+回忆第 4 章：UDP 嗅探出的域名会参与直连 / 代理判定，同时也是**分组路由**的依据——这正是本场景需要的。
 
 ### 8.5 双栈验证清单
 
@@ -717,7 +724,7 @@ curl -4 ifconfig.co ; curl -6 ifconfig.co
 
 - 出现 v6 客户端地址（2409:…）和 v6 目标地址；
 - v6 的 YouTube 连接命中 `youtube` 组而不是 default；
-- UDP/443 的连接也有分组记录。
+- UDP 443 的连接也有分组记录。
 
 v6 连接在日志里完全隐身，而设备确实有公网 v6——多半是第一层（nftables / 策略路由）没接住 v6；日志里有 v6 连接但分组不对——就是第二层的键没覆盖到。
 
@@ -747,51 +754,16 @@ xtp-rs -T -c /etc/xtp-rs/config.toml    # 启动前自检 + 打印生效配置
 logread -f | grep xtp-rs                 # OpenWrt（procd 无 journalctl）
 ```
 
-`log_level = "debug"` + `SIGHUP` 重载后，日志里能看到：每条连接的客户端/目标、嗅探到的域名、命中的规则、被选中的组与上游、实时评分。**排障第一件事永远是开 debug 看日志，而不是猜。**
+`log_level = "debug"` + `SIGHUP` 重载后，日志里能看到：每条连接的客户端 / 目标、嗅探到的域名、命中的规则、被选中的组与上游、实时评分。**排障第一件事永远是开 debug 看日志，而不是猜。**
 
 ### 9.3 OpenWrt 集成
 
-`contrib/etc/init.d/xtp-rs` 提供 procd 服务脚本，支持 ujail 沙箱与 capabilities 约束（`contrib/etc/capabilities/xtp-rs.json`），免 root 全权运行：
+OpenWrt 使用 `uci` 配置、`/etc/init.d/xtp-rs`（procd）管理服务，支持 ujail 沙箱与 capabilities 约束（`contrib/etc/capabilities/xtp-rs.json`），并可用 `xtp-stats-reporter` 上报 ShadowQUIC 链路质量供动态评分使用。
 
-```bash
-/etc/init.d/xtp-rs enable && /etc/init.d/xtp-rs start
-```
-
-### 9.3.1 xtp-stats-reporter：ShadowQUIC 性能上报
-
-如果你使用 ShadowQUIC 作为隧道客户端并希望 xtp-rs 能根据 QUIC 链路质量动态选路，需要部署 `xtp-stats-reporter`。ShadowQUIC 原生支持将链路质量输出到 syslog，无需任何修改；xtp-stats-reporter 作为配套 daemon，从 syslog 中实时捕获这些日志（RTT、丢包率、MTU），解析后上报给 xtp-rs。
-
-**安装**：
-
-```bash
-cp contrib/etc/init.d/xtp-stats-reporter /etc/init.d/
-cp contrib/usr/libexec/xtp-rs/stats_reporter.sh /usr/libexec/xtp-rs/
-chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
-
-/etc/init.d/xtp-stats-reporter enable
-/etc/init.d/xtp-stats-reporter start
-```
-
-**依赖**：`socat`（`opkg install socat`）、`logread`（OpenWrt 自带）。
-
-**验证**：`logread | grep xtp-stats-reporter` 应能看到解析日志；如果 ShadowQUIC 正在运行且链路有流量，xtp-rs 的 debug 日志中会出现 QUIC 探针分数更新。
-
-**多实例配置的 id 对应关系**：新版 ShadowQUIC 支持单个配置文件声明多个实例，日志会带 `instance{n=N}:` 前缀（如 `instance{n=0}: uplink stats ...`）。此时上报的 `upstream_id` 为「配置文件名_N」，例如 `/etc/shadowquic/combine.yaml` 的实例 0、1 分别上报 `combine_0`、`combine_1`，xtp-rs 侧的 upstream `id` 须与之对应：
-
-```toml
-[[upstream]]
-id = "combine_0"   # combine.yaml 的实例 0
-# ...
-
-[[upstream]]
-id = "combine_1"   # combine.yaml 的实例 1
-# ...
-```
-
-单实例（旧版 fork，或新版只配置一个实例）的日志没有 `instance{n=X}` 字段，`upstream_id` 仍为配置文件名本身（如 `id = "niyaou"` 对应 `niyaou.yaml`），旧部署无需改动。
+这部分内容统一放在 **[OpenWrt 部署](./OpenWrt.md)**：UCI 选项、procd 服务、交叉编译、stats-reporter 安装与多实例 `upstream_id` 对应关系。
 
 > [!NOTE]
-> 不使用 ShadowQUIC 时无需部署此 daemon。xtp-rs 的 TCP 吞吐评分（基于 `TCP_INFO`）始终自动生效，不依赖任何外部组件。
+> 通用 Linux 用 `sudo` + `systemctl`（见 **[通用 Linux 部署](./部署.md)**），OpenWrt 用 `uci` + `/etc/init.d`，两套命令体系不要混用。
 
 ### 9.4 路由缓存
 
@@ -804,9 +776,9 @@ id = "combine_1"   # combine.yaml 的实例 1
 
 ### 9.5 性能提示
 
-- `splice = false` 保持默认：内核开了 `ip_forward` 时 splice 零拷贝反而可能掉速；
-- 嗅探只处理非直连流量首包，全开的开销可以忽略；QUIC 解析 AES 相对贵一点，低配路由可在分组需求不强时用 `quic_sniff_mode = "none"`；
-- UDP 会话超时 `udp_session_timeout_secs`（默认 60s）对 QUIC 长连接足够。
+- `splice = false` 保持默认：历史讨论曾报告部分开启 IP 转发的环境存在性能下降，但不宜直接推广；如需启用，建议在实际环境中对比吞吐量与 CPU 占用；
+- 嗅探会带来协议解析开销，QUIC 解析（含 AES）相对更贵；低配路由在分组需求不强时可用 `quic_sniff_mode = "none"`；
+- UDP 会话超时 `udp_session_timeout_secs`（默认 120 秒）对 QUIC 长连接足够。
 
 ---
 
@@ -967,7 +939,7 @@ network = "udp"
 
 ---
 
-## 结语：xtp-rs的思维层级
+## 结语：xtp-rs 的思维层级
 
 | 层级 | 要解决的问题 | xtp-rs 的武器 |
 |:---:|--------------|----------------|
@@ -976,10 +948,10 @@ network = "udp"
 | 3 | 按域名精准识别 | TLS / HTTP / QUIC 嗅探 |
 | 4 | 业务划专线 | `groups` + `client_domain_routes` |
 | 5 | 线路自动优胜劣汰 | 多上游动态评分 + 平方加权随机 |
-| 6 | v4/v6/TCP/UDP 都不漏 | 双栈劫持 + v6 CIDR 客户端路由 + QUIC 嗅探 |
+| 6 | v4 / v6 / TCP / UDP 都不漏 | 双栈劫持 + v6 CIDR 客户端路由 + QUIC 嗅探 |
 | 7 | DNS、游戏特殊处理 | `port_forward` + `force_direct_domains` |
 | 8 | 无人值守 | 健康检查、热重载、信号、procd |
 
-最终你的网关不再是一个「固定出口」的代理，而是一套按 **业务、客户端、协议、实时网络质量** 做决策的调度系统：普通流量在默认池里 BBR/Brutal 竞争，YouTube 在专线池里竞争，Poe 走固定专线，国内直连，游戏直连，DNS 走隧道——网络好时斯文，绝境时拼命，全自动。
+最终你的网关不再是一个「固定出口」的代理，而是一套按 **业务、客户端、协议、实时网络质量** 做决策的调度系统：普通流量在默认池里 BBR / Brutal 竞争，YouTube 在专线池里竞争，Poe 走固定专线，国内直连，游戏直连，DNS 走隧道——网络好时斯文，绝境时拼命，全自动。
 
 > 欢迎到 [GitHub 仓库](https://github.com/hrimfaxi/xtp-rs)提交 Issue 和 PR。
