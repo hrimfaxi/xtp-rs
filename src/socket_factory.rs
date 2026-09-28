@@ -148,12 +148,26 @@ impl SocketFactory {
     }
 
     /// 创建带 fwmark 的异步 TCP 连接
-    pub async fn connect_tcp_stream(&self, addr: SocketAddr, fwmark: u32) -> Result<TcpStream> {
+    ///
+    /// `tcp_nodelay` 为 `true` 时设 `TCP_NODELAY`（关闭 Nagle），覆盖该 socket 之后
+    /// 的全部写——SOCKS5 握手与随后的转发都在这条连接上。此处失败可以传播：它在
+    /// connect 路径上，不是 accept 循环。
+    pub async fn connect_tcp_stream(
+        &self,
+        addr: SocketAddr,
+        fwmark: u32,
+        tcp_nodelay: bool,
+    ) -> Result<TcpStream> {
         let socket = self
             .tcp_socket(addr)
             .with_context(|| format!("failed to create TCP socket for {addr}"))?;
         self.apply_socket_options(&socket, addr, false, false, None, Some(fwmark))
             .with_context(|| format!("failed to apply socket options for {addr}"))?;
+        if tcp_nodelay {
+            socket
+                .set_tcp_nodelay(true)
+                .with_context(|| format!("failed to set TCP_NODELAY for {addr}"))?;
+        }
         socket
             .set_nonblocking(true)
             .with_context(|| format!("failed to set nonblocking for {addr}"))?;

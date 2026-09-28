@@ -71,6 +71,7 @@ async fn try_connect_socks5_group(
             state.config.fwmark,
             state.socks5_credentials(),
             std::time::Duration::from_secs(state.config.connect_timeout_secs),
+            state.config.tcp_nodelay,
         )
         .await
         {
@@ -113,11 +114,12 @@ pub async fn connect_tcp_upstream(
     fwmark: u32,
     creds: Option<(&str, &str)>,
     timeout: std::time::Duration,
+    tcp_nodelay: bool,
 ) -> Result<TcpStream> {
     match target {
         TcpUpstreamTarget::Direct(addr) => {
             debug!(addr = %addr, "direct connect");
-            tokio::time::timeout(timeout, direct_connect(*addr, fwmark))
+            tokio::time::timeout(timeout, direct_connect(*addr, fwmark, tcp_nodelay))
                 .await
                 .map_err(|_| anyhow!("direct connect timeout"))?
         }
@@ -125,7 +127,13 @@ pub async fn connect_tcp_upstream(
             debug!(addr = %addr, "proxy connect by ip");
             tokio::time::timeout(
                 timeout,
-                socks5_connect(Socks5Target::Ip(*addr), socks5_addr, fwmark, creds),
+                socks5_connect(
+                    Socks5Target::Ip(*addr),
+                    socks5_addr,
+                    fwmark,
+                    creds,
+                    tcp_nodelay,
+                ),
             )
             .await
             .map_err(|_| anyhow!("SOCKS5 connect timeout"))?
@@ -139,6 +147,7 @@ pub async fn connect_tcp_upstream(
                     socks5_addr,
                     fwmark,
                     creds,
+                    tcp_nodelay,
                 ),
             )
             .await
@@ -147,10 +156,14 @@ pub async fn connect_tcp_upstream(
     }
 }
 
-pub async fn direct_connect(orig_dst: SocketAddr, fwmark: u32) -> Result<TcpStream> {
+pub async fn direct_connect(
+    orig_dst: SocketAddr,
+    fwmark: u32,
+    tcp_nodelay: bool,
+) -> Result<TcpStream> {
     debug!(dst = %orig_dst, "direct connect");
     SocketFactory::new()
-        .connect_tcp_stream(orig_dst, fwmark)
+        .connect_tcp_stream(orig_dst, fwmark, tcp_nodelay)
         .await
         .with_context(|| format!("direct connect to {orig_dst} failed"))
 }
@@ -294,10 +307,12 @@ pub async fn handle_tcp_connection(
         let target = decide_tcp_upstream_target(orig_dst, true, None);
         if let TcpUpstreamTarget::Direct(target_addr) = target {
             let timeout = std::time::Duration::from_secs(state.config.connect_timeout_secs);
-            let mut upstream =
-                tokio::time::timeout(timeout, direct_connect(target_addr, state.config.fwmark))
-                    .await
-                    .map_err(|_| anyhow!("direct connect timeout"))??;
+            let mut upstream = tokio::time::timeout(
+                timeout,
+                direct_connect(target_addr, state.config.fwmark, state.config.tcp_nodelay),
+            )
+            .await
+            .map_err(|_| anyhow!("direct connect timeout"))??;
             return relay_tcp(
                 &mut client,
                 &mut upstream,
@@ -334,9 +349,12 @@ pub async fn handle_tcp_connection(
     let (mut upstream, up) = match target {
         TcpUpstreamTarget::Direct(target_addr) => {
             let timeout = std::time::Duration::from_secs(state.config.connect_timeout_secs);
-            let s = tokio::time::timeout(timeout, direct_connect(target_addr, state.config.fwmark))
-                .await
-                .map_err(|_| anyhow!("direct connect timeout"))??;
+            let s = tokio::time::timeout(
+                timeout,
+                direct_connect(target_addr, state.config.fwmark, state.config.tcp_nodelay),
+            )
+            .await
+            .map_err(|_| anyhow!("direct connect timeout"))??;
             (s, None)
         }
         _ => {
@@ -351,6 +369,7 @@ pub async fn handle_tcp_connection(
                     state.config.fwmark,
                     state.socks5_credentials(),
                     std::time::Duration::from_secs(state.config.connect_timeout_secs),
+                    state.config.tcp_nodelay,
                 )
                 .await
                 {
@@ -467,6 +486,11 @@ pub async fn run_tcp_port_forward(
             res = listener.accept() => {
                 let (mut client, peer_addr) = res
                     .with_context(|| format!("accept on port-forward {}", listen_addr))?;
+                // 回程方向（上游 -> 客户端）；accept 循环里丢弃错误：为一个
+                // socket 选项拒绝连接（或打断整个循环）比付这段延迟更糟。
+                if state.config.tcp_nodelay {
+                    let _ = client.set_nodelay(true);
+                }
                 let state_for_task = state.clone();
                 state.tcp_handlers.spawn(|cancel| async move {
                     tokio::select! {
@@ -571,6 +595,10 @@ pub async fn tcp_accept_loop(
             res = listener.accept() => {
                 match res {
                     Ok((stream, peer_addr)) => {
+                        // 回程方向（上游 -> 客户端）；accept 循环里丢弃错误，理由同上。
+                        if state.config.tcp_nodelay {
+                            let _ = stream.set_nodelay(true);
+                        }
                         let state_for_task = state.clone();
                         state.tcp_handlers.spawn(|cancel| async move {
                             tokio::select! {

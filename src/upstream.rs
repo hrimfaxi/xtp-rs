@@ -1075,12 +1075,13 @@ async fn check_upstream_health(
     creds: Option<(&str, &str)>,
     check_url: &str,
     timeout_secs: u64,
+    tcp_nodelay: bool,
 ) -> bool {
     let target = Socks5Target::Domain(check_url, 80);
 
     let Ok(Ok(mut stream)) = timeout(
         Duration::from_secs(timeout_secs),
-        socks5_connect(target, up.addr, fwmark, creds),
+        socks5_connect(target, up.addr, fwmark, creds, tcp_nodelay),
     )
     .await
     else {
@@ -1146,6 +1147,7 @@ pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationTok
                     creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
                     &check_url,
                     timeout_secs,
+                    c.tcp_nodelay,
                 ) => r,
             };
 

@@ -40,6 +40,16 @@ udp_session_timeout_secs = 120
 # poll_write，看门狗观测不到），half_close_timeout 会被忽略并在启动时 WARN。
 splice = false
 
+# 是否对所有 TCP socket 设 TCP_NODELAY（关闭 Nagle）。
+# 默认值：true
+#
+# 覆盖入站 accept 出来的连接（回程：上游 -> 客户端）与出站连接（去程）两处。
+# 中继本身不产生数据，origin 的 Nagle 已经合并过一次，中继再合并没有收益，
+# 反而会把连续的 sub-MSS 小写压到对端 delayed-ACK（Linux 最长 40ms）才发出，
+# 影响 HTTP/2 帧、SSE、WebSocket、SSH 这类交互式/流式流量。
+# 写满 MSS 时两者报文完全一致，所以大流量不受影响。设为 false 可回退对比。
+tcp_nodelay = true
+
 # TCP relay 半关闭静默超时（秒）。0 表示禁用。
 #
 # 场景：对端只关闭写半边（half-close）后永不关闭读半边时，copy_bidirectional

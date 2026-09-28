@@ -425,7 +425,12 @@ async fn connect_socks5_udp(state: &AppState, spec: &UdpSessionSpec) -> Result<S
 
     let assoc = tokio::time::timeout(
         std::time::Duration::from_secs(state.config.connect_timeout_secs),
-        socks5_udp_associate_for_client(up.addr, state.config.fwmark, state.socks5_credentials()),
+        socks5_udp_associate_for_client(
+            up.addr,
+            state.config.fwmark,
+            state.socks5_credentials(),
+            state.config.tcp_nodelay,
+        ),
     )
     .await
     .map_err(|_| anyhow!("SOCKS5 UDP ASSOCIATE timeout"))??;

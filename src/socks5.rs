@@ -204,10 +204,11 @@ pub async fn socks5_connect(
     socks5_addr: SocketAddr,
     fwmark: u32,
     creds: Option<(&str, &str)>,
+    tcp_nodelay: bool,
 ) -> Result<TcpStream> {
     trace!(proxy = %socks5_addr, "SOCKS5 TCP connect");
     let mut stream = SocketFactory::new()
-        .connect_tcp_stream(socks5_addr, fwmark)
+        .connect_tcp_stream(socks5_addr, fwmark, tcp_nodelay)
         .await
         .with_context(|| format!("SOCKS5 TCP connect to proxy {socks5_addr} failed"))?;
 
@@ -292,10 +293,11 @@ pub async fn socks5_udp_associate_for_client(
     socks5_addr: SocketAddr,
     fwmark: u32,
     creds: Option<(&str, &str)>,
+    tcp_nodelay: bool,
 ) -> Result<Socks5UdpAssoc> {
     trace!(proxy = %socks5_addr, "SOCKS5 UDP ASSOCIATE control connect");
     let mut control = SocketFactory::new()
-        .connect_tcp_stream(socks5_addr, fwmark)
+        .connect_tcp_stream(socks5_addr, fwmark, tcp_nodelay)
         .await
         .with_context(|| {
             format!("SOCKS5 UDP ASSOCIATE control connect to proxy {socks5_addr} failed")

@@ -195,6 +195,21 @@ pub struct Config {
     /// 字节流动，因此该路径跳过看门狗并在启动时 WARN 一次。见 `half_close_timeout`。
     pub splice: bool,
 
+    #[serde(default = "default_tcp_nodelay")]
+    /// 是否对所有 TCP socket 设 `TCP_NODELAY`（关闭 Nagle），默认 `true`。
+    ///
+    /// 覆盖两处：入站 accept 出来的连接（回程方向，上游 -> 客户端），
+    /// 以及出站连接（去程方向，直连 / SOCKS5 握手与随后的转发）。
+    ///
+    /// 设为 `false` 时保持内核默认（Nagle 开启），用于回退对比。
+    ///
+    /// - `true`：中继只搬运数据、不产生数据，origin 自己的 Nagle 已经合并过一次，
+    ///   中继再合并没有收益，只会把 sub-MSS 的连续小写压到对端 delayed-ACK
+    ///   （Linux 最长 40ms）才发出。
+    /// - `false`：恢复改造前行为。写满 MSS 时两者报文完全一致，所以大流量不受影响，
+    ///   差异只体现在交互式/流式的连续小写（HTTP/2 帧、SSE、WebSocket、SSH 等）。
+    pub tcp_nodelay: bool,
+
     #[serde(default = "default_half_close_timeout")]
     /// TCP relay 半关闭静默超时，单位秒。`0` 表示禁用（保持改造前行为）。
     ///
@@ -607,6 +622,11 @@ pub fn default_splice() -> bool {
     false
 }
 
+/// 默认开启 `TCP_NODELAY`：见 `Config::tcp_nodelay`。
+pub fn default_tcp_nodelay() -> bool {
+    true
+}
+
 /// TCP relay 半关闭静默超时的默认值（秒）。
 ///
 /// 600 秒，与 shadowquic 保持一致：半关闭后静默 600 秒的对端，与“永不关闭”
@@ -962,6 +982,7 @@ mod tests {
             mmdb_path: None,
             udp_session_timeout_secs: 120,
             splice: false,
+            tcp_nodelay: default_tcp_nodelay(),
             half_close_timeout: default_half_close_timeout(),
             sniff_tls_sni: false,
             sniff_http_host: false,
@@ -1024,6 +1045,21 @@ mod tests {
     fn parse_listen_addr_invalid() {
         assert!(parse_listen_addr("not_an_addr").is_err());
         assert!(parse_listen_addr("127.0.0.1:999999").is_err());
+    }
+
+    #[test]
+    fn deserialize_tcp_nodelay_defaults_to_on() {
+        let toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.tcp_nodelay);
+    }
+
+    #[test]
+    fn deserialize_tcp_nodelay_can_be_turned_off() {
+        // TOML 规则：顶层键必须放在 [[upstream]] 表头之前
+        let toml = "tcp_nodelay = false\n[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.tcp_nodelay);
     }
 
     #[test]
