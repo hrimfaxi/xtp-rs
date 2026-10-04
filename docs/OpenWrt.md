@@ -166,33 +166,40 @@ chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
 上报 JSON 格式：
 
 ```json
-{"upstream_id": "bbr_tunnel", "peer": "1234", "rtt_ms": 152.300, "loss_rate": 0.3700, "mtu": 1280, "link": "downlink"}
+{"upstream_id": "vultr_p20808", "peer": "1234", "rtt_ms": 152.300, "loss_rate": 0.3700, "mtu": 1280, "link": "downlink"}
 ```
 
 | 字段 | 说明 |
 |------|------|
-| `upstream_id` | 由 ShadowQUIC `-c` / `--config` 参数推导的实例名（配置文件名去扩展名；多实例追加 `_N` 后缀） |
+| `upstream_id` | `<配置文件名>_<出站 tag>`：配置文件名跨进程去重，出站 tag 区分同进程内的多条隧道；需与 xtp-rs 侧该 upstream 的 `id` 完全一致 |
 | `peer` | ShadowQUIC 进程 PID |
 | `rtt_ms` | 链路 RTT（毫秒） |
 | `loss_rate` | 丢包率（小数，0.37 = 37%） |
 | `mtu` | 链路 MTU |
 | `link` | 方向：`uplink` / `downlink` |
 
-`upstream_id` 推导规则：读取 `/proc/PID/cmdline`，找到 `-c` / `-c=` / `--config` / `--config=` 参数对应路径，取 basename 去扩展名；若日志行带多实例前缀 `instance{n=N}:`，追加 `_N` 后缀。例如：
+`upstream_id` 推导规则：读取 `/proc/PID/cmdline`，取 `-c` / `-c=` / `--config` / `--config=` 参数对应配置文件的 basename 去扩展名作为前缀；再从日志 span 前缀 `inbound{tag=...}:outbound{tag=...}:` 取出 `outbound{tag=...}` 的 tag；拼成 `<配置名>_<tag>`。例如：
 
-| 启动命令 | 日志 instance 字段 | `upstream_id` |
-|----------|--------------------|---------------|
-| `shadowquic -c /etc/shadowquic/bbr.yaml` | 无 | `bbr` |
-| `shadowquic -c /etc/shadowquic/combine.yaml` | `instance{n=0}:` | `combine_0` |
-| `shadowquic -c /etc/shadowquic/combine.yaml` | `instance{n=1}:` | `combine_1` |
-| 找不到 `-c` 参数 / cmdline 不可读 | — | 跳过该次上报（仅 debug 日志记录） |
+| 启动命令 | 日志 span 前缀 | `upstream_id` |
+|----------|----------------|---------------|
+| `shadowquic -c /etc/shadowquic/vultr.yaml`（outbound tag `p20808`） | `inbound{tag=20808}:outbound{tag=p20808}:` | `vultr_p20808` |
+| `shadowquic -c /etc/shadowquic/vultr.yaml`（outbound tag `p20809`） | `inbound{tag=20809}:outbound{tag=p20809}:` | `vultr_p20809` |
+| `shadowquic -c /etc/shadowquic/other.yaml`（outbound tag `p20808`） | `inbound{tag=...}:outbound{tag=p20808}:` | `other_p20808` |
+| 找不到 `-c` 参数 / cmdline 不可读 / 日志无 `outbound{tag=...}` | — | 跳过该次上报（仅 debug 日志记录） |
 
-xtp-rs 侧需把 upstream 的 `id` 配成一致的值：单实例对应 `id = "bbr"`；多实例 `combine.yaml` 的第 N 个实例对应 `id = "combine_N"`。
+xtp-rs 侧需把 upstream 的 `id` 配成完全一致的值。例如配置名 `vultr`、outbound tag `p20808`：
+
+```toml
+[[upstream]]
+id = "vultr_p20808"
+addr = "127.0.0.1:20808"
+```
 
 > [!NOTE]
-> - 单实例（旧版 fork，或新版只配一个实例）日志无 `instance{n=X}` 字段，`upstream_id` 保持配置名本身，与旧版部署兼容；
-> - 实例序号 N 以 ShadowQUIC 实际日志为准，增删实例或调整顺序都会重排 N，需同步修改 xtp-rs 侧 id；
-> - 仅解析匹配 `shadowquic[PID]:` 前缀 + `uplink stats` / `downlink stats` 关键字的日志，其他进程日志忽略；
+> - `upstream_id` 用**配置文件名做前缀**是为跨进程去重：不同 shadowquic 进程可能复用同一出站 tag（旧式单端点 `outbound:` 写法 tag 甚至默认为 `outbound`），只取 tag 会撞在一起；
+> - 出站 tag 区分同一进程内的多条隧道：一个 inbound 经路由（如 Lua `router`）可走多个 outbound，各出站会分别以自己的 tag 上报；
+> - `upstream_id`（`<配置名>_<出站 tag>`）与 xtp-rs 的 upstream `id` 为精确相等匹配，改动 ShadowQUIC 配置里的 tag / 配置文件名后须同步修改 xtp-rs 侧 id；
+> - 仅解析匹配 `shadowquic[PID]:` 前缀 + `uplink connection stats` / `downlink connection stats` 关键字的日志，其他进程日志忽略；
 > - 不使用 ShadowQUIC 时无需部署；xtp-rs 的 TCP 吞吐评分（基于 `TCP_INFO`）不依赖任何外部组件。
 
 ---

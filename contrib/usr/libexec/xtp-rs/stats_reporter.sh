@@ -61,8 +61,8 @@ cleanup() {
     fi
 
     if [ -n "$REFRESH_PID" ]; then
-        # 直接终止刷新循环本身。若其当前正在运行 curl（多实例并发探测
-        # 时可能有多个在途 curl），curl 受 --max-time 2 限制；若正在
+        # 直接终止刷新循环本身。若其当前正在运行 curl（多个 bind-addr
+        # 并发探测时可能有多个在途 curl），curl 受 --max-time 2 限制；若正在
         # sleep，则 sleep 最多持续至本轮剩余刷新间隔。它们均不会进入
         # 下一次刷新循环。
         kill "$REFRESH_PID" 2>/dev/null
@@ -142,9 +142,10 @@ get_config_path() {
     '
 }
 
-# 从 /proc/PID/cmdline 提取配置文件名（去扩展名），作为 upstream_id 的基名。
-# 多实例日志带 instance{n=N} 时由调用方追加 _N 后缀（如 combine_0）；
-# 单实例/旧版日志无 instance 字段，直接使用基名（向后兼容）。
+# 从 /proc/PID/cmdline 提取配置文件名（去扩展名），作为 upstream_id 的前缀。
+# 用途是跨进程去重：不同 shadowquic 进程可能使用相同的出站 tag（旧式单端点
+# 写法 outbound tag 甚至默认为 "outbound"），仅用 tag 会撞 id。
+# 取不到时由调用方跳过本次上报。
 get_config_name() {
     local pid="$1"
     local cmdline_file="/proc/$pid/cmdline"
@@ -164,7 +165,7 @@ get_config_name() {
     cfg_file=$(get_config_path "$pid")
 
     if [ -z "$cfg_file" ]; then
-        dbg "PID=$pid: config argument not found; using unknown-$pid"
+        dbg "PID=$pid: config argument not found"
         printf 'unknown-%s\n' "$pid"
         return 1
     fi
@@ -224,7 +225,7 @@ send_json() {
 
 # ---------- 刷新功能 ----------
 # 从配置提取所有 bind-addr，每行输出 "host port"。
-# 多实例配置含多个 inbound（每个实例一个），需全部探测；
+# 一份配置可含多个 inbound，需全部探测；
 # 兼容顶层键与 YAML 列表项（"- bind-addr:"）两种写法，
 # 支持引号、行尾注释、IPv6 方括号（如 [::1]:1080）。
 parse_bind_addrs() {
@@ -274,8 +275,9 @@ refresh_connections() {
             continue
         fi
 
-        # 多实例配置有多个 bind-addr，全部探测。探测仅用于触发流量，
-        # 让每个实例都向 syslog 输出 stats，无需 instance ↔ 端口映射。
+        # 一份配置可有多个 inbound（多个 bind-addr），全部探测。探测
+        # 仅用于触发流量，让每个 inbound 对应的出站都向 syslog 输出
+        # stats；上报身份由日志里的 outbound tag 决定，无需端口映射。
         addrs=$(parse_bind_addrs "$config_path")
         if [ -z "$addrs" ]; then
             dbg "refresh: PID=$pid no valid bind-addr in $config_path"
@@ -313,7 +315,7 @@ refresh_connections() {
             # --noproxy '' 强制不使用 NO_PROXY/no_proxy 规则，确保探测
             # 一定经过 SOCKS5（否则可能绕过 Shadowquic 直连，线报不刷新）。
             # -- 防止异常的 REFRESH_URL（如以 - 开头）被 curl 当作选项解析。
-            # 并发探测：多实例配置有多个 bind-addr，串行时每个失败探测
+            # 并发探测：一份配置可有多个 bind-addr，串行时每个失败探测
             # 最多阻塞 2 秒，逐个累加会拉长整轮刷新周期；后台并行执行，
             # 失败日志由子 shell 写入，curl 受 --max-time 2 自行限时。
             (
@@ -356,9 +358,9 @@ if ! mkfifo "$FIFO"; then
 fi
 
 if [ "$DEBUG" = "1" ]; then
-    logread -f -e 'shadowquic\[[0-9][0-9]*\].*\(uplink\|downlink\) stats ' > "$FIFO" 2>>"$DEBUG_LOG" &
+    logread -f -e 'shadowquic\[[0-9][0-9]*\].*\(uplink\|downlink\) connection stats ' > "$FIFO" 2>>"$DEBUG_LOG" &
 else
-    logread -f -e 'shadowquic\[[0-9][0-9]*\].*\(uplink\|downlink\) stats ' > "$FIFO" 2>/dev/null &
+    logread -f -e 'shadowquic\[[0-9][0-9]*\].*\(uplink\|downlink\) connection stats ' > "$FIFO" 2>/dev/null &
 fi
 
 LOGREAD_PID=$!
@@ -398,7 +400,7 @@ while IFS= read -r line; do
     esac
 
     case "$line" in
-        *"uplink stats "*|*"downlink stats "*)
+        *"uplink connection stats "*|*"downlink connection stats "*)
             ;;
         *)
             continue
@@ -421,24 +423,26 @@ while IFS= read -r line; do
             if (pid == "")
                 exit
 
-            if ($0 ~ /uplink stats /)
+            if ($0 ~ /uplink connection stats /)
                 link = "uplink"
-            else if ($0 ~ /downlink stats /)
+            else if ($0 ~ /downlink connection stats /)
                 link = "downlink"
             else
                 exit
 
-            # 多实例日志带 instance{n=N}: 前缀，提取 N；
-            # 单实例/旧版日志无此字段，inst 保持空。
+            # 新版日志带 tracing span 前缀，出站隧道由 outbound{tag=...}
+            # 标识。该 tag 与配置名一起拼成上报的 upstream_id
+            # （<配置名>_<tag>，见下方主循环），xtp-rs 侧 id 须完全一致。
             # 用 index/substr 而非 brace 正则，避免 busybox awk 兼容问题；
-            # 数字后必须紧跟 "}" 才认定为实例序号，防止日志其他位置
-            # 恰好出现 "instance{n=" 字样时误提取。
-            inst = ""
-            i = index($0, "instance{n=")
+            # 必须遇到 "}" 才算完整 tag，防止日志其他位置恰好含
+            # "outbound{tag=" 字样时误提取。
+            otag = ""
+            i = index($0, "outbound{tag=")
             if (i > 0) {
-                rest = substr($0, i + length("instance{n="))
-                if (match(rest, /^[0-9]+/) && substr(rest, RLENGTH + 1, 1) == "}")
-                    inst = substr(rest, 1, RLENGTH)
+                rest = substr($0, i + length("outbound{tag="))
+                j = index(rest, "}")
+                if (j > 1)
+                    otag = substr(rest, 1, j - 1)
             }
 
             rtt = ""
@@ -458,7 +462,7 @@ while IFS= read -r line; do
                 mtu = substr($0, RSTART + 4, RLENGTH - 4)
             }
 
-            printf "%s|%s|%s|%s|%s|%s\n", pid, rtt, loss, mtu, link, inst
+            printf "%s|%s|%s|%s|%s|%s\n", pid, rtt, loss, mtu, link, otag
         }'
     )
 
@@ -467,7 +471,7 @@ while IFS= read -r line; do
         continue
     fi
 
-    IFS='|' read -r pid rtt loss_rate mtu link inst_n <<EOF
+    IFS='|' read -r pid rtt loss_rate mtu link outbound_tag <<EOF
 $parsed_data
 EOF
 
@@ -475,29 +479,31 @@ EOF
     [ -n "$loss_rate" ] || loss_rate=0
     [ -n "$mtu" ] || mtu=0
 
-    dbg "parsed: pid=$pid rtt=$rtt loss_rate=$loss_rate mtu=$mtu link=$link instance=${inst_n:-none}"
+    dbg "parsed: pid=$pid rtt=$rtt loss_rate=$loss_rate mtu=$mtu link=$link outbound_tag=${outbound_tag:-none}"
+
+    # 日志缺 outbound tag（格式异常）时无法与 xtp-rs upstream id 对应，
+    # 直接跳过本次上报，避免无意义的上报。
+    if [ -z "$outbound_tag" ]; then
+        dbg "skip report: no outbound tag for pid=$pid"
+        continue
+    fi
 
     cfg_name=$(get_config_name "$pid")
     cfg_rc=$?
 
     dbg "config name lookup: pid=$pid cfg_name=$cfg_name rc=$cfg_rc"
 
-    # 进程刚退出（cmdline 已消失）等场景拿不到配置名，拼出的
-    # unknown-* id 在 xtp-rs 侧必然匹配不上，直接跳过本次上报。
+    # 进程刚退出（cmdline 已消失）等场景拿不到配置名，拼出的 id 在
+    # xtp-rs 侧必然匹配不上，直接跳过本次上报。
     if [ "$cfg_rc" -ne 0 ] || [ -z "$cfg_name" ]; then
         dbg "skip report: no config name for pid=$pid"
         continue
     fi
 
-    # upstream_id 推导：
-    # - 多实例日志带 instance{n=N}：配置名_N（如 combine_0），
-    #   与 xtp-rs 配置中该实例的 upstream id 对应。
-    # - 单实例/旧版日志无 instance 字段：直接用配置名，向后兼容。
-    if [ -n "$inst_n" ]; then
-        upstream_id="${cfg_name}_${inst_n}"
-    else
-        upstream_id="$cfg_name"
-    fi
+    # upstream_id = <配置名>_<出站 tag>：
+    # - 配置名跨进程去重（不同 shadowquic 进程可能用相同出站 tag）；
+    # - 出站 tag 区分同一进程内的多条出站隧道。
+    upstream_id="${cfg_name}_${outbound_tag}"
 
     dbg "upstream_id=$upstream_id"
 

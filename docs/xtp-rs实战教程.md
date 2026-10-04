@@ -418,6 +418,9 @@ addr = "127.0.0.1:20809"
 
 两个 upstream 都没写 `groups`，自动同属 `default` 组——普通代理流量就在它俩之间竞争。
 
+> [!NOTE]
+> 上面的 `id` 仅为示例。要让 QUIC 探针分生效，`id` 必须等于 `<配置文件名>_<ShadowQUIC 出站 tag>`（见 6.6）。
+
 ### 6.6 评分机制内幕
 
 xtp-rs 给每条上游维护一个 0–1000 的动态分，来自两个信息源：
@@ -435,8 +438,10 @@ xtp-rs 给每条上游维护一个 0–1000 的动态分，来自两个信息源
 **② QUIC 探针分（被动接收）**：ShadowQUIC 原生支持将链路质量（RTT、丢包率、MTU）输出到 syslog，无需任何修改。配套的 `xtp-stats-reporter` daemon（`contrib/usr/libexec/xtp-rs/stats_reporter.sh`）实时捕获这些日志，解析后通过本地 Unix 数据报 socket `/tmp/xtp-rs-report.sock` 以 JSON 格式上报给 xtp-rs：
 
 ```json
-{"upstream_id": "bbr_tunnel", "peer": "1234", "rtt_ms": 152.3, "loss_rate": 0.37, "mtu": 1280, "link": "downlink"}
+{"upstream_id": "vultr_p20808", "peer": "1234", "rtt_ms": 152.3, "loss_rate": 0.37, "mtu": 1280, "link": "downlink"}
 ```
+
+`upstream_id` = **`<配置文件名>_<出站 tag>`**：配置文件名（ShadowQUIC `-c` 参数去扩展名，跨进程去重）加日志里 `outbound{tag=...}` 的出站 tag（区分同进程内的多条隧道）。因此 xtp-rs 侧该 upstream 的 `id` 要与它完全一致（上例即 `id = "vultr_p20808"`）。
 
 基础分 1000，按丢包率和 RTT 逐级扣分；每 5 秒最多刷新一次，新旧分按 3:7 混合（新数据占七成，响应快又不至于抖动）。`loss_rate` 是小数（0.37 = 37%）；`link` 可标 `downlink` / 上行，双向都有报告时取平均。
 
@@ -760,7 +765,7 @@ logread -f | grep xtp-rs                 # OpenWrt（procd 无 journalctl）
 
 OpenWrt 使用 `uci` 配置、`/etc/init.d/xtp-rs`（procd）管理服务，支持 ujail 沙箱与 capabilities 约束（`contrib/etc/capabilities/xtp-rs.json`），并可用 `xtp-stats-reporter` 上报 ShadowQUIC 链路质量供动态评分使用。
 
-这部分内容统一放在 **[OpenWrt 部署](./OpenWrt.md)**：UCI 选项、procd 服务、交叉编译、stats-reporter 安装与多实例 `upstream_id` 对应关系。
+这部分内容统一放在 **[OpenWrt 部署](./OpenWrt.md)**：UCI 选项、procd 服务、交叉编译、stats-reporter 安装与 `<配置名>_<出站 tag>` ↔ `upstream_id` 对应关系。
 
 > [!NOTE]
 > 通用 Linux 用 `sudo` + `systemctl`（见 **[通用 Linux 部署](./部署.md)**），OpenWrt 用 `uci` + `/etc/init.d`，两套命令体系不要混用。
