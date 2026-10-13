@@ -209,7 +209,7 @@ cargo test
 
 部分测试需要 `tokio` 运行时环境（会自动处理）。
 
-`src/activity_stream.rs` 的半关闭看门狗单测依赖 `tokio` 的 `test-util`（暂停时钟，位于 `[dev-dependencies]`，不进入发布二进制）。TCP relay 半关闭回收的集成测试使用真实 loopback socket，**不需要 root 或 TPROXY**，机制与用例见 [工作原理 · TCP relay 半关闭静默超时](./docs/工作原理.md#六tcp-relay-半关闭静默超时)。
+半关闭超时的单测（`src/relay.rs`）跑在 `tokio` 的暂停时钟上（`test-util`，位于 `[dev-dependencies]`，不进入发布二进制），用 `duplex` 流覆盖计时语义，毫秒级跑完。真实 loopback socket 上只留两条**必须用真 socket** 才能验证的用例（回收时发 RST、正常关闭走 FIN），**不需要 root 或 TPROXY**。机制与用例见 [工作原理 · TCP relay 半关闭静默超时](./docs/工作原理.md#六tcp-relay-半关闭静默超时)。
 
 ---
 

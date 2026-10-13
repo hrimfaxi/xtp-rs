@@ -4,10 +4,10 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod activity_stream;
 mod cli;
 #[cfg(feature = "geosite")]
 mod geosite;
+mod relay;
 mod sniff;
 mod socket_factory;
 mod socks5;
@@ -47,15 +47,15 @@ fn build_env_filter(config: &Config) -> Result<EnvFilter> {
     }
 }
 
-/// `splice = true` 时半关闭看门狗不生效，这里在每次配置生效时提示一次。
+/// `splice = true` 时半关闭静默超时不生效，这里在每次配置生效时提示一次。
 ///
-/// 不是错误：splice 是用户显式开启的优化，我们不去静默改掉它，也不因为看门狗
+/// 不是错误：splice 是用户显式开启的优化，我们不去静默改掉它，也不因为超时保护
 /// 而拒绝启动。但“配置了 half_close_timeout 却完全没保护”必须让人看见。
-fn warn_if_watchdog_disabled_by_splice(config: &Config) {
+fn warn_if_half_close_timeout_disabled_by_splice(config: &Config) {
     if config.splice && config.half_close_timeout > 0 {
         warn!(
             half_close_timeout = config.half_close_timeout,
-            "splice = true: zero-copy relay bypasses the half-close watchdog, \
+            "splice = true: zero-copy relay bypasses the half-close timeout, \
              so half_close_timeout is NOT in effect; set splice = false to enable it"
         );
     }
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
 
     debug!("xtp-rs started");
 
-    warn_if_watchdog_disabled_by_splice(&config);
+    warn_if_half_close_timeout_disabled_by_splice(&config);
 
     let app_state = AppState::build(config, cli.config.clone()).await?;
     let state = Arc::new(ArcSwap::from(Arc::new(app_state)));
@@ -260,7 +260,7 @@ async fn reload_config(state: Arc<ArcSwap<AppState>>) -> Result<()> {
         warn!("old generation shutdown timed out, some tasks aborted");
     }
 
-    warn_if_watchdog_disabled_by_splice(&new_arc.config);
+    warn_if_half_close_timeout_disabled_by_splice(&new_arc.config);
 
     info!(path = %path, "config reloaded");
     Ok(())

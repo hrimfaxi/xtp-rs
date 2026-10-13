@@ -190,9 +190,9 @@ pub struct Config {
     /// - `true`：优先调用 `tokio_splice::zero_copy_bidirectional`
     /// - `false`：回退到 `tokio::io::copy_bidirectional`
     ///
-    /// 注意：`splice = true` 时**半关闭看门狗不生效**。zero-copy 走内核 fd 搬运，
-    /// 数据不经过 `poll_read`/`poll_write`，看门狗依赖的 `ActivityGuard` 无法观测
-    /// 字节流动，因此该路径跳过看门狗并在启动时 WARN 一次。见 `half_close_timeout`。
+    /// 注意：`splice = true` 时**半关闭静默超时不生效**。zero-copy 走内核 fd 搬运，
+    /// 数据不经过 `poll_read`/`poll_write`，`relay::Tracked` 观测不到字节流动，
+    /// 因此该路径跳过超时并在启动时 WARN 一次。见 `half_close_timeout`。
     pub splice: bool,
 
     #[serde(default = "default_tcp_nodelay")]

@@ -36,8 +36,8 @@ udp_session_timeout_secs = 120
 # TCP 转发是否优先使用 splice 零拷贝
 # 默认值：false
 #
-# 注意：splice = true 时半关闭看门狗不生效（zero-copy 数据不经过 poll_read/
-# poll_write，看门狗观测不到），half_close_timeout 会被忽略并在启动时 WARN。
+# 注意：splice = true 时半关闭静默超时不生效（zero-copy 数据不经过 poll_read/
+# poll_write，观测不到字节流动），half_close_timeout 会被忽略并在启动时 WARN。
 splice = false
 
 # 是否对所有 TCP socket 设 TCP_NODELAY（关闭 Nagle）。
