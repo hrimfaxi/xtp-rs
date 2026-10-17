@@ -2,7 +2,7 @@
 
 set -e
 
-export TOOLCHAIN=/home/hrimfaxi/temp/openwrt-sdk-25.12.2-x86-64_gcc-14.3.0_musl.Linux-x86_64/staging_dir/toolchain-x86_64_gcc-14.3.0_musl/bin/
+export TOOLCHAIN=/home/hrimfaxi/temp/openwrt-sdk-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64/staging_dir/toolchain-x86_64_gcc-14.3.0_musl/bin/
 export PATH=$TOOLCHAIN:$PATH
 
 export CC_X86_64_UNKNOWN_LINUX_MUSL=$TOOLCHAIN/x86_64-openwrt-linux-musl-gcc

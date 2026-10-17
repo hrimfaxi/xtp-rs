@@ -24,5 +24,6 @@ else
   echo "upx not found, skipping compression"
 fi
 
-rsync -avrPzz $BIN zdxlz:/usr/bin/
-ssh zdxlz service xtp-rs restart
+TARGET=${1:-zdxlz}
+rsync -avrPzz $BIN $TARGET:/usr/bin/
+ssh $TARGET service xtp-rs restart
