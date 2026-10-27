@@ -32,6 +32,10 @@ start_service() {
     procd_add_jail_mount_rw /tmp
   fi
 
+  # mimalloc arena 地址空间预留：默认 1G 对 256M 内存的路由器过于激进，
+  # 实测 RSS 峰值仅 ~20M，64M 预留足够
+  procd_set_param env MIMALLOC_ARENA_RESERVE=64M
+
   procd_set_param limits nofile="1048576 1048576"
   procd_set_param command $XTP_BIN -c /etc/xtp-rs/config.toml
   procd_set_param respawn 3600 5 0 # 设置自动重启
