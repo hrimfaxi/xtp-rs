@@ -7,7 +7,7 @@
 #   sh contrib/tests/stats-reporter-test.sh
 #
 # 当前机器装了哪个后端就跑哪个；两个都没有时跳过 JSON 相关用例
-# （REST 模式本来也会被脚本自己禁用）。
+# （正式启动时缺后端是致命错误，脚本会直接退出）。
 
 STATS_REPORTER_TEST=1
 . "$(dirname "$0")/../usr/libexec/xtp-rs/stats_reporter.sh"
@@ -96,7 +96,7 @@ check_eq 'loss_rate_from 40 位输入仍是十进制数' '1.0000' \
     "$(loss_rate_from "$forty" "$forty")"
 
 # ---------- 上报报文 ----------
-# 报文格式被 xtp-rs 逐字段解析，两条取数路径共用同一构造器，这里锁死格式。
+# 报文格式被 xtp-rs 逐字段解析，这里锁死格式。
 check_eq 'build_report_json 报文格式' \
     '{"upstream_id":"tproxy_cn_sq-out","peer":"18520","rtt_ms":301.384,"loss_rate":0.0150,"mtu":1452,"link":"uplink"}' \
     "$(build_report_json 'tproxy_cn_sq-out' '18520' '301.383866' '0.0150' '1452' 'uplink')"
@@ -258,6 +258,52 @@ restful-api:
 EOF
 check_eq 'restful-api: 地址含空白时整段作废' '' "$(read_rest "$TMPDIR_TEST/j.yaml")"
 
+# 返回值把"没有该段"和"有该段但解析不出来"分开：只走 RESTful API 的版本
+# 两者都会致命退出，但 syslog 里要能看出是哪种情况。
+parse_restful_api "$TMPDIR_TEST/a.yaml" >/dev/null
+check_eq 'parse_restful_api: 正常配置 rc=0' '0' "$?"
+parse_restful_api "$TMPDIR_TEST/b.yaml" >/dev/null
+check_eq 'parse_restful_api: 无该段 rc=3' '3' "$?"
+parse_restful_api "$TMPDIR_TEST/k.yaml" >/dev/null
+check_eq 'parse_restful_api: 块标量 secret rc=2' '2' "$?"
+parse_restful_api "$TMPDIR_TEST/q.yaml" >/dev/null
+check_eq 'parse_restful_api: 端口位数超限 rc=2' '2' "$?"
+
+# ---------- 进程识别 ----------
+# pgrep -f 会命中命令行里带 "shadowquic" 的无关进程，而"配置里没有
+# restful-api 就退出"是致命判定，必须按 argv[0] 再过一遍。
+ln -s "$(command -v sleep)" "$TMPDIR_TEST/shadowquic"
+"$TMPDIR_TEST/shadowquic" 30 &
+FAKE_SQ_PID=$!
+
+# 子进程 fork 之后、exec 之前 /proc/PID/cmdline 还是父进程的，直接读会
+# 拿到 "sh"；这里等它 exec 成目标程序，最多等 3 秒。
+fake_tries=0
+while [ $fake_tries -lt 3 ] && ! is_shadowquic_pid "$FAKE_SQ_PID"; do
+    fake_tries=$((fake_tries + 1))
+    sleep 1
+done
+
+if is_shadowquic_pid "$FAKE_SQ_PID"; then
+    ok 'is_shadowquic_pid: 认出 argv[0] 为 shadowquic 的进程'
+else
+    ng 'is_shadowquic_pid: 认出 argv[0] 为 shadowquic 的进程'
+fi
+kill "$FAKE_SQ_PID" 2>/dev/null
+wait "$FAKE_SQ_PID" 2>/dev/null
+
+if is_shadowquic_pid $$; then
+    ng 'is_shadowquic_pid: 不接受 argv[0] 为 sh 的进程'
+else
+    ok 'is_shadowquic_pid: 不接受 argv[0] 为 sh 的进程'
+fi
+
+if is_shadowquic_pid 99999999; then
+    ng 'is_shadowquic_pid: 不存在的 pid'
+else
+    ok 'is_shadowquic_pid: 不存在的 pid'
+fi
+
 # ---------- 数值校验 ----------
 for v in 0 5 1452 12345; do
     if is_uint "$v"; then ok "is_uint 接受 $v"; else ng "is_uint 接受 $v"; fi
@@ -363,7 +409,7 @@ EOF
     check_eq 'rest_collect_samples: 缺计数器时不产出该方向' '' \
         "$(rest_collect_samples "$TMPDIR_TEST/nolost.json")"
 
-    # 出站取不出 tag 时返回非零，调用方据此回落到日志模式。
+    # 出站取不出 tag 时返回非零，调用方据此放弃本轮上报。
     printf '{"outbounds":[{"tag":null},{"tag":"y","quality":{"sq_conn_stats":null}}]}' \
         > "$TMPDIR_TEST/notag.json"
     rest_collect_samples "$TMPDIR_TEST/notag.json" >/dev/null
@@ -376,7 +422,7 @@ EOF
     rest_collect_samples "$TMPDIR_TEST/tailnotag.json" >/dev/null
     check_rc 'rest_collect_samples: 末尾缺 tag 时报结构异常' nonzero $?
 
-    # 全部缺 tag：不能当成"成功但没有采样"，否则该进程的日志路径被永久挡住。
+    # 全部缺 tag：不能当成"成功但没有采样"，否则这一轮会被误判成正常。
     printf '{"outbounds":[{"quality":{}},{"quality":{}}]}' > "$TMPDIR_TEST/allnotag.json"
     rest_collect_samples "$TMPDIR_TEST/allnotag.json" >/dev/null
     check_rc 'rest_collect_samples: 全部缺 tag 时报结构异常' nonzero $?
@@ -404,12 +450,12 @@ EOF
     check_eq 'rest_collect_samples: 空串计数器不产出' '' \
         "$(rest_collect_samples "$TMPDIR_TEST/emptyfield.json")"
 
-    # 尾部 null 元素：两个后端都当作"元素不存在"，不触发回落。这是有意接受
-    # 的取舍（jsonfilter 无法区分 null 元素与越界），这里锁死行为。
+    # 尾部 null 元素：两个后端都当作"元素不存在"，不报结构异常。这是有意
+    # 接受的取舍（jsonfilter 无法区分 null 元素与越界），这里锁死行为。
     printf '{"outbounds":[{"tag":"a","quality":{}},null]}' > "$TMPDIR_TEST/tailnull.json"
     tailnull_out=$(rest_collect_samples "$TMPDIR_TEST/tailnull.json")
     tailnull_rc=$?
-    check_rc 'rest_collect_samples: 尾部 null 不触发回落' zero "$tailnull_rc"
+    check_rc 'rest_collect_samples: 尾部 null 不算结构异常' zero "$tailnull_rc"
     check_eq 'rest_collect_samples: 尾部 null 不产出采样' '' "$tailnull_out"
 
     # 超长计数器会让 loss_rate 算出 inf/nan，必须在取数阶段就挡掉。
