@@ -77,11 +77,13 @@ update_china_ips() {
   fi
 
   echo "[*] [IPv4] Filtering valid IPv4 CIDR entries ..."
-  # 仅保留合法 IPv4 CIDR（各字节 0-255、前缀 0-32），剔除注释与其他行
-  grep -E '^[[:space:]]*(((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))(/(3[0-2]|[12][0-9]|[1-9]))?[[:space:]]*$' \
+  # 仅保留合法 IPv4 CIDR（各字节 0-255、前缀 0-32），剔除注释与其他行。
+  # LC_ALL=C 固定字符类与排序语义：上游数据是 ASCII，C locale 下 [[:space:]]
+  # 与 sort 的顺序不受运行环境 locale 影响。
+  LC_ALL=C grep -E '^[[:space:]]*(((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))(/(3[0-2]|[12][0-9]|[1-9]))?[[:space:]]*$' \
     "${TMP_DIR}/chnroute4.src" \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-    | sort -u \
+    | LC_ALL=C sort -u \
     > "${TMP_DIR}/cidr4.txt"
 
   if [ ! -s "${TMP_DIR}/cidr4.txt" ]; then
@@ -99,7 +101,7 @@ update_china_ips() {
     # "interval overlaps" 加载失败；同时可合并相邻网段减小内核集合体积
     echo "  auto-merge;"
     echo "  elements = {"
-    awk 'BEGIN { first = 1 }
+    LC_ALL=C awk 'BEGIN { first = 1 }
          {
            cidr = $0
            if (cidr !~ /\//) cidr = cidr "/32"
@@ -131,9 +133,67 @@ update_china_ip6s() {
   # 不做区间->CIDR 换算；重叠/相邻区间交给 set 的 auto-merge 处理。
   # 方向必须校验：写反的区间能通过格式检查，但 nft include 是全有全无的，
   # 加载时会报 invalid interval 并炸掉整张 inet xtp-rs 表。
-  awk '
-    function ip6_ok(t) {
-      return (t ~ /^(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:((:[0-9A-Fa-f]{1,4}){1,6})|:((:[0-9A-Fa-f]{1,4}){1,7}|:))$/)
+  # 下方 awk 程序内「AWK_PARITY_ 的起止注释标记」之间的内容会被
+  # contrib/tests/awk-parity-check.sh 抽取，单独喂给 gawk / mawk / busybox
+  # awk 做跨实现差分测试。因此本段必须是自包含的纯 awk 程序：不得内插
+  # shell 变量；改动后跑一次该测试。
+  # LC_ALL=C：区间方向校验靠定长十六进制键的字典序比较，而 gawk 的字符串
+  # 比较按 locale 排序规则走，只有 C locale 下才是纯字节序；toupper 同理。
+  LC_ALL=C awk '
+    # >>> AWK_PARITY_BEGIN
+    # 十六进制字符白名单：用 index() 查表，不用正则字符类。
+    BEGIN { HEX = "0123456789abcdefABCDEF" }
+
+    # 统计不含 "::" 的片段里有多少个 1-4 位十六进制组；非法片段返回 -1，
+    # 空串返回 0（对应 "::" 左/右为空的那一侧）。
+    function ip6_groups(seg,   n, i, c, glen, groups) {
+      n = length(seg)
+      if (n == 0) return 0
+      i = 1; glen = 0; groups = 0
+      while (i <= n) {
+        c = substr(seg, i, 1)
+        if (c == ":") {
+          if (glen == 0) return -1          # 空组：前导/结尾单冒号或三个连续冒号
+          groups++; glen = 0; i++
+          continue
+        }
+        if (index(HEX, c) == 0) return -1    # 非十六进制字符（含内嵌 IPv4 的点）
+        glen++
+        if (glen > 4) return -1
+        i++
+      }
+      if (glen == 0) return -1
+      return groups + 1
+    }
+
+    # 校验 IPv6 字面量：只认纯十六进制组写法（不认 ::ffff:1.2.3.4 内嵌 IPv4，
+    # 与旧实现一致）。至多一个 "::"；无 "::" 时须恰 8 组，有 "::" 时显式组
+    # 数须小于 8（"::" 至少压缩一组）。
+    #
+    # 刻意不用正则：mawk 的正则引擎对嵌套区间量词 {n,m} 的处理与 gawk /
+    # busybox awk 不一致——Ubuntu 22.04 的 mawk 1.3.4(20200120) 会把正常地址
+    # 全判非法（整族更新失败），较新的 mawk 则静默丢行。故 IPv6 字面量校验
+    # 不用正则、也不用区间量词，只用 index / substr / length / 字符串比较，
+    # 这四者在 POSIX awk 语义下一致。
+    #
+    # 注意范围：仅本函数（字面量校验）去正则化；同一程序里其余部分仍用
+    # sub() / split() 做空白与字段处理，那些是单字符类与 "+"，各实现一致，
+    # 且被 contrib/tests/awk-parity-check.sh 的语料覆盖。
+    function ip6_ok(t,   pos, left, right, nl, nr) {
+      if (t == "" || index(t, ":") == 0) return 0
+      if (index(t, ":::") > 0) return 0
+      pos = index(t, "::")
+      if (pos == 0) {
+        nl = ip6_groups(t)
+        return (nl == 8)
+      }
+      left = substr(t, 1, pos - 1)
+      right = substr(t, pos + 2)
+      nl = ip6_groups(left)
+      if (nl < 0) return 0
+      nr = ip6_groups(right)
+      if (nr < 0) return 0
+      return (nl + nr < 8)
     }
     # 归一化 IPv6 字面量为定长可比较键：:: 展开为缺失的全零组（插在
     # 前后段之间）、每组左补零至 4 位、统一大写，得 32 位十六进制串。
@@ -174,6 +234,7 @@ update_china_ip6s() {
       if (bad > 0) printf("[!] [IPv6] skipped %d invalid line(s).\n", bad) > "/dev/stderr"
       exit (cnt == 0 ? 1 : 0)
     }
+    # <<< AWK_PARITY_END
   ' "${TMP_DIR}/chnroute6.src" > "${TMP_DIR}/ranges6.txt" || return 1
 
   mkdir -p "$(dirname "${CHNROUTE6_FILE}")" || return 1

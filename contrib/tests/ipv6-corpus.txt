@@ -1,0 +1,45 @@
+# IPv6「起始 结束」语料，供 contrib/tests/awk-parity-check.sh 做跨 awk 实现
+# 差分测试：gawk / mawk / busybox awk 必须给出完全相同的 stdout 与 stderr，
+# 且与同目录的 ipv6-corpus.stdout / ipv6-corpus.stderr 逐字节一致。
+#
+# 输入契约：本文件是 update-chnroute.sh 中 awk 校验程序的输入（每行两列）。
+# 期望：接受 16 行（按输入顺序写入 stdout），跳过 16 行（只进 stderr 计数）。
+#
+# 制表符分隔、行尾 CR、多空白分隔这三类控制字符算例由 harness 在运行时
+# 拼接到本文件之后（见 awk-parity-check.sh 的 build_cases 函数），
+# 以免在仓库内的文本文件里混入控制字符。
+#
+# 上半部分：合法区间（含各种压缩写法的边界）
+2408:8000:: 2408:8000:ffff:ffff:ffff:ffff:ffff:ffff
+1:2:3:4:5:6:7:8 1:2:3:4:5:6:7:9
+::1 ::1
+:: ::
+fe80:: fe80::ffff:ffff:ffff:ffff
+2001:7fa:10:: 2001:7fa:10:ffff:ffff:ffff:ffff:ffff
+2001:dd8:1a:: 2001:dd8:1a:ffff:ffff:ffff:ffff:ffff
+2001:df6:40:: 2001:df6:40:ffff:ffff:ffff:ffff:ffff
+240c:6:: 240c:6:ffff:ffff:ffff:ffff:ffff:ffff
+240c:f:: 240c:f:ffff:ffff:ffff:ffff:ffff:ffff
+1:2:3:4:5:6:7:: 1:2:3:4:5:6:7::
+ABCD:EF01:: ABCD:EF01::FFFF
+100:: 100::ffff
+240e:: 240e::
+1:: 1:2:3:4:5:6:7:8
+0:0:0:0:0:0:0:0 0:0:0:0:0:0:0:1
+# 下半部分：非法行（格式错、组数越界、方向反、列数不对）
+::ffff:1.2.3.4 ::ffff:1.2.3.5
+1:2:3:4:5:6:7:8:9 1:2:3:4:5:6:7:8:9
+1:2:3:4:5:6:7 1:2:3:4:5:6:7
+1:2:3:4:5:6:7:8:: 1:2:3:4:5:6:7:8::
+::1:2:3:4:5:6:7:8 ::1:2:3:4:5:6:7:8
+1:::2 1:::2
+:1:2:3:4:5:6:7 :1:2:3:4:5:6:7
+1:2:3:4:5:6:7:8: 1:2:3:4:5:6:7:8:
+1::2::3 1::2::3
+12345::1 12345::1
+abcd abcd
+gggg::1 gggg::1
+240e:1:: 240e::
+240e:6::
+240e:7:: 240e:8:: extra
+::: :::

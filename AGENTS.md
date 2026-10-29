@@ -75,6 +75,7 @@ cross build --release --target mipsel-unknown-linux-musl
 - `fwmark = 2` 是出站 socket 的旁路标记；`fwmark = 1` 保留给 nftables 入站标记。混用会导致路由环路。
 - UDP 使用 `BytesMut::split_to().freeze()` 零拷贝传递载荷给 spawn 的 task。
 - `TaskGuard`（`util.rs`）管理 spawn task 的生命周期和优雅退出。
+- `contrib/usr/libexec/xtp-rs/update-chnroute.sh` 里的 awk 程序受 `contrib/tests/awk-parity-check.sh` 约束：改动后必须跑一次。原因是各实现的 awk 行为不等价——Ubuntu 22.04 的 mawk 对嵌套区间量词 `{n,m}` 的处理与 gawk / OpenWrt busybox awk 不同，曾导致 IPv6 列表整族更新失败。因此该脚本的 IPv6 字面量校验（`ip6_ok` / `ip6_groups`）不使用依赖实现差异的正则与区间量词，只用 `index/substr/length` 等 POSIX 语义一致的构造；程序其余部分的 `sub()` / `split()` 单字符正则保持不变，同样由该测试的语料覆盖。
 
 ## Git 规范
 
