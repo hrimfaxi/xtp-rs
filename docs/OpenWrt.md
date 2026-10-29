@@ -148,7 +148,60 @@ XTP_TCP_PORTS="80 443" XTP_BYPASS_CHNROUTE=1 /usr/libexec/xtp-rs/setup-xtp-rs.sh
 
 ## 五、xtp-stats-reporter（ShadowQUIC 性能上报）
 
-`xtp-stats-reporter` 是 **ShadowQUIC 专用**的性能上报 daemon：ShadowQUIC 把链路质量（RTT、丢包率、MTU）输出到 syslog，本 daemon 用 `logread` 实时捕获、解析后，通过本地 Unix 数据报 socket（`/tmp/xtp-rs-report.sock`）以 JSON 上报给 xtp-rs，供上游动态评分使用。无需修改 ShadowQUIC。机制详见 [工作原理](./工作原理.md#五上游动态评分机制)。
+`xtp-stats-reporter` 是 **ShadowQUIC 专用**的性能上报 daemon：它采集 ShadowQUIC 的链路质量（RTT、丢包率、MTU），通过本地 Unix 数据报 socket（`/tmp/xtp-rs-report.sock`）以 JSON 上报给 xtp-rs，供上游动态评分使用。无需修改 ShadowQUIC。机制详见 [工作原理](./工作原理.md#五上游动态评分机制)。
+
+### 5.1 两种取数方式（自动适配）
+
+脚本按**每个 ShadowQUIC 进程**自己的配置自动选路，不需要按版本手工切换：
+
+| 条件 | 取数方式 |
+|------|----------|
+| 该进程的配置文件里有顶层 `restful-api:` 段，且 `/api/v1/outbounds` 能取到数据 | **REST 模式**：轮询 API 取连接采样，并用 `POST /api/v1/outbounds/{tag}/probe` 主动喂流量刷新采样 |
+| 其余情况（ShadowQUIC 未编 `restful-api`、配置里没写这段、或 API 一时连不上） | **日志模式**：`logread` 抓 `uplink/downlink connection stats` |
+
+两种模式上报的 JSON 完全相同，xtp-rs 侧无感知。稳态下同一进程只走一条路：REST 可用的进程会被日志路径跳过。**切换瞬间做不到严格互斥** —— 已经排在管道里、或者已经通过归属检查的日志行仍可能被发送，因此切换时可能**重复、也可能乱序**上报同一进程的采样，脚本里没有按采样身份去重。乱序的影响取决于 xtp-rs 的打分模式：默认（`enable_relative_scoring = false`）的绝对打分带 5 秒冷却，紧邻的重复/晚到报文会被丢弃；开启相对归一化后是"最后写入者胜"，晚到的旧值会短暂覆盖新值，下个周期自然纠正。API 连不上时下一轮自动回落到日志模式。
+
+REST 模式要求的 ShadowQUIC 配置：
+
+```yaml
+restful-api:
+  tag: restful-api
+  bind-addr: "127.0.0.1:9090"   # 只给本机上报用，绑回环即可
+  # secret: "choose-a-secret"   # 配了就必须带 Bearer，脚本会自动读取
+```
+
+ShadowQUIC 需以 `restful-api` feature 编译（默认开启），否则配置会被判为非法而启动失败。REST 模式下 `upstream_id` 的前缀仍取配置文件名，tag 来自 API 返回的出站 tag，推导结果与日志模式一致。
+
+API 响应由 `jq` 或 `jsonfilter` 解析（脚本不再自己解析 JSON）：两者都没有时 REST 模式自动禁用，只走日志模式。选路细节：
+
+- 只有 `curl` 退出码为 0 **且**响应体是合法 JSON、`outbounds` 为数组时才认为该进程可走 REST；截断的响应、错误对象、半截数据一律回落到日志模式，避免"非空就当可用"把日志路径永久挡住；
+- 结构与标签同样交叉校验：`outbounds` 为空、数组长度与 tag 数量不一致（有出站缺 tag）、某条出站取不出 tag，都按"响应不可用"处理并回落日志模式 —— 不做静默跳过，否则该进程的日志路径会被永久挡住而数据彻底消失。例外是数组元素本身为 `null`：`jsonfilter` 无法把"元素是 null"和"下标越界"区分开，两个后端统一按"该元素不存在"处理，**不触发回落**。这类元素本身取不到 tag、也就没有 REST 采样；但要注意，如果这个异常响应其实是服务端漏报了某个真实出站，脚本无法判断，那条出站这一轮的日志采样也会因为进程已被 REST 接管而跳过；
+- API 请求带 `--noproxy '*'`：本机管理接口必须直连，否则环境里配了 `http_proxy` 时请求（连同 Bearer secret）会被送进代理；
+- 出站的 `sample_age_ms` 缺失或非数字时**整条出站跳过**，不按 0 处理（否则过期采样会被当成最新数据反复上报）；过期判断用 `awk` 比较而不是 shell 的 `test` —— 超出整数范围的年龄会让 `test` 报错，而 `if` 里"报错"等于"不过期"；
+- 计数器、`rtt`、`mtu` 逐字段校验，任一字段不可用就跳过该方向：整数字段拒绝前导 0（`printf %d` 会按八进制解析）与超长数字（`lost`/`sent`/`sample_age_ms` 限制在 18 位内、`mtu` 限定 `0..65535`），`rtt` 接受 JSON 科学计数法（`jq` 会印成 `1E-7`）但限定在 `0..10^7 ms`（约 2.7 小时）。位数上限是"拒绝不可信的离谱值"：`shadowquic` 侧是 u64（最多 20 位），真实计数远到不了 18 位，而计数到 double 溢出量级（309 位以上）时 `lost/(sent+1)` 会算出 `-nan` 并被 `printf` 原样拼进报文、得到非法 JSON；算出来的 `loss_rate` 若不是纯十进制数也不发；
+- probe 端点的 tag 直接拼在 URL 路径里，只有 `[A-Za-z0-9._~-]` 的 tag 会被 probe（其它字符不再尝试，避免 URL 语义破坏请求），但不影响该出站的采样上报；
+- `bind-addr` 只接受 `主机:端口` 且主机字符集限定为字母数字与 `.` `_` `-`（IPv6 方括号内为十六进制/冒号/点）、端口最多 5 位：这个值会被直接拼进 URL，放行 `/` `?` `#` `@` 等于让配置文件决定请求打到哪个端点；
+- 配置文件参数是相对路径时（procd 里常见的 `-c tproxy_cn.yaml`），按 `/proc/<PID>/cwd/` 解析，不依赖上报脚本自己的工作目录；
+- `restful-api` 段的 `secret` 支持双/单引号与行尾注释，引号内的 `#` 不会被当成注释（`secret: "abc#123"` 与 `secret: "a\" #b"` 都按字面处理）；只解析单行标量，双引号内只解码 `\\` `\"` `\/` `\n` `\t` `\r`，且解码后含控制字符的 secret 一律拒绝（会破坏 Authorization 头）。secret 的首尾空白按原样保留（`secret: " abc "` 就是带空格的 `abc`）。超出这个子集的写法一律判为"这一段不可解析"、该进程直接走日志模式，而不是发一个已知不等价的凭据：块标量（`secret: |`、`secret: >-`，按去引号前的形态判断，所以 `secret: "|"` 仍是合法的一字符 secret）和 `\uXXXX` 这类转义都属此类；
+- pid 列表、API 响应、FIFO 都放在 `mktemp -d` 建的 0700 私有目录里，退出时整目录删除 —— 避免在可写的 `/tmp` 里用可预测文件名重定向（本地符号链接攻击面）；
+- "连续发送失败"的计数是**近似值**：日志路径与 REST worker 会并发失败，计数用"追加一个字节、读文件大小"实现，不会因为读-改-写而丢整次更新，但并发下某次阈值告警可能被延迟或漏掉，成功清零与失败写入也可能交错。它只用来避免静默失败，不承担精确语义。
+
+取数是按字段逐个调用后端的（一条出站一轮约 10 次），换来的是"字段缺失就跳过、绝不猜值"的逐字段校验。代价实测可忽略：aarch64 路由器上一次 `jsonfilter` 约 3ms，两出站满轮约 0.07 秒，对 30 秒周期不足 0.3%。
+
+可调环境变量（写在 `/etc/init.d/xtp-stats-reporter` 的 `procd_set_param env` 里）：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `REFRESH_INTERVAL` | `30` | 取数 / 喂流量周期（秒） |
+| `REFRESH_URL` | `http://cp.cloudflare.com/generate_204` | probe 目标，REST 模式仅支持 `http://`，且需 2xx |
+| `API_TIMEOUT` | `5` | 单个 API 请求超时（秒） |
+| `PROBE_TIMEOUT_MS` | `3000` | probe 超时（毫秒） |
+| `MAX_SAMPLE_AGE_MS` | `120000` | 采样年龄超过该值不再上报，避免隧道空闲时反复推过期数据 |
+
+> [!NOTE]
+> REST 模式下 API 返回的 `sq_conn_stats` 只在**连接已建立且数据面刷新过采样**后才有值（ShadowQUIC 的 `print_stats` 在发起代理请求时触发、10 秒节流）。所以脚本每轮都会 probe 一次喂流量；若 probe 目标不可达且链路上本来没有流量，会因采样过期而不上报，评分随之按 `quic_stale_secs` 衰减。
+
+### 5.2 安装、依赖与上报格式
 
 安装：
 
@@ -161,7 +214,13 @@ chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
 /etc/init.d/xtp-stats-reporter start
 ```
 
-依赖：`socat`（`opkg install socat`）、`logread`（OpenWrt 自带）。
+依赖：`socat`（`opkg install socat`）、`curl`（REST 模式与喂流量探测需要）、`jq` 或 `jsonfilter`（OpenWrt 自带 libubox 的 `jsonfilter`，REST 模式解析 API 响应用；两者都没有时只走日志模式）、`pgrep` / `awk`（busybox 自带）、`logread`（OpenWrt 自带，日志模式需要）。
+
+脚本的纯函数（`restful-api` 配置解析、JSON 取数、报文构造）有单测，本机与路由器都能跑，装了哪个 JSON 后端就测哪个：
+
+```sh
+sh contrib/tests/stats-reporter-test.sh
+```
 
 上报 JSON 格式：
 
@@ -178,7 +237,9 @@ chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
 | `mtu` | 链路 MTU |
 | `link` | 方向：`uplink` / `downlink` |
 
-`upstream_id` 推导规则：读取 `/proc/PID/cmdline`，取 `-c` / `-c=` / `--config` / `--config=` 参数对应配置文件的 basename 去扩展名作为前缀；再从日志 span 前缀 `inbound{tag=...}:outbound{tag=...}:` 取出 `outbound{tag=...}` 的 tag；拼成 `<配置名>_<tag>`。例如：
+### 5.3 upstream_id 推导规则
+
+`upstream_id` 推导规则：读取 `/proc/PID/cmdline`，取 `-c` / `-c=` / `--config` / `--config=` 参数对应配置文件的 basename 去扩展名作为前缀；再从日志 span 前缀 `inbound{tag=...}:outbound{tag=...}:` 取出 `outbound{tag=...}` 的 tag；拼成 `<配置名>_<tag>`。REST 模式没有日志 span，tag 直接取 API 返回的出站 tag，拼接规则相同。例如：
 
 | 启动命令 | 日志 span 前缀 | `upstream_id` |
 |----------|----------------|---------------|
@@ -199,7 +260,7 @@ addr = "127.0.0.1:20808"
 > - `upstream_id` 用**配置文件名做前缀**是为跨进程去重：不同 shadowquic 进程可能复用同一出站 tag（旧式单端点 `outbound:` 写法 tag 甚至默认为 `outbound`），只取 tag 会撞在一起；
 > - 出站 tag 区分同一进程内的多条隧道：一个 inbound 经路由（如 Lua `router`）可走多个 outbound，各出站会分别以自己的 tag 上报；
 > - `upstream_id`（`<配置名>_<出站 tag>`）与 xtp-rs 的 upstream `id` 为精确相等匹配，改动 ShadowQUIC 配置里的 tag / 配置文件名后须同步修改 xtp-rs 侧 id；
-> - 仅解析匹配 `shadowquic[PID]:` 前缀 + `uplink connection stats` / `downlink connection stats` 关键字的日志，其他进程日志忽略；
+> - 日志模式仅解析匹配 `shadowquic[PID]:` 前缀 + `uplink connection stats` / `downlink connection stats` 关键字的日志，其他进程日志忽略；REST 模式不依赖 syslog，两者互斥（同一进程只会有一路生效）；
 > - 不使用 ShadowQUIC 时无需部署；xtp-rs 的 TCP 吞吐评分（基于 `TCP_INFO`）不依赖任何外部组件。
 
 ---
