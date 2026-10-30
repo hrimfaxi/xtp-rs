@@ -177,9 +177,34 @@ has_nft_table() {
 # 幂等操作封装
 # -------------------------------------------------------------------------
 
+# 规则显式打上 protocol kernel。
+# systemd-networkd 的 ManageForeignRoutingPolicyRules 默认为 yes，启动或重配时会
+# 删除所有"不在 .network 文件里且 proto 不是 kernel"的规则。iproute2 默认把规则
+# 标成 proto unspec，于是一旦 networkd 被重启（典型场景：apt 升级 systemd 后
+# needrestart 重启服务），fwmark 规则会被静默删除——nft 仍在打 mark，但没有任何
+# 规则把它导入表 XTP_TABLE_ID，被标记的包改走默认路由直连出网，透明代理失效而
+# 服务本身看起来完全正常。proto kernel 在 networkd 的豁免名单里，可避免此问题。
+#
+# 老版本 iproute2 的 `ip rule add` 不认 protocol 关键字。此时回退到原命令保证规则
+# 仍能建立，但必须把"保护未生效"喊出来：降级会静默丢失防护，只写一条日志等于下次
+# 网络工具重启后故障重演。回退失败则返回非零，由调用方（set -e）中止 setup。
+# 注意已有规则不会被自动迁移——早于本改动建立的规则 proto 仍是 unspec，需先
+# `ip rule del` 再重跑 setup（或重启设备）才会带上新 proto。
 add_ip_rule() {
   if ! has_ip_rule "$1" "$2"; then
-    ip_cmd rule add fwmark "$1" table "$2"
+    local err
+    if err=$(ip_cmd rule add fwmark "$1" table "$2" protocol kernel 2>&1); then
+      return 0
+    fi
+
+    printf 'warning: failed to add IPv4 rule with protocol kernel: %s\n' "$err" >&2
+
+    if ip_cmd rule add fwmark "$1" table "$2"; then
+      printf '%s\n' \
+        'warning: IPv4 rule added without protocol kernel; systemd-networkd may remove it' >&2
+    else
+      return 1
+    fi
   fi
 }
 
@@ -201,9 +226,22 @@ del_ip_route() {
   fi
 }
 
+# 同 add_ip_rule，IPv6 侧同理（networkd 对 v4/v6 规则一视同仁地清理）
 add_ip6_rule() {
   if ! has_ip6_rule "$1" "$2"; then
-    ip_cmd -6 rule add fwmark "$1" table "$2"
+    local err
+    if err=$(ip_cmd -6 rule add fwmark "$1" table "$2" protocol kernel 2>&1); then
+      return 0
+    fi
+
+    printf 'warning: failed to add IPv6 rule with protocol kernel: %s\n' "$err" >&2
+
+    if ip_cmd -6 rule add fwmark "$1" table "$2"; then
+      printf '%s\n' \
+        'warning: IPv6 rule added without protocol kernel; systemd-networkd may remove it' >&2
+    else
+      return 1
+    fi
   fi
 }
 
