@@ -217,7 +217,7 @@ chmod +x /etc/init.d/xtp-stats-reporter /usr/libexec/xtp-rs/stats_reporter.sh
 /etc/init.d/xtp-stats-reporter start
 ```
 
-依赖（缺任何一个都会启动即报错退出）：`socat`（`opkg install socat`）、`curl`（轮询 API 与喂流量 probe 需要）、`jq` 或 `jsonfilter`（OpenWrt 自带 libubox 的 `jsonfilter`，解析 API 响应）、`pgrep` / `awk`（busybox 自带）。不再依赖 `logread`。
+依赖（缺任何一个都会启动即报错退出，错误写 syslog）：`socat`（`opkg install socat`）、`curl`（`opkg install curl`，轮询 API 与喂流量 probe 需要 —— OpenWrt 默认不带 curl，漏装会让 daemon 启动即退出）、`jq` 或 `jsonfilter`（OpenWrt 自带 libubox 的 `jsonfilter`，解析 API 响应）、`pgrep` / `awk`（busybox 自带）。不再依赖 `logread`。
 
 脚本的纯函数（`restful-api` 配置解析、JSON 取数、报文构造）有单测，本机与路由器都能跑，装了哪个 JSON 后端就测哪个：
 
