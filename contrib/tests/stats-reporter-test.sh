@@ -78,6 +78,59 @@ check_eq 'clear_send_failures 清掉计数文件' 'missing' \
     "$([ -e "$SEND_FAIL_FILE" ] && echo present || echo missing)"
 SEND_FAIL_FILE=""
 
+# socket 不存在是最常见的故障（xtp-rs 没起来 / SOCKET 配错）：它必须计入失败
+# 计数，否则 DEBUG=0 时这条路径一点声音都没有。
+SEND_FAIL_FILE="$TMPDIR_TEST/send-failures-socket"
+LOGGER_CALLS=0
+send_json '{"upstream_id":"x"}' >/dev/null 2>&1
+check_rc 'send_json: socket 不存在时返回非零' nonzero $?
+check_eq 'send_json: socket 不存在时计入失败' '1' \
+    "$(wc -c < "$SEND_FAIL_FILE" | tr -d ' ')"
+check_eq 'send_json: 首次失败立刻报一条 syslog' '1' "$LOGGER_CALLS"
+SEND_FAIL_FILE=""
+
+# API 失败同理：REST-only 之后没有日志回落，“服务活着但一直没有数据”
+# 只能靠这条节流 syslog 暴露。
+API_FAIL_FILE="$TMPDIR_TEST/api-failures"
+LOGGER_CALLS=0
+i=0
+while [ $i -lt 120 ]; do
+    count_api_failure "pid=1 host=127.0.0.1 port=9090 request failed"
+    i=$((i + 1))
+done
+check_eq 'count_api_failure 首次与第 61 次各报一条' '2' "$LOGGER_CALLS"
+clear_api_failures
+check_eq 'clear_api_failures 清掉计数文件' 'missing' \
+    "$([ -e "$API_FAIL_FILE" ] && echo present || echo missing)"
+API_FAIL_FILE=""
+
+# 计数必须按实例隔离（脚本里按 pid 分文件）：A 一直失败、B 一直成功时，B 的清零
+# 不能动 A 的计数，否则"A 首次失败即告警"会退化成每轮一条。
+API_FAIL_FILE="$TMPDIR_TEST/api-failures.100"
+LOGGER_CALLS=0
+count_api_failure "pid=100 host=127.0.0.1 port=9090 request failed"
+API_FAIL_FILE="$TMPDIR_TEST/api-failures.200"
+clear_api_failures
+check_eq 'clear_api_failures: B 的清零不动 A 的计数文件' 'present' \
+    "$([ -e "$TMPDIR_TEST/api-failures.100" ] && echo present || echo missing)"
+API_FAIL_FILE="$TMPDIR_TEST/api-failures.100"
+count_api_failure "pid=100 host=127.0.0.1 port=9090 request failed"
+check_eq 'count_api_failure: A 的第二次失败不重复告警' '1' "$LOGGER_CALLS"
+API_FAIL_FILE=""
+
+# 按 pid 分文件之后要能收走已退出实例的计数文件，否则进程反复重启会在状态
+# 目录里越堆越多。
+STATE_DIR="$TMPDIR_TEST/prune"
+mkdir -p "$STATE_DIR"
+: > "$STATE_DIR/api-failures.99999999"
+: > "$STATE_DIR/api-failures.$$"
+prune_stale_api_failures
+check_eq 'prune_stale_api_failures: 删掉已退出 pid 的计数文件' 'missing' \
+    "$([ -e "$STATE_DIR/api-failures.99999999" ] && echo present || echo missing)"
+check_eq 'prune_stale_api_failures: 保留存活 pid 的计数文件' 'present' \
+    "$([ -e "$STATE_DIR/api-failures.$$" ] && echo present || echo missing)"
+STATE_DIR=""
+
 # ---------- 丢包率 -> 报文 链路 ----------
 check_eq 'loss_rate_from 正常值' '0.0150' "$(loss_rate_from 150 9999)"
 
@@ -252,6 +305,26 @@ restful-api:
 YAML
 check_eq 'restful-api: 端口位数超限时整段作废' '' "$(read_rest "$TMPDIR_TEST/q.yaml")"
 
+cat > "$TMPDIR_TEST/r.yaml" <<'YAML'
+restful-api:
+  bind-addr: "127.0.0.1:99999"
+YAML
+# 位数没超（5 位），但超出端口范围：当作配置错误立即退出，而不是每轮 curl 失败。
+check_eq 'restful-api: 端口超出 65535 时整段作废' '' "$(read_rest "$TMPDIR_TEST/r.yaml")"
+
+cat > "$TMPDIR_TEST/s.yaml" <<'YAML'
+restful-api:
+  bind-addr: "127.0.0.1:0"
+YAML
+check_eq 'restful-api: 端口 0 判为不可解析' '' "$(read_rest "$TMPDIR_TEST/s.yaml")"
+
+cat > "$TMPDIR_TEST/t.yaml" <<'YAML'
+restful-api:
+  bind-addr: "127.0.0.1:65535"
+YAML
+check_eq 'restful-api: 上界端口 65535 可用' '127.0.0.1|65535|' \
+    "$(read_rest "$TMPDIR_TEST/t.yaml")"
+
 cat > "$TMPDIR_TEST/j.yaml" <<'EOF'
 restful-api:
   bind-addr: "127.0.0.1 : 9097"
@@ -268,29 +341,26 @@ parse_restful_api "$TMPDIR_TEST/k.yaml" >/dev/null
 check_eq 'parse_restful_api: 块标量 secret rc=2' '2' "$?"
 parse_restful_api "$TMPDIR_TEST/q.yaml" >/dev/null
 check_eq 'parse_restful_api: 端口位数超限 rc=2' '2' "$?"
+parse_restful_api "$TMPDIR_TEST/r.yaml" >/dev/null
+check_eq 'parse_restful_api: 端口超出范围 rc=2' '2' "$?"
 
-# ---------- 进程识别 ----------
-# pgrep -f 会命中命令行里带 "shadowquic" 的无关进程，而"配置里没有
-# restful-api 就退出"是致命判定，必须按 argv[0] 再过一遍。
-ln -s "$(command -v sleep)" "$TMPDIR_TEST/shadowquic"
-"$TMPDIR_TEST/shadowquic" 30 &
-FAKE_SQ_PID=$!
-
-# 子进程 fork 之后、exec 之前 /proc/PID/cmdline 还是父进程的，直接读会
-# 拿到 "sh"；这里等它 exec 成目标程序，最多等 3 秒。
-fake_tries=0
-while [ $fake_tries -lt 3 ] && ! is_shadowquic_pid "$FAKE_SQ_PID"; do
-    fake_tries=$((fake_tries + 1))
-    sleep 1
-done
-
-if is_shadowquic_pid "$FAKE_SQ_PID"; then
-    ok 'is_shadowquic_pid: 认出 argv[0] 为 shadowquic 的进程'
-else
-    ng 'is_shadowquic_pid: 认出 argv[0] 为 shadowquic 的进程'
-fi
-kill "$FAKE_SQ_PID" 2>/dev/null
-wait "$FAKE_SQ_PID" 2>/dev/null
+# ---------- 进程识别与命令行解析 ----------
+# 这里以前靠 ln -s 出一个名叫 shadowquic 的 sleep 当替身进程。那条路不可移植：
+# uutils 的 coreutils 会校验 argv[0] 与二进制名是否一致（改名即拒跑），
+# OpenWrt 的 busybox 也会把未知 applet 名当错误，于是用例在正常环境里假失败。
+# 改成直接喂 cmdline 文本 —— 顺带能覆盖 `vim shadowquic.yaml` 这类真实误判。
+printf 'shadowquic\n-c\n/etc/x.yaml\n' | cmdline_is_shadowquic
+check_rc 'cmdline_is_shadowquic: 裸程序名' zero $?
+printf '/usr/bin/shadowquic\nrun\n' | cmdline_is_shadowquic
+check_rc 'cmdline_is_shadowquic: 绝对路径' zero $?
+printf '/usr/lib/shadowquic-rs\nrun\n' | cmdline_is_shadowquic
+check_rc 'cmdline_is_shadowquic: 带后缀的程序名' zero $?
+printf 'vim\nshadowquic.yaml\n' | cmdline_is_shadowquic
+check_rc 'cmdline_is_shadowquic: 不误判命令行含 shadowquic 的编辑器' nonzero $?
+printf 'tail\n-f\n/tmp/shadowquic.log\n' | cmdline_is_shadowquic
+check_rc 'cmdline_is_shadowquic: 不误判 tail 日志' nonzero $?
+printf '' | cmdline_is_shadowquic
+check_rc 'cmdline_is_shadowquic: 空 cmdline' nonzero $?
 
 if is_shadowquic_pid $$; then
     ng 'is_shadowquic_pid: 不接受 argv[0] 为 sh 的进程'
@@ -303,6 +373,33 @@ if is_shadowquic_pid 99999999; then
 else
     ok 'is_shadowquic_pid: 不存在的 pid'
 fi
+
+# 配置文件参数：支持 -c / -c= / --config / --config=，且 `--` 是选项结束符。
+cfgarg() {
+    printf '%s\n' "$@" | parse_config_arg
+}
+
+check_eq 'parse_config_arg: -c 分离形式' '/etc/x.yaml' \
+    "$(cfgarg shadowquic -c /etc/x.yaml)"
+check_eq 'parse_config_arg: -c= 形式' '/etc/x.yaml' \
+    "$(cfgarg shadowquic -c=/etc/x.yaml)"
+check_eq 'parse_config_arg: --config 分离形式' '/etc/x.yaml' \
+    "$(cfgarg shadowquic run --config /etc/x.yaml)"
+check_eq 'parse_config_arg: --config= 形式' '/etc/x.yaml' \
+    "$(cfgarg shadowquic --config=/etc/x.yaml)"
+
+# 回归点：`shadowquic -c a.yaml --` 是合法写法，`--` 之前的 -c 必须照常生效
+# （旧实现把 `--` 当成"只看它后面"，于是把真正的 -c 跳过了）。
+check_eq 'parse_config_arg: -- 之前的 -c 仍有效' '/etc/x.yaml' \
+    "$(cfgarg shadowquic -c /etc/x.yaml --)"
+check_eq 'parse_config_arg: -- 之后不再解析' '/etc/x.yaml' \
+    "$(cfgarg shadowquic -c /etc/x.yaml -- -c /etc/y.yaml)"
+check_eq 'parse_config_arg: 只有 -- 之后的 -c 时取不到' '' \
+    "$(cfgarg shadowquic -- -c /etc/y.yaml)"
+
+check_eq 'parse_config_arg: 没有配置参数' '' "$(cfgarg shadowquic run)"
+check_eq 'parse_config_arg: -c 后面跟的是另一个选项时不算配置' '' \
+    "$(cfgarg shadowquic -c --dump)"
 
 # ---------- 数值校验 ----------
 for v in 0 5 1452 12345; do
@@ -336,6 +433,18 @@ if is_age_stale 99999999999999999999999999999999 120000; then
 else
     ng 'is_age_stale 超长年龄判为过期'
 fi
+
+# 环境数值：前导零（`sleep 00` 就是零秒等待）、0、超长数字都必须回退到默认值，
+# 否则 REFRESH_INTERVAL=00 会变成无间隔循环。
+check_eq 'num_or: 正常值' '30' "$(num_or 30 30 86400)"
+check_eq 'num_or: 上界本身可用' '86400' "$(num_or 86400 30 86400)"
+check_eq 'num_or: 空值回退' '30' "$(num_or '' 30 86400)"
+check_eq 'num_or: 0 回退' '30' "$(num_or 0 30 86400)"
+check_eq 'num_or: 前导零回退' '30' "$(num_or 00 30 86400)"
+check_eq 'num_or: 非数字回退' '30' "$(num_or 3x 30 86400)"
+check_eq 'num_or: 超上限回退' '30' "$(num_or 99999 30 86400)"
+check_eq 'num_or: 四十位数字回退' '30' \
+    "$(num_or 9999999999999999999999999999999999999999 30 86400)"
 
 # ---------- JSON 取数 ----------
 detect_json_backend
@@ -485,7 +594,8 @@ EOF
     check_eq 'rest_collect_samples: 超长 sample_age_ms 不产出' '' \
         "$(rest_collect_samples "$TMPDIR_TEST/hugeage.json")"
 
-    # 长度推导本身：null 元素两个后端口径一致（数非 null 元素）。
+    # 长度推导本身（jq：整个数组里非 null 元素的个数；jsonfilter 的算法不同，
+    # 见下面的独立段落）。
     check_eq 'json_array_len: 混合数组' '2' \
         "$(json_array_len "$TMPDIR_TEST/notag.json" outbounds)"
     check_eq 'json_array_len: 空数组' '0' \
@@ -495,6 +605,68 @@ EOF
     printf '{"outbounds":[{"tag":"a","quality":{}}]}' > "$TMPDIR_TEST/nostats.json"
     check_eq 'rest_collect_samples: 无采样的出站正常跳过' '0' \
         "$(rest_collect_samples "$TMPDIR_TEST/nostats.json" | wc -l | tr -d ' ')"
+fi
+
+# ---------- 真 jsonfilter 后端 ----------
+# 上面那组跑的是本机选中的后端（装了 jq 就是 jq）。target 上跑的是 jsonfilter，
+# 而它的 -t 类型输出、null 元素的停止点、数组下标语义都还没在本机验证过 ——
+# 没装就明确 SKIP，绝不拿 jq 跑过的结果充当 jsonfilter 通过。
+if ! command -v jsonfilter >/dev/null 2>&1; then
+    printf 'SKIP jsonfilter 后端用例：本机没有 jsonfilter（jq 的结果不能替代）\n'
+else
+    saved_backend="$JSON_BACKEND"
+    JSON_BACKEND=jsonfilter
+
+    cat > "$TMPDIR_TEST/jf-ok.json" <<'EOF'
+{"outbounds":[
+ {"tag":"direct","quality":{"probe":{"status":"ok"},"sq_conn_stats":null}},
+ {"tag":"sq-out","quality":{"sq_conn_stats":{
+   "sample_age_ms":6365,
+   "uplink":{"current_mtu":1452,"lost_packets":208,"rtt":302.10632599999997,"sent_packets":12737},
+   "downlink":{"current_mtu":1452,"lost_packets":2165,"rtt":301.383866,"sent_packets":14680}}}}]}
+EOF
+    printf '{"outbounds":[]}' > "$TMPDIR_TEST/jf-empty.json"
+    printf '{"outbounds":{}}' > "$TMPDIR_TEST/jf-objarr.json"
+    printf '{"outbounds":[{"tag":"x"' > "$TMPDIR_TEST/jf-truncated.json"
+    printf '{"outbounds":[null,{"tag":"a","quality":{"sq_conn_stats":null}}]}' \
+        > "$TMPDIR_TEST/jf-headnull.json"
+    printf '{"outbounds":[{"tag":"a","quality":{"sq_conn_stats":null}},null,{"tag":"b","quality":{"sq_conn_stats":null}}]}' \
+        > "$TMPDIR_TEST/jf-midnull.json"
+    printf '{"outbounds":[{"tag":"a","quality":{"sq_conn_stats":null}},null]}' \
+        > "$TMPDIR_TEST/jf-tailnull.json"
+    printf '{"outbounds":[{"tag":null},{"tag":"y","quality":{"sq_conn_stats":null}}]}' \
+        > "$TMPDIR_TEST/jf-notag.json"
+
+    json_has_outbounds "$TMPDIR_TEST/jf-ok.json"
+    check_rc 'jsonfilter: 正常响应的 outbounds 是数组' zero $?
+    json_has_outbounds "$TMPDIR_TEST/jf-objarr.json"
+    check_rc 'jsonfilter: outbounds 为对象时判为不可用' nonzero $?
+    json_has_outbounds "$TMPDIR_TEST/jf-truncated.json"
+    check_rc 'jsonfilter: 截断的响应判为不可用' nonzero $?
+
+    check_eq 'jsonfilter: 按下标取 tag' 'sq-out' \
+        "$(json_get "$TMPDIR_TEST/jf-ok.json" 'outbounds[1].tag')"
+    json_get "$TMPDIR_TEST/jf-ok.json" 'outbounds[9].tag' >/dev/null
+    check_rc 'jsonfilter: 越界下标视为缺失' nonzero $?
+
+    check_eq 'jsonfilter: 正常响应上下行各一条' '2' \
+        "$(rest_collect_samples "$TMPDIR_TEST/jf-ok.json" | wc -l | tr -d ' ')"
+    rest_collect_samples "$TMPDIR_TEST/jf-empty.json" >/dev/null
+    check_rc 'jsonfilter: 空数组视为不可用' nonzero $?
+
+    # null / 缺 tag 的四种形态：只断言安全不变式（绝不把 null 当出站、绝不产出
+    # 采样），不断言 rc —— jsonfilter 停在哪一步还没在真机验证，把观测值打出来
+    # 留痕，真机跑一次就能看清。
+    for f in headnull midnull tailnull notag; do
+        out=$(rest_collect_samples "$TMPDIR_TEST/jf-$f.json" 2>/dev/null)
+        rc=$?
+        n=$(json_array_len "$TMPDIR_TEST/jf-$f.json" outbounds)
+        ntags=$(json_outbound_tags "$TMPDIR_TEST/jf-$f.json" | wc -l | tr -d ' ')
+        check_eq "jsonfilter: $f 不产出采样" '' "$out"
+        printf '     留痕 %-8s n=%s tags=%s rc=%s\n' "$f" "${n:-?}" "$ntags" "$rc"
+    done
+
+    JSON_BACKEND="$saved_backend"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

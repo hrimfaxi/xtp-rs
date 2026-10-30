@@ -31,6 +31,7 @@ MAX_SAMPLE_AGE_MS="${MAX_SAMPLE_AGE_MS:-120000}"
 # 用可预测的 $$ 命名再直接 > 重定向，等于给本地用户一个符号链接攻击面。
 JSON_FILE=""
 SEND_FAIL_FILE=""
+API_FAIL_FILE=""
 STATE_DIR=""
 
 # JSON 解析后端：优先 jq（自带 @json、表达式更完整），
@@ -78,7 +79,7 @@ cleanup() {
         SLEEP_PID=""
     fi
 
-    rm -f "$JSON_FILE" "$SEND_FAIL_FILE"
+    rm -f "$JSON_FILE" "$SEND_FAIL_FILE" "$API_FAIL_FILE"
     # 整个私有状态目录一起删（含 mktemp 建的目录本身）。
     if [ -n "$STATE_DIR" ]; then
         rm -rf "$STATE_DIR"
@@ -88,14 +89,18 @@ cleanup() {
 }
 
 # ---------- 进程识别与配置解析 ----------
-# 该 pid 是不是 ShadowQUIC 本体：pgrep -f 会把命令行里带 "shadowquic" 的
-# 无关进程一起命中（编辑器、tail、包装脚本），而"配置里没有 restful-api
-# 就退出"是致命判定，绝不能被 `vim shadowquic.yaml` 之类的进程触发，
-# 所以这里再按 argv[0] 的 basename 过一遍。
-is_shadowquic_pid() {
+# cmdline_is_shadowquic：从 stdin 读 cmdline 文本（NUL 或换行分隔，首行是
+# argv[0]），判 argv[0] 的 basename 是否以 shadowquic 开头。
+# pgrep -f 会把命令行里带 "shadowquic" 的无关进程一起命中（编辑器、tail、
+# 包装脚本），而"配置里没有 restful-api 就退出"是致命判定，绝不能被
+# `vim shadowquic.yaml` 之类的进程触发，所以这里再按 argv[0] 过一遍。
+# 抽成纯函数是为了单测能直接喂造出来的 cmdline：换台机器往往找不到一个
+# "改名之后还肯运行"的替身进程（例如 uutils 的 coreutils 会校验 argv[0]）。
+cmdline_is_shadowquic() {
     local exe
 
-    exe=$(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | awk 'NR == 1 { print }')
+    IFS= read -r exe || :
+
     case "${exe##*/}" in
         shadowquic*) return 0 ;;
     esac
@@ -103,38 +108,36 @@ is_shadowquic_pid() {
     return 1
 }
 
-# 从 /proc/PID/cmdline 提取配置文件路径。取不到时返回非零。
-get_config_path() {
-    local pid="$1"
-    local cmdline_file="/proc/$pid/cmdline"
-    local cfg_file
+is_shadowquic_pid() {
+    local cmdline="/proc/$1/cmdline"
 
-    if [ ! -r "$cmdline_file" ]; then
-        dbg "PID=$pid: cannot read $cmdline_file"
-        return 1
-    fi
+    # 先判可读：否则重定向失败会在 stderr 上留下 "cannot open ..."，
+    # 而 pid 不存在是轮询里的正常情况（进程刚退出）。
+    [ -r "$cmdline" ] || return 1
 
-    # 支持以下参数格式：
-    #
-    # shadowquic -c /etc/xray/shadowquic/niyaou.yaml
-    # shadowquic -c=/etc/xray/shadowquic/niyaou.yaml
-    # shadowquic --config /etc/xray/shadowquic/niyaou.yaml
-    # shadowquic --config=/etc/xray/shadowquic/niyaou.yaml
-    cfg_file=$(tr '\0' '\n' < "$cmdline_file" 2>/dev/null | awk '
+    tr '\0' '\n' < "$cmdline" 2>/dev/null | cmdline_is_shadowquic
+}
+
+# 从 cmdline 文本（同上，首行 argv[0]）里挑出配置文件参数。取不到时无输出。
+# 支持以下参数格式：
+#
+# shadowquic -c /etc/xray/shadowquic/niyaou.yaml
+# shadowquic -c=/etc/xray/shadowquic/niyaou.yaml
+# shadowquic --config /etc/xray/shadowquic/niyaou.yaml
+# shadowquic --config=/etc/xray/shadowquic/niyaou.yaml
+parse_config_arg() {
+    awk '
         { a[NR] = $0 }
 
         END {
-            # 有 "--" 时，仅解析其后的真实程序参数；
-            # 无 "--" 时，从头解析。
-            start = 1
-            for (i = 1; i <= NR; i++) {
-                if (a[i] == "--") {
-                    start = i + 1
-                    break
-                }
-            }
+            # argv[0] 是程序路径，从 argv[1] 开始扫描。
+            for (i = 2; i <= NR; i++) {
 
-            for (i = start; i <= NR; i++) {
+                # `--` 是选项结束符（clap 也是这个语义）：后面都是位置参数，
+                # 不可能再有 -c / --config，继续扫只会把位置参数误认成配置。
+                if (a[i] == "--")
+                    break
+
                 file = ""
 
                 # -c /path/config.yaml
@@ -158,7 +161,21 @@ get_config_path() {
                 }
             }
         }
-    ')
+    '
+}
+
+# 从 /proc/PID/cmdline 提取配置文件路径。取不到时返回非零。
+get_config_path() {
+    local pid="$1"
+    local cmdline_file="/proc/$pid/cmdline"
+    local cfg_file
+
+    if [ ! -r "$cmdline_file" ]; then
+        dbg "PID=$pid: cannot read $cmdline_file"
+        return 1
+    fi
+
+    cfg_file=$(tr '\0' '\n' < "$cmdline_file" 2>/dev/null | parse_config_arg)
 
     if [ -z "$cfg_file" ]; then
         dbg "PID=$pid: config argument not found"
@@ -287,13 +304,21 @@ send_json() {
     local t_start t_end rc
 
     if [ ! -S "$SOCKET" ]; then
+        # 最常见的一种故障（xtp-rs 没起来 / SOCKET 配错）也走失败计数：
+        # 只写 debug 日志的话，DEBUG=0 时它会一直静默。
         dbg "ERROR: socket does not exist or is not a Unix socket: $SOCKET"
+        count_send_failure 1
         return 1
     fi
 
     t_start=$(monotime)
     dbg "sending JSON via UNIX datagram: $json"
 
+    # 这里的发送没有时间上界，别指望 socat 的选项补上：-t 是"一个方向 EOF
+    # 后的关闭阶段等待"，-T 是传输循环内的无活动超时，都不是"整次发送的总
+    # 超时"，也打断不了卡在 sendto 上的写。前台命令执行期间 TERM 只会被记下，
+    # 收尾要等它自己返回（procd 的 term_timeout 到点会 SIGKILL，清理就跑不掉）。
+    # 已知残留风险，未修。
     # 直接取管道的退出码：写成 if ... ; fi 时，条件不成立且没有 else
     # 分支会让整个 if 复合命令返回 0，真实失败码就被吞掉了。
     if [ "$DEBUG" = "1" ]; then
@@ -318,33 +343,62 @@ send_json() {
     return "$rc"
 }
 
-# 连续发送失败计数。落盘而不是放变量：上报都在管道的 while 子 shell 里执行，
+# 连续失败计数。落盘而不是放变量：上报都在管道的 while 子 shell 里执行，
 # 进程内变量每轮都会重置，"连续失败 60 次报一次 syslog"永远不会触发。
 #
 # 计数方式是"每次失败往文件追加一个字节，用文件大小当计数"：成功后清零
 # 与失败写入可能交错，读-加-写会丢更新，而 O_APPEND 的单字节写入不会。
 # 所以这是一个近似计数，只用来"别让它静默失败"，不承担精确语义。
-count_send_failure() {
-    local rc="$1" n
+count_failure() {
+    local file="$1" msg="$2" n
 
-    [ -n "$SEND_FAIL_FILE" ] || return 0
+    [ -n "$file" ] || return 0
 
-    printf 'x' >> "$SEND_FAIL_FILE" 2>/dev/null
-    n=$(wc -c < "$SEND_FAIL_FILE" 2>/dev/null | tr -d ' ')
+    printf 'x' >> "$file" 2>/dev/null
+    n=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
     case "$n" in
         ''|*[!0-9]*) return 0 ;;
     esac
 
-    # 每连续失败 60 次报一次 syslog，避免静默假运行。
+    # 首次失败立刻报一次（否则要等半个周期才知道坏了），之后每 60 次一条：
+    # 判等用 (n % 60) -eq 1，命中的是第 1、61、121… 次。
     if [ $((n % 60)) -eq 1 ]; then
         logger -t xtp-stats-reporter \
-            "WARNING: send failed $n times (socket=$SOCKET, rc=$rc)"
+            "WARNING: $msg (consecutive failures: $n)"
     fi
     return 0
 }
 
+count_send_failure() {
+    count_failure "$SEND_FAIL_FILE" "send failed (socket=$SOCKET, rc=$1)"
+}
+
+count_api_failure() {
+    count_failure "$API_FAIL_FILE" "API request failed ($1)"
+}
+
+clear_failures() {
+    [ -n "$1" ] && rm -f "$1" 2>/dev/null
+    return 0
+}
+
 clear_send_failures() {
-    [ -n "$SEND_FAIL_FILE" ] && rm -f "$SEND_FAIL_FILE" 2>/dev/null
+    clear_failures "$SEND_FAIL_FILE"
+}
+
+clear_api_failures() {
+    clear_failures "$API_FAIL_FILE"
+}
+
+# 清掉已经退出的实例的计数文件。按 pid 分文件之后，shadowquic 反复重启会在
+# 状态目录里留下越来越多的小文件；pid 不在了就没有"连续失败"可言，直接删。
+prune_stale_api_failures() {
+    local f
+
+    for f in "$STATE_DIR"/api-failures.*; do
+        [ -e "$f" ] || continue
+        kill -0 "${f##*.}" 2>/dev/null || rm -f "$f"
+    done
     return 0
 }
 
@@ -390,6 +444,15 @@ json_get() {
 #
 # 两个后端都没有 length：jsonfilter 用 -t 逐个下标探存在性。
 # 元素本身为 null 时 jsonfilter 会提前收手，所以调用方还要和 tag 行数交叉校验。
+#
+# 两个后端的算法并不等价，这里如实记下各自实现，别当成"口径已对齐"：
+#   jq        — 数整个数组里非 null 元素的个数；
+#   jsonfilter — 从下标 0 顺序探到第一个 null（或越界）为止，之后的元素不计。
+# 因此同一份含 null 的响应可能得到不同的 n，调用方不能只靠 n 成立：
+# tag 行数必须等于 n、遍历完 identified 必须等于 n，否则整轮放弃上报。
+# 已知表现：首部 null（下标 0 取不到 tag）与中间的 null（identified 偏小）都会
+# 报结构异常；尾部 null 不会被遍历到，等于被忽略 —— 它本身也没有采样可取。
+# jsonfilter 遇到 null 时究竟停在哪，本机没有该后端，未实测。
 json_array_len() {
     local file="$1" path="$2" idx
 
@@ -447,6 +510,11 @@ json_has_outbounds() {
 # ---------- RESTful API 取数 ----------
 # 从配置文件提取 restful-api 段的监听地址与 secret。
 # 成功时输出三行：host、port、secret（未配置 secret 时为空行）。
+#
+# 注意这里不是 YAML 解析器，只认顶层 `restful-api:` 段里的单行 `bind-addr:` /
+# `secret:` 两个键（块标量、不支持的转义一律判为不可解析）。段的边界只按"下一个
+# 顶格行"切分，不校验缩进层级 —— 该段内部更深层的同名 `secret:` / `bind-addr:`
+# 同样会被匹配，这是已知限制。
 #
 # 返回值区分两种不可用：
 #   2 — 有 `restful-api:` 段，但这一段的写法解析不出来（含不支持的 secret
@@ -607,6 +675,12 @@ parse_restful_api() {
             }
 
             if (length(port) > 5)
+                exit 2
+
+            # 光看位数不够：127.0.0.1:99999 会通过上面的检查，之后每轮 curl
+            # 都失败。端口必须落在可连接范围内（0 拿来当"动态端口"的话，脚本
+            # 也无从得知实际端口，同样按不可解析处理）。
+            if (port + 0 < 1 || port + 0 > 65535)
                 exit 2
 
             print host
@@ -804,6 +878,11 @@ poll_outbounds() {
         kill -0 "$pid" 2>/dev/null || continue
         is_shadowquic_pid "$pid" || continue
 
+        # 失败计数按 pid 分文件：不同进程的连续失败数必须互不影响。共用一个
+        # 文件时，A 一直失败、B 一直成功就会每轮"A 失败 → B 成功清零 → A 又
+        # 是第一次失败"，节流彻底失效。
+        API_FAIL_FILE="$STATE_DIR/api-failures.$pid"
+
         config_path=$(get_config_path "$pid")
         if [ -z "$config_path" ]; then
             # 进程可能刚退出，也可能不是用 -c/--config 启动的：取不到配置
@@ -835,8 +914,8 @@ poll_outbounds() {
         port="$REST_PORT"
         secret="$REST_SECRET"
 
-        # upstream_id = <配置名>_<出站 tag>：配置名跨进程去重（不同进程可能
-        # 用相同的出站 tag），出站 tag 区分同一进程内的多条隧道。
+        # upstream_id = <配置名>_<出站 tag>：配置名（basename，同机唯一）区分
+        # 进程，出站 tag 区分同一进程内的多条隧道。
         cfg_name=$(basename "$config_path")
         cfg_name=${cfg_name%.*}
         if [ -z "$cfg_name" ]; then
@@ -847,23 +926,29 @@ poll_outbounds() {
 
         # 先看 curl 自己的退出码，再看 JSON 是否完整可用：超时前收到的半截
         # 响应可以"非空但不可用"，只凭非空判断会把一次失败当成 API 可用。
+        # 三种失败都走计数 + 节流 syslog：REST-only 之后没有日志回落路径，
+        # 只剩 debug 日志的话，"服务活着但一直没有数据"会一直不报警。
         if ! rest_api "$host" "$port" "$secret" GET /api/v1/outbounds \
             > "$JSON_FILE"; then
             dbg "poll: PID=$pid API request failed at $host:$port, retry next round"
+            count_api_failure "pid=$pid host=$host port=$port request failed"
             continue
         fi
 
         if [ ! -s "$JSON_FILE" ] || ! json_has_outbounds "$JSON_FILE"; then
             dbg "poll: PID=$pid API returned unusable payload, retry next round"
+            count_api_failure "pid=$pid host=$host port=$port unusable payload"
             continue
         fi
 
         samples=$(rest_collect_samples "$JSON_FILE")
         if [ $? -ne 0 ]; then
             dbg "poll: PID=$pid API payload has unexpected shape, retry next round"
+            count_api_failure "pid=$pid host=$host port=$port unexpected payload shape"
             continue
         fi
 
+        clear_api_failures
         dbg "poll: PID=$pid API ok at $host:$port"
 
         printf '%s\n' "$samples" | while IFS='	' read -r tag link rtt lost sent mtu age; do
@@ -917,30 +1002,38 @@ poll_outbounds() {
                 dbg "poll: probe failed tag=$tag (ignored)"
         done
     done
+
+    prune_stale_api_failures
 }
 
-# 数值型环境变量的统一校验：非数字、空或 0 时回退到默认值，
+# 数值型环境变量的统一校验：空、非数字、前导零、0 或超过上限时回退到默认值，
 # 避免 sleep / curl 直接失败造成无间隔高速循环。
+# 复用 is_uint_range 而不是自己写 case：`''|*[!0-9]*|0)` 会放过 "00"
+# （sleep 00 就是零秒等待）和几十位的数字（sleep / curl 会直接报错）。
 num_or() {
-    case "$1" in
-        ''|*[!0-9]*|0) printf '%s' "$2" ;;
-        *) printf '%s' "$1" ;;
-    esac
+    local v="$1" fallback="$2" max="$3"
+
+    if is_uint_range "$v" "$max" && [ "$v" -gt 0 ]; then
+        printf '%s' "$v"
+    else
+        printf '%s' "$fallback"
+    fi
 }
 
 main() {
-    # REFRESH_INTERVAL 非法时额外发一条 syslog：这项配错会直接打满 CPU。
-    case "$REFRESH_INTERVAL" in
-        ''|*[!0-9]*|0)
-            logger -t xtp-stats-reporter \
-                "WARNING: invalid REFRESH_INTERVAL=$REFRESH_INTERVAL, using 30"
-            REFRESH_INTERVAL=30
-            ;;
-    esac
+    # 上限只为挡住"配错成天文数字"：无限大等于永不超时，
+    # 0 等于无间隔循环。正常部署的值离这些上界很远。
+    interval=$(num_or "$REFRESH_INTERVAL" 30 86400)
+    if [ "$interval" != "$REFRESH_INTERVAL" ]; then
+        # REFRESH_INTERVAL 配错会直接打满 CPU，这项多报一条 syslog。
+        logger -t xtp-stats-reporter \
+            "WARNING: invalid REFRESH_INTERVAL=$REFRESH_INTERVAL, using $interval"
+    fi
+    REFRESH_INTERVAL=$interval
 
-    API_TIMEOUT=$(num_or "$API_TIMEOUT" 5)
-    PROBE_TIMEOUT_MS=$(num_or "$PROBE_TIMEOUT_MS" 3000)
-    MAX_SAMPLE_AGE_MS=$(num_or "$MAX_SAMPLE_AGE_MS" 120000)
+    API_TIMEOUT=$(num_or "$API_TIMEOUT" 5 3600)
+    PROBE_TIMEOUT_MS=$(num_or "$PROBE_TIMEOUT_MS" 3000 3600000)
+    MAX_SAMPLE_AGE_MS=$(num_or "$MAX_SAMPLE_AGE_MS" 120000 86400000)
 
     # 只走 RESTful API，三件依赖缺一不可，缺了就别假装在跑。
     command -v socat >/dev/null 2>&1 ||
@@ -961,6 +1054,7 @@ main() {
         die "cannot create state dir under ${TMPDIR:-/tmp}"
     JSON_FILE="$STATE_DIR/outbounds.json"
     SEND_FAIL_FILE="$STATE_DIR/send-failures"
+    # API_FAIL_FILE 不在这里定：它按 pid 分文件（见 poll_outbounds）。
 
     if [ "$DEBUG" = "1" ]; then
         : > "$DEBUG_LOG"
