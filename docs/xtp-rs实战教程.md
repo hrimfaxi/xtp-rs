@@ -435,13 +435,13 @@ xtp-rs 给每条上游维护一个 0–1000 的动态分，来自两个信息源
 | 10 MiB/s | 800 |
 | ≥ 50 MiB/s | 1000 |
 
-**② QUIC 探针分（被动接收）**：ShadowQUIC 原生支持将链路质量（RTT、丢包率、MTU）输出到 syslog，无需任何修改。配套的 `xtp-stats-reporter` daemon（`contrib/usr/libexec/xtp-rs/stats_reporter.sh`）实时捕获这些日志，解析后通过本地 Unix 数据报 socket `/tmp/xtp-rs-report.sock` 以 JSON 格式上报给 xtp-rs：
+**② QUIC 探针分（被动接收）**：ShadowQUIC 提供 RESTful API 暴露链路质量（RTT、丢包率、MTU），无需任何修改。配套的 `xtp-stats-reporter` daemon（`contrib/usr/libexec/xtp-rs/stats_reporter.sh`）轮询 `/api/v1/outbounds` 取采样、并用 probe 端点喂流量，然后通过本地 Unix 数据报 socket `/tmp/xtp-rs-report.sock` 以 JSON 格式上报给 xtp-rs：
 
 ```json
 {"upstream_id": "vultr_p20808", "peer": "1234", "rtt_ms": 152.3, "loss_rate": 0.37, "mtu": 1280, "link": "downlink"}
 ```
 
-`upstream_id` = **`<配置文件名>_<出站 tag>`**：配置文件名（ShadowQUIC `-c` 参数去扩展名，跨进程去重）加日志里 `outbound{tag=...}` 的出站 tag（区分同进程内的多条隧道）。因此 xtp-rs 侧该 upstream 的 `id` 要与它完全一致（上例即 `id = "vultr_p20808"`）。
+`upstream_id` = **`<配置文件名>_<出站 tag>`**：配置文件名（ShadowQUIC `-c` 参数去扩展名，跨进程去重）加 API 返回的出站 tag（区分同进程内的多条隧道）。因此 xtp-rs 侧该 upstream 的 `id` 要与它完全一致（上例即 `id = "vultr_p20808"`）。
 
 基础分 1000，按丢包率和 RTT 逐级扣分；每 5 秒最多刷新一次，新旧分按 3:7 混合（新数据占七成，响应快又不至于抖动）。`loss_rate` 是小数（0.37 = 37%）；`link` 可标 `downlink` / 上行，双向都有报告时取平均。
 

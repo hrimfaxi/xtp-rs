@@ -16,7 +16,7 @@ start_service() {
 
     procd_set_param command /bin/sh "$SCRIPT"
 
-    # 给 stats_reporter.sh 的 TERM trap 留出清理 FIFO 和 logread 子进程的时间。
+    # 给 stats_reporter.sh 的 TERM trap 留出收尾清理（删私有状态目录）的时间。
     procd_set_param term_timeout 5
 
     # debug 日志写到 /tmp/shadowquic-stats-report.debug.log，不经过 stdout/stderr。
