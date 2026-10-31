@@ -968,6 +968,93 @@ impl Config {
     }
 }
 
+/// 配置键的兼容别名：这些键能反序列化成功，但不会出现在序列化结果里，
+/// 因此必须在未知键检查中显式放行（与 `#[serde(alias = "...")]` 保持一致）。
+const CONFIG_KEY_ALIASES: &[&str] = &["udp_session_idle_timeout_secs"];
+
+/// 找出配置文件中会被 serde 静默忽略的未知键。
+///
+/// toml 反序列化默认不拒绝未知键：拼错的键（例如把 `quic_sniff_mode` 写成
+/// `sniff_quic_mode`）会被直接丢弃，对应字段退回默认值，现场只能靠"配置明明
+/// 写了却不生效"倒推，极难定位。这里以"把已解析的 `Config` 序列化回 TOML"
+/// 得到的键集合作为已知键，用户写了但不在其中的键即为未知键。
+///
+/// 覆盖范围：顶层键，以及 `[[upstream]]` / `[[port_forward]]` 这类数组表的
+/// 元素键。`client_routes` 等 map 型配置的键由用户自由定义，不参与比较。
+/// 序列化会跳过 `None` 字段，但用户显式写下的键解析后必然非 `None`，
+/// 所以不会因此误报。
+pub fn unknown_config_keys(config_str: &str, config: &Config) -> Vec<String> {
+    let Ok(raw) = toml::from_str::<toml::Value>(config_str) else {
+        return Vec::new();
+    };
+    let Ok(serialized) = toml::to_string(config) else {
+        return Vec::new();
+    };
+    let Ok(known) = toml::from_str::<toml::Value>(&serialized) else {
+        return Vec::new();
+    };
+    let (Some(raw), Some(known)) = (raw.as_table(), known.as_table()) else {
+        return Vec::new();
+    };
+
+    let mut unknown = Vec::new();
+    for (key, value) in raw {
+        if CONFIG_KEY_ALIASES.contains(&key.as_str()) {
+            continue;
+        }
+        match known.get(key) {
+            Some(known_value) => {
+                collect_unknown_array_table_keys(key, value, known_value, &mut unknown)
+            }
+            None => unknown.push(key.clone()),
+        }
+    }
+    unknown
+}
+
+/// 对数组表逐元素比较键名：`[[upstream]]` 每个元素对应一个结构体，
+/// 取已知元素键的并集作为该表段的合法键集合。
+fn collect_unknown_array_table_keys(
+    prefix: &str,
+    raw: &toml::Value,
+    known: &toml::Value,
+    out: &mut Vec<String>,
+) {
+    let (Some(raw_items), Some(known_items)) = (raw.as_array(), known.as_array()) else {
+        return;
+    };
+    let mut known_keys = std::collections::HashSet::new();
+    for item in known_items {
+        if let Some(table) = item.as_table() {
+            known_keys.extend(table.keys().map(|k| k.as_str()));
+        }
+    }
+    // 序列化结果里该段为空（例如未配置 port_forward）时无从判断，直接跳过。
+    if known_keys.is_empty() {
+        return;
+    }
+    for (i, item) in raw_items.iter().enumerate() {
+        let Some(table) = item.as_table() else {
+            continue;
+        };
+        for key in table.keys() {
+            if !known_keys.contains(key.as_str()) {
+                out.push(format!("{prefix}[{i}].{key}"));
+            }
+        }
+    }
+}
+
+/// 对 `unknown_config_keys` 的结果逐条告警。启动与热重载时各调用一次。
+pub fn warn_unknown_config_keys(config_str: &str, config: &Config) {
+    for key in unknown_config_keys(config_str, config) {
+        warn!(
+            key = %key,
+            "unknown config key ignored; check spelling against docs/配置.md"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1355,6 +1442,53 @@ mod tests {
         #[test]
         fn quic_sniff_mode_default_is_none() {
             assert_eq!(super::QuicSniffMode::default(), super::QuicSniffMode::None);
+        }
+
+        #[test]
+        fn unknown_config_keys_flags_typo_and_array_table_key() {
+            // 复现现场事故：sniff_quic_mode 拼错后 serde 静默忽略，QUIC 嗅探一直是 none。
+            let raw = r#"
+listen = "[::]:10810"
+sniff_quic_mode = "full"
+quic_sniff_mode = "none"
+
+[[upstream]]
+id = "a"
+addr = "127.0.0.1:1080"
+groops = ["youtube"]
+"#;
+            let cfg: super::Config = toml::from_str(raw).unwrap();
+            let unknown = super::unknown_config_keys(raw, &cfg);
+            assert!(
+                unknown.iter().any(|k| k == "sniff_quic_mode"),
+                "顶层拼错的键应被识别: {unknown:?}"
+            );
+            assert!(
+                unknown.iter().any(|k| k == "upstream[0].groops"),
+                "数组表元素里拼错的键应被识别: {unknown:?}"
+            );
+            assert!(
+                !unknown.iter().any(|k| k == "quic_sniff_mode"),
+                "合法键不应误报: {unknown:?}"
+            );
+        }
+
+        #[test]
+        fn unknown_config_keys_accepts_alias_and_map_keys() {
+            let raw = r#"
+udp_session_idle_timeout_secs = 30
+quic_sniff_mode = "full"
+client_domain_routes = { "10.0.0.0/24" = { ".example.com" = "default" } }
+
+[[upstream]]
+id = "a"
+addr = "127.0.0.1:1080"
+"#;
+            let cfg: super::Config = toml::from_str(raw).unwrap();
+            assert!(
+                super::unknown_config_keys(raw, &cfg).is_empty(),
+                "别名键与用户自定义 map 键不应误报"
+            );
         }
     }
 }

@@ -30,7 +30,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry, reload};
 
-use crate::cli::{Cli, Config, ProxyMode};
+use crate::cli::{Cli, Config, ProxyMode, unknown_config_keys, warn_unknown_config_keys};
 use crate::state::AppState;
 use crate::upstream::run_upstream_stats_listener;
 use crate::util::TaskGuard;
@@ -74,6 +74,10 @@ async fn main() -> Result<()> {
 
     // --check / -T: 打印生效配置后退出，不启动服务
     if cli.check {
+        // 此时 tracing 尚未初始化，未知键直接打到 stderr
+        for key in unknown_config_keys(&config_str, &config) {
+            eprintln!("warning: unknown config key '{key}' ignored; check spelling");
+        }
         let output = toml::to_string_pretty(&config).context("failed to serialize config")?;
         print!("{}", output);
         return Ok(());
@@ -94,6 +98,7 @@ async fn main() -> Result<()> {
     debug!("xtp-rs started");
 
     warn_if_half_close_timeout_disabled_by_splice(&config);
+    warn_unknown_config_keys(&config_str, &config);
 
     let app_state = AppState::build(config, cli.config.clone()).await?;
     let state = Arc::new(ArcSwap::from(Arc::new(app_state)));
@@ -213,6 +218,7 @@ async fn reload_config(state: Arc<ArcSwap<AppState>>) -> Result<()> {
     let mut config: Config = toml::from_str(&config_str).context("invalid config")?;
     config.normalize_geosite_tags();
     config.validate()?;
+    warn_unknown_config_keys(&config_str, &config);
     // 提前校验 log filter，失败时旧 generation 不动
     let new_filter = build_env_filter(&config)?;
     let new_arc = Arc::new(AppState::build(config, path.clone()).await?);
