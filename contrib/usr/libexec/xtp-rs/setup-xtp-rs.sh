@@ -301,8 +301,16 @@ fi
 # uci 选项 xtp-rs.main.tcp_ports / udp_ports（/etc/config/xtp-rs）>
 # 内置默认值。未安装 uci 的系统自动使用环境变量或内置默认值。
 # 列表为空白、逗号或分号分隔的端口号（1-65535）；非法项忽略并告警，
-# 全部无效时回退默认值，保证生成的 nft 集合永不为空（归一化函数
-# normalize_port_list 见 common.sh）。
+# 全部无效时回退默认值（归一化函数 normalize_port_list 见 common.sh）。
+#
+# 「不代理某协议」需显式写 none（大小写不敏感）：此时对应的 nft 集合不带
+# elements，引用它的规则永不命中，等于该协议不进入 TPROXY。空值仍是"用
+# 内置默认值"——否则未安装 uci 的系统在没设环境变量时会静默变成"什么都不
+# 代理"，而表面上服务一切正常。
+#   XTP_UDP_PORTS=none        → 完全不代理 UDP（内网 UDP 也随之全直连）
+#   XTP_TCP_PORTS=none        → 完全不代理 TCP
+# 注意 nft 不接受空的 elements 块（elements = { } 会加载失败），故只能用
+# 省略 elements 的方式表达空集合。
 # 改动后需重跑本脚本（或重启 xtp-rs 服务）才会生效。
 # -------------------------------------------------------------------------
 XTP_TCP_PORTS="${XTP_TCP_PORTS:-}"
@@ -314,19 +322,38 @@ if [ -z "$XTP_UDP_PORTS" ] && command -v uci >/dev/null 2>&1; then
   XTP_UDP_PORTS="$(uci -q get xtp-rs.main.udp_ports || true)"
 fi
 
-XTP_TCP_PORT_LIST="$(normalize_port_list "$XTP_TCP_PORTS" "80 443")"
-if [ -z "$XTP_TCP_PORT_LIST" ]; then
-  echo "xtp-rs: warning: no valid TCP ports configured, falling back to defaults: 80 443" >&2
-  XTP_TCP_PORT_LIST="80 443"
+XTP_TCP_PORT_LIST=""
+XTP_UDP_PORT_LIST=""
+if is_ports_none "$XTP_TCP_PORTS"; then
+  echo "xtp-rs: info: tcp_ports=none, TCP transparent proxy disabled" >&2
+else
+  XTP_TCP_PORT_LIST="$(normalize_port_list "$XTP_TCP_PORTS" "80 443")"
+  if [ -z "$XTP_TCP_PORT_LIST" ]; then
+    echo "xtp-rs: warning: no valid TCP ports configured, falling back to defaults: 80 443" >&2
+    XTP_TCP_PORT_LIST="80 443"
+  fi
 fi
-XTP_UDP_PORT_LIST="$(normalize_port_list "$XTP_UDP_PORTS" "53 443")"
-if [ -z "$XTP_UDP_PORT_LIST" ]; then
-  echo "xtp-rs: warning: no valid UDP ports configured, falling back to defaults: 53 443" >&2
-  XTP_UDP_PORT_LIST="53 443"
+if is_ports_none "$XTP_UDP_PORTS"; then
+  echo "xtp-rs: info: udp_ports=none, UDP transparent proxy disabled" >&2
+else
+  XTP_UDP_PORT_LIST="$(normalize_port_list "$XTP_UDP_PORTS" "53 443")"
+  if [ -z "$XTP_UDP_PORT_LIST" ]; then
+    echo "xtp-rs: warning: no valid UDP ports configured, falling back to defaults: 53 443" >&2
+    XTP_UDP_PORT_LIST="53 443"
+  fi
 fi
 
-TCP_PORT_ELEMENTS="$(set_elements_nft "$XTP_TCP_PORT_LIST")"
-UDP_PORT_ELEMENTS="$(set_elements_nft "$XTP_UDP_PORT_LIST")"
+TCP_PORT_SET_ELEMENTS="$(port_set_elements_nft "$XTP_TCP_PORT_LIST")"
+UDP_PORT_SET_ELEMENTS="$(port_set_elements_nft "$XTP_UDP_PORT_LIST")"
+
+# ban_foreign_quic 把境外 QUIC 挡下后，客户端会改试 TCP/443 —— 若 TCP 443
+# 不在代理端口内，回落的那条连接是直连出去的，等于"拦了 QUIC 又没接管 TCP"
+if [ "$XTP_BAN_FOREIGN_QUIC" = "1" ]; then
+  case " ${XTP_TCP_PORT_LIST} " in
+    *" 443 "*) ;;
+    *) echo "xtp-rs: warning: ban_foreign_quic=1 but TCP/443 is not in tcp_ports; clients falling back to TCP will connect directly, not through the proxy" >&2 ;;
+  esac
+fi
 
 # -------------------------------------------------------------------------
 # 可选：按进程属主（uid）跳过代理（防环路的替代方案）
@@ -544,19 +571,17 @@ ${RESERVED_IP_ELEMENTS}
   }
 
   # 待代理 TCP 目的端口（uci xtp-rs.main.tcp_ports，默认 80,443）
+  # 配置为 none 时该集合不带 elements：nft 不允许空的 elements 块，而"无元素"
+  # 的集合正好表示不代理——引用它的规则永不命中。
   set xtp_tcp_ports {
     type inet_service;
-    elements = {
-${TCP_PORT_ELEMENTS}
-    }
+${TCP_PORT_SET_ELEMENTS}
   }
 
   # 待代理 UDP 目的端口（uci xtp-rs.main.udp_ports，默认 53,443）
   set xtp_udp_ports {
     type inet_service;
-    elements = {
-${UDP_PORT_ELEMENTS}
-    }
+${UDP_PORT_SET_ELEMENTS}
   }
 
 ${CHNROUTE_INCLUDE}

@@ -67,8 +67,8 @@ cargo build --release --target mipsel-unknown-linux-musl \
 | `bypass_chnroute` | `0` | 中国大陆 IP 目的地址直连（需先跑 `update-chnroute.sh`） |
 | `ban_foreign_quic` | `0` | 拒绝发往境外地址的 QUIC（UDP/443），迫使回落到 TCP（需先跑 `update-chnroute.sh`） |
 | `ban_foreign_quic_action` | `auto` | 上面开关的处置动作：`auto` / `reject` / `drop` |
-| `tcp_ports` | `80 443` | 待代理 TCP 目的端口（空白 / 逗号 / 分号分隔，1-65535） |
-| `udp_ports` | `53 443` | 待代理 UDP 目的端口 |
+| `tcp_ports` | `80 443` | 待代理 TCP 目的端口（空白 / 逗号 / 分号分隔，1-65535；`none` = 不代理 TCP） |
+| `udp_ports` | `53 443` | 待代理 UDP 目的端口（同上；`none` = 不代理 UDP） |
 | `ext_reserved_ip` | 空 | 额外强制直连的目的地址（上游 VPN IP、内网服务器、指定公网 IP） |
 | `bypass_saddr` | 空 | 按源 IP 直连，跳过代理 |
 | `bypass_skuid` | 空 | 按进程属主（用户名或 uid）直连，防环路替代方案 |
@@ -113,6 +113,24 @@ uci commit xtp-rs
 ```
 
 列表文件位于 `/etc/xtp-rs/chnroute.nft`（IPv4）与 `/etc/xtp-rs/chnroute6.nft`（IPv6）；两个地址族独立，任一缺失只跳过对应规则。脚本只能识别“文件缺失 / 不是以 `set china_ips` 开头”这类问题；语法或类型损坏的文件要到 nft 加载阶段才会报错，此时 `setup-xtp-rs.sh` 会回滚到旧规则并报错（透明代理不会因此消失）。
+
+### 关闭某个协议的代理（`none`）
+
+把端口列表写成 `none`（或 `off`，大小写不敏感）就是「该协议完全不代理」：
+
+```sh
+uci set xtp-rs.main.udp_ports='none'    # 不代理任何 UDP（境外 DNS、内网 UDP 全部直连）
+uci set xtp-rs.main.tcp_ports='none'    # 不代理任何 TCP
+uci commit xtp-rs
+/etc/init.d/xtp-rs restart
+```
+
+> [!IMPORTANT]
+> **空值不等于 `none`**：把 `udp_ports` 设成空串 / 删掉该选项，脚本会回退到内置默认值（UDP 仍代理 `53 443`）。原因是未安装 uci 的系统在没设环境变量时也读不到值，若把空值当成"关闭"，那些系统会静默变成"什么都不代理"而服务看起来一切正常。
+
+实现上，`none` 生成的 `xtp_tcp_ports` / `xtp_udp_ports` 集合**不带 `elements`**（nft 不接受空的 `elements = { }` 块），引用该集合的 `tproxy` / `mark` 规则因此永不命中；`lan_udp_ports` 子链也随之退化为"内网 UDP 全部直连"。
+
+注意与 `ban_foreign_quic` 的配合：若 `tcp_ports` 不含 `443`（或为 `none`）而 `ban_foreign_quic=1`，被拦下的境外 QUIC 回落 TCP 时是**直连**而非走代理，`setup-xtp-rs.sh` 会在启动日志里给出告警。
 
 ### 禁止境外 QUIC
 

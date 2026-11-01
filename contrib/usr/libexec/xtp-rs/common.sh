@@ -110,6 +110,30 @@ saddr_bypass_rules_nft() {
   done
 }
 
+# 判断端口列表是否被显式配置为"不代理"（none / off，大小写不敏感）。
+# 只认这两个词：其它写法（含空串）一律按"端口列表"处理，避免把笔误当成关闭
+# 代理——未安装 uci 且没设环境变量的系统，空值必须走内置默认值。
+is_ports_none() {
+  case "$1" in
+    *[!NnOoFfEe]*) return 1 ;;
+  esac
+  case "$1" in
+    [Nn][Oo][Nn][Ee]|[Oo][Ff][Ff]) return 0 ;;
+  esac
+  return 1
+}
+
+# 生成 nft set 的 elements 块（4 空格缩进，元素 6 空格缩进）；端口列表为空
+# 时输出空串，由调用方省掉整个 elements 属性——nft 不接受空的 elements 块
+# （elements = { } 直接加载失败），而"无元素"的集合等价于不代理该协议：
+# 引用它的规则永不命中。
+port_set_elements_nft() {
+  [ -n "$1" ] || return 0
+  printf '    elements = {\n'
+  set_elements_nft "$1"
+  printf '    }\n'
+}
+
 # 归一化端口列表：非法/越界项告警并丢弃，去重后以空格分隔输出；
 # 入参为空时使用默认列表 $_default。注意：入参非空但全部非法时返回
 # 空串，须由调用方回退默认值（setup-xtp-rs.sh 已处理），本函数不单独
