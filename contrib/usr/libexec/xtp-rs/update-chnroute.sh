@@ -15,10 +15,10 @@ set -eu
 # 并非 CIDR 写法；nftables 的 interval set 原生支持区间元素（a-b），
 # 故校验后原样写入，由 auto-merge 合并相邻/重叠区间。
 #
-# 片段供 setup-xtp-rs.sh 在开启 XTP_BYPASS_CHNROUTE=1 时 include 进
-# inet xtp-rs 表，使发往中国大陆的流量不进入 TPROXY、保持正常转发路径
-# （fw4 flowtable 软/硬 offload 得以对其生效）。两个地址族相互独立，
-# 任一下载/生成失败不影响另一个的更新。
+# 片段供 setup-xtp-rs.sh 在开启 XTP_BYPASS_CHNROUTE=1（中国大陆流量不进入
+# TPROXY、保持正常转发路径，fw4 flowtable 软/硬 offload 得以对其生效）或
+# XTP_BAN_FOREIGN_QUIC=1（拒绝境外 QUIC，迫使回落 TCP）时 include 进
+# inet xtp-rs 表。两个地址族相互独立，任一下载/生成失败不影响另一个的更新。
 #
 # 本脚本只生成数据文件，不改动运行中的规则；生成后需重跑 setup-xtp-rs.sh
 # （或重启 xtp-rs 服务）才会生效。

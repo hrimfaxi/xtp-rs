@@ -8,6 +8,31 @@ config xtp_rs 'main'
 	# 改动后需重启服务或重跑 setup-xtp-rs.sh 才会生效。
 	option bypass_chnroute '0'
 
+	# 禁止发往境外地址的 QUIC（UDP/443）：开启后目的地址不在中国大陆
+	# IP 列表内的 UDP/443 被 reject（回 ICMP/ICMPv6 port-unreachable），
+	# 客户端据此立刻回落 TCP，境外站点因此走 TCP 代理而不是用 QUIC
+	# 直连绕过代理。规则在 TPROXY 之前，故即使 udp_ports 含 443，境外
+	# QUIC 也不会进入代理；国内 QUIC 与内网流量不受影响。
+	# UCI 路径：uci get xtp-rs.main.ban_foreign_quic
+	# 前置条件同 bypass_chnroute：先用 update-chnroute.sh 生成列表文件；
+	# 两个地址族独立，任一列表缺失只跳过对应规则。
+	# 无 uci 的系统可用环境变量 XTP_BAN_FOREIGN_QUIC 覆盖。
+	# 改动后需重启服务或重跑 setup-xtp-rs.sh 才会生效。
+	option ban_foreign_quic '0'
+
+	# 上面开关的处置动作（仅 ban_foreign_quic=1 时有效）：
+	#   auto（默认）先按 reject 生成；加载失败时自动改用 drop 重试一次。
+	#              5.9 之前的内核（如 OpenWrt 19.07/21.02 的 4.14/5.4）不支持
+	#              在 prerouting hook 使用 nftables reject，整表会加载失败，
+	#              此时 auto 会降级为 drop（丢包，回落更慢但可用）。
+	#   reject     强制回 ICMP / ICMPv6 port-unreachable（回落最快）。
+	#   drop       强制丢包，不发 ICMP。
+	# 注意：动作只影响命中规则的包，是否回落 TCP 取决于客户端实现；且规则匹配
+	# 所有 UDP/443（不只 QUIC）。
+	# UCI 路径：uci get xtp-rs.main.ban_foreign_quic_action
+	# 无 uci 的系统可用环境变量 XTP_BAN_FOREIGN_QUIC_ACTION 覆盖。
+	option ban_foreign_quic_action 'auto'
+
 	# 待代理的 TCP 目的端口列表（空白、逗号或分号分隔，1-65535）。
 	# UCI 路径：uci get xtp-rs.main.tcp_ports
 	# 未安装 uci 的系统可用环境变量 XTP_TCP_PORTS 覆盖；

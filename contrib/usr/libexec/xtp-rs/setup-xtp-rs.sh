@@ -144,9 +144,10 @@ BYPASS_SADDR_RULES=""
 #     （TPROXY 截走的流会被导入本机 input 路径，永远到不了 forward hook，
 #      对这些流 nat offload 是无效的。）
 # 列表由 update-chnroute.sh 下载生成（建议加入 cron 定期刷新），本脚本只
-# 消费不下载，开机不依赖网络；文件缺失或损坏时仅警告并继续，不影响其余功能。
-# 两个地址族相互独立：任一列表缺失只跳过对应规则。更新列表后需重跑本脚本
-# （或重启 xtp-rs 服务）才会生效。
+# 消费不下载，开机不依赖网络；文件缺失或不是以 set china_ips 开头时仅警告并
+# 跳过对应规则。语法/类型损坏的文件要到 nft 加载阶段才会暴露，此时按下方
+# load_nft_table 的回滚逻辑保留旧规则并报错。两个地址族相互独立：任一列表
+# 缺失只跳过对应规则。更新列表后需重跑本脚本（或重启 xtp-rs 服务）才会生效。
 #
 # 开关取值优先级：环境变量 XTP_BYPASS_CHNROUTE > uci 选项
 # xtp-rs.main.bypass_chnroute（/etc/config/xtp-rs）> 默认关闭。
@@ -163,22 +164,132 @@ esac
 CHNROUTE_NFT_FILE="${XTP_CHNROUTE_FILE:-/etc/xtp-rs/chnroute.nft}"
 CHNROUTE6_NFT_FILE="${XTP_CHNROUTE6_FILE:-/etc/xtp-rs/chnroute6.nft}"
 
+# -------------------------------------------------------------------------
+# 可选：禁止发往境外地址的 QUIC（UDP/443）
+# -------------------------------------------------------------------------
+# 开启 XTP_BAN_FOREIGN_QUIC=1 后，prerouting / output 链中目的地址不在
+# china_ips（IPv4）/ china_ip6s（IPv6）集合内的 UDP/443 包直接拒绝，回
+# ICMP / ICMPv6 port-unreachable，迫使浏览器等客户端立刻回落 TCP
+# （TCP/443 仍在代理范围内，境外站点因此统一走 TCP 代理）。
+#
+# 适用场景：客户端优先使用 QUIC（UDP/443）直连，导致境外流量绕过代理；
+# 或 UDP 走代理不稳定，希望强制回落 TCP。
+#
+# 规则位置在 TPROXY 规则之前：即使 udp_ports 含 443，境外 QUIC 也会被拒绝
+# 而不会进入代理。国内 QUIC 命中 china_ips / china_ip6s 故跳过；内网与保留
+# 地址在更前面的规则里已 return；xtp-rs 自身出站（mark = XTP_BYPASS_MARK）
+# 同样先 return，上游隧道不受影响。
+#
+# 依赖与 bypass_chnroute 相同：先跑 update-chnroute.sh 生成列表。两个地址族
+# 相互独立，任一列表缺失只跳过对应规则并告警。
+#
+# 动作（XTP_BAN_FOREIGN_QUIC_ACTION / uci xtp-rs.main.ban_foreign_quic_action）：
+#   auto（默认）reject 失败时自动降级为 drop —— 5.9 之前的内核不支持在
+#               prerouting hook 使用 nftables reject（整表加载会失败），
+#               自动降级让它在这类内核上仍可用，只是少了 ICMP 提示；
+#   reject     强制 reject（回 ICMP / ICMPv6 port-unreachable，回落最快）；
+#   drop       强制 drop（丢包，客户端要等 QUIC 握手超时才回落 TCP）。
+# 注意：动作只影响命中规则的包，是否回落 TCP 由客户端实现决定；且规则匹配
+# 的是所有 UDP/443（不只 QUIC），其它用 443 的 UDP 协议同样被拒。
+#
+# 开关取值优先级：环境变量 XTP_BAN_FOREIGN_QUIC > uci 选项
+# xtp-rs.main.ban_foreign_quic（/etc/config/xtp-rs）> 默认关闭。
+# -------------------------------------------------------------------------
+XTP_BAN_FOREIGN_QUIC="${XTP_BAN_FOREIGN_QUIC:-}"
+if [ -z "$XTP_BAN_FOREIGN_QUIC" ] && command -v uci >/dev/null 2>&1; then
+  XTP_BAN_FOREIGN_QUIC="$(uci -q get xtp-rs.main.ban_foreign_quic || true)"
+fi
+case "$XTP_BAN_FOREIGN_QUIC" in
+  1|true|yes|on) XTP_BAN_FOREIGN_QUIC=1 ;;
+  *) XTP_BAN_FOREIGN_QUIC=0 ;;
+esac
+
+XTP_BAN_FOREIGN_QUIC_ACTION="${XTP_BAN_FOREIGN_QUIC_ACTION:-}"
+if [ -z "$XTP_BAN_FOREIGN_QUIC_ACTION" ] && command -v uci >/dev/null 2>&1; then
+  XTP_BAN_FOREIGN_QUIC_ACTION="$(uci -q get xtp-rs.main.ban_foreign_quic_action || true)"
+fi
+case "$XTP_BAN_FOREIGN_QUIC_ACTION" in
+  ''|auto|AUTO) XTP_BAN_FOREIGN_QUIC_ACTION=auto ;;
+  reject|drop) ;;
+  *)
+    echo "xtp-rs: warning: invalid ban_foreign_quic_action '$XTP_BAN_FOREIGN_QUIC_ACTION' (expect auto|reject|drop), falling back to auto" >&2
+    XTP_BAN_FOREIGN_QUIC_ACTION=auto
+    ;;
+esac
+# 生成的规则里实际使用的动作；auto 先按 reject 生成，加载失败再整体降级为 drop
+BAN_QUIC_ACTION=reject
+if [ "$XTP_BAN_FOREIGN_QUIC" = "1" ] && [ "$XTP_BAN_FOREIGN_QUIC_ACTION" = "drop" ]; then
+  BAN_QUIC_ACTION=drop
+fi
+
+# china_ips / china_ip6s 集合的可用性单独判定：bypass_chnroute（直连）与
+# ban_foreign_quic（拒绝境外 QUIC）都依赖它们，任一开关需要时只 include 一次
+# ——同一张表里重复定义同名 set 会让整张表加载失败。
+CHNROUTE_V4_OK=0
+CHNROUTE_V6_OK=0
+if [ -s "$CHNROUTE_NFT_FILE" ] && grep -q '^set china_ips' "$CHNROUTE_NFT_FILE"; then
+  CHNROUTE_V4_OK=1
+fi
+if [ -s "$CHNROUTE6_NFT_FILE" ] && grep -q '^set china_ip6s' "$CHNROUTE6_NFT_FILE"; then
+  CHNROUTE_V6_OK=1
+fi
+
 CHNROUTE_INCLUDE=""
 CHNROUTE_RETURN=""
 CHNROUTE6_INCLUDE=""
 CHNROUTE6_RETURN=""
-if [ "$XTP_BYPASS_CHNROUTE" = "1" ]; then
-  if [ -s "$CHNROUTE_NFT_FILE" ] && grep -q '^set china_ips' "$CHNROUTE_NFT_FILE"; then
-    CHNROUTE_INCLUDE="include \"${CHNROUTE_NFT_FILE}\""
-    CHNROUTE_RETURN="ip daddr @china_ips counter return"
-  else
-    echo "xtp-rs: warning: XTP_BYPASS_CHNROUTE=1 but $CHNROUTE_NFT_FILE is missing or invalid, IPv4 bypass disabled; run update-chnroute.sh first" >&2
+BAN_QUIC_V4_RULE=""
+BAN_QUIC_V6_RULE=""
+if [ "$XTP_BYPASS_CHNROUTE" = "1" ] || [ "$XTP_BAN_FOREIGN_QUIC" = "1" ]; then
+  # 告警里只列真正开启的开关，避免只开 ban_foreign_quic 时被告知
+  # bypass_chnroute 失效
+  CHNROUTE_SWITCHES=""
+  if [ "$XTP_BYPASS_CHNROUTE" = "1" ]; then
+    CHNROUTE_SWITCHES="XTP_BYPASS_CHNROUTE=1"
   fi
-  if [ -s "$CHNROUTE6_NFT_FILE" ] && grep -q '^set china_ip6s' "$CHNROUTE6_NFT_FILE"; then
-    CHNROUTE6_INCLUDE="include \"${CHNROUTE6_NFT_FILE}\""
-    CHNROUTE6_RETURN="ip6 daddr @china_ip6s counter return"
+  if [ "$XTP_BAN_FOREIGN_QUIC" = "1" ]; then
+    CHNROUTE_SWITCHES="${CHNROUTE_SWITCHES:+${CHNROUTE_SWITCHES}, }XTP_BAN_FOREIGN_QUIC=1"
+  fi
+
+  if [ "$CHNROUTE_V4_OK" = "1" ]; then
+    CHNROUTE_INCLUDE="include \"${CHNROUTE_NFT_FILE}\""
+    if [ "$XTP_BYPASS_CHNROUTE" = "1" ]; then
+      CHNROUTE_RETURN="ip daddr @china_ips counter return"
+    fi
+    if [ "$XTP_BAN_FOREIGN_QUIC" = "1" ]; then
+      # 排除项复用 reserved_ip，另外必须显式排除 192.168.0.0/16：内网 UDP 走
+      # 上面的 lan_udp_ports 子链，命中 udp_ports（默认含 443）后 return 回
+      # 父链，正好落到本规则上，而 192.168/16 不在 reserved_ip 里（内网 UDP
+      # 命中 proxied 端口时要能被代理，所以不能把它塞进 reserved_ip），
+      # 不排除就会把内网 QUIC 误判成"境外"拒绝。
+      # 保留网段与 local_ip 其实都在前面的 return 里已放行，这里再引用一次
+      # reserved_ip 是为了让规则自身成立，避免以后调整规则顺序时静默误拒内网。
+      if [ "$BAN_QUIC_ACTION" = "drop" ]; then
+        BAN_QUIC_V4_RULE="ip daddr != @china_ips ip daddr != @reserved_ip ip daddr != 192.168.0.0/16 udp dport 443 counter drop"
+      else
+        BAN_QUIC_V4_RULE="ip daddr != @china_ips ip daddr != @reserved_ip ip daddr != 192.168.0.0/16 udp dport 443 counter reject with icmp port-unreachable"
+      fi
+    fi
   else
-    echo "xtp-rs: warning: XTP_BYPASS_CHNROUTE=1 but $CHNROUTE6_NFT_FILE is missing or invalid, IPv6 bypass disabled; run update-chnroute.sh first" >&2
+    echo "xtp-rs: warning: ${CHNROUTE_SWITCHES} but $CHNROUTE_NFT_FILE is missing or invalid, IPv4 rules disabled; run update-chnroute.sh first" >&2
+  fi
+
+  if [ "$CHNROUTE_V6_OK" = "1" ]; then
+    CHNROUTE6_INCLUDE="include \"${CHNROUTE6_NFT_FILE}\""
+    if [ "$XTP_BYPASS_CHNROUTE" = "1" ]; then
+      CHNROUTE6_RETURN="ip6 daddr @china_ip6s counter return"
+    fi
+    if [ "$XTP_BAN_FOREIGN_QUIC" = "1" ]; then
+      # 同 IPv4：复用 reserved_ip6 排除保留地址。fd00::/8（内网 ULA）包含在
+      # reserved_ip6 的 fc00::/7 里，一并覆盖，无需再单独列。
+      if [ "$BAN_QUIC_ACTION" = "drop" ]; then
+        BAN_QUIC_V6_RULE="ip6 daddr != @china_ip6s ip6 daddr != @reserved_ip6 udp dport 443 counter drop"
+      else
+        BAN_QUIC_V6_RULE="ip6 daddr != @china_ip6s ip6 daddr != @reserved_ip6 udp dport 443 counter reject with icmpv6 port-unreachable"
+      fi
+    fi
+  else
+    echo "xtp-rs: warning: ${CHNROUTE_SWITCHES} but $CHNROUTE6_NFT_FILE is missing or invalid, IPv6 rules disabled; run update-chnroute.sh first" >&2
   fi
 fi
 
@@ -317,8 +428,9 @@ for _mod in nft_tproxy nft_socket; do
   fi
 done
 
-#cat <<NFTABLES
-load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
+# 规则文本先落到变量：reject 在 5.9 之前的内核上不被 prerouting hook 支持，
+# 加载失败时要能降级为 drop 重试一次（见文件末尾）。
+RULES_NFT="$(cat <<NFTABLES
 #
 # XTP-RS 透明代理 (TPROXY) 核心原理
 
@@ -390,6 +502,19 @@ load_nft_table "$XTP_TABLE_NAME" <<NFTABLES
 # 内网 TCP 全部直连（return）；内网 UDP 仅放行命中 xtp_udp_ports 集合的
 # 端口（默认 53/443），其余直连。这样 UDP/53（DNS）等仍可被代理/劫持。
 # 端口列表可由 uci xtp-rs.main.tcp_ports / udp_ports 自定义。
+#
+# -------------------------------------------------------------------------
+# 【禁止境外 QUIC（可选，ban_foreign_quic）】
+# -------------------------------------------------------------------------
+# 目的地址不在 china_ips / china_ip6s 内的 UDP/443 一律 reject（回
+# ICMP/ICMPv6 port-unreachable），客户端据此立刻回落 TCP，境外站点因此
+# 走 TCP 代理而不是用 QUIC 直连绕过代理。规则刻意放在 TPROXY 规则之前：
+# 即使 udp_ports 含 443，境外 QUIC 也不会进入代理。未开启时这两行为空。
+#
+# 排除项复用 reserved_ip / reserved_ip6（保留网段 + ext_reserved_ip），另需
+# 显式排除 192.168.0.0/16：内网 UDP 命中 udp_ports 时会从 lan_udp_ports 子链
+# return 回父链，且 192.168/16 不在 reserved_ip 里（内网 UDP 命中 proxied
+# 端口时要能被代理），不排除会把内网 QUIC 误判成"境外"而拒绝。
 #
 
 table inet ${XTP_TABLE_NAME} {
@@ -477,6 +602,14 @@ ${BYPASS_SADDR_RULES}
     meta l4proto tcp ip6 daddr fd00::/8 return
     ip6 daddr fd00::/8 meta l4proto udp jump lan_udp_ports
 
+    # 禁止境外 QUIC（uci xtp-rs.main.ban_foreign_quic，默认关闭）：
+    # 内网 / 保留地址已在上面 return，规则内再显式排除 192.168.0.0/16
+    # （内网 UDP 命中 udp_ports 时会从 lan_udp_ports 子链 return 回来）。
+    # reject 回 port-unreachable 让客户端立即回落 TCP；放在 TPROXY 规则
+    # 之前，故 udp_ports 含 443 时境外 QUIC 也不会进入代理。
+    ${BAN_QUIC_V4_RULE}
+    ${BAN_QUIC_V6_RULE}
+
     meta l4proto tcp th dport @xtp_tcp_ports meta mark set ${XTP_FWMARK} tproxy ip to 127.0.0.1:${XTP_TPROXY_PORT} accept
     meta l4proto tcp th dport @xtp_tcp_ports meta mark set ${XTP_FWMARK} tproxy ip6 to [::1]:${XTP_TPROXY_PORT} accept
     meta l4proto udp th dport @xtp_udp_ports meta mark set ${XTP_FWMARK} tproxy ip to 127.0.0.1:${XTP_TPROXY_PORT} accept
@@ -503,6 +636,12 @@ ${BYPASS_SADDR_RULES}
     ${CHNROUTE6_RETURN}
     meta l4proto tcp ip6 daddr fd00::/8 return
     ip6 daddr fd00::/8 meta l4proto udp jump lan_udp_ports
+
+    # 禁止境外 QUIC（uci xtp-rs.main.ban_foreign_quic，默认关闭）：
+    # 本机出站同理，迫使本机程序的 QUIC 回落 TCP 走代理。
+    ${BAN_QUIC_V4_RULE}
+    ${BAN_QUIC_V6_RULE}
+
     meta l4proto tcp th dport @xtp_tcp_ports meta mark set ${XTP_FWMARK} accept
     meta l4proto udp th dport @xtp_udp_ports meta mark set ${XTP_FWMARK} accept
   }
@@ -518,3 +657,24 @@ ${BYPASS_SADDR_RULES}
   }
 }
 NFTABLES
+)"
+
+# reject 动作降级为 drop：只改我们生成的两条 ban_foreign_quic 规则的行尾动作，
+# 用行尾锚定避免误伤注释或其它规则。
+ban_action_downgrade() {
+  sed -e 's/ udp dport 443 counter reject with icmp port-unreachable$/ udp dport 443 counter drop/' \
+      -e 's/ udp dport 443 counter reject with icmpv6 port-unreachable$/ udp dport 443 counter drop/'
+}
+
+if ! printf '%s\n' "$RULES_NFT" | load_nft_table "$XTP_TABLE_NAME"; then
+  # 已显式指定动作的不重试：让用户看到真实错误，避免把配置错误悄悄改成 drop
+  if [ "$XTP_BAN_FOREIGN_QUIC" = "1" ] && [ "$BAN_QUIC_ACTION" = "reject" ] &&
+     [ "$XTP_BAN_FOREIGN_QUIC_ACTION" = "auto" ]; then
+    echo "xtp-rs: warning: nftables load failed, retrying with drop (kernel < 5.9 has no prerouting reject support; if the failure is unrelated it will fail again)" >&2
+    RULES_NFT="$(printf '%s\n' "$RULES_NFT" | ban_action_downgrade)"
+    printf '%s\n' "$RULES_NFT" | load_nft_table "$XTP_TABLE_NAME"
+  else
+    echo "xtp-rs: error: failed to load nftables table $XTP_TABLE_NAME" >&2
+    exit 1
+  fi
+fi

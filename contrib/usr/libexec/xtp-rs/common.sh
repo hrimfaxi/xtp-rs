@@ -263,14 +263,38 @@ del_ip6_route() {
   fi
 }
 
-# 加载 nft 规则（先删旧表，再从 stdin 读取新规则）
+# 加载 nft 规则（备份旧表 → 删旧表 → 从 stdin 读取新规则；失败则回滚旧表）
 # 用法: load_nft_table "$XTP_TABLE_NAME" <<'EOF' ... EOF
+#
+# 为什么要备份：nft 的单个事务是原子的，但"先删旧表、再加载新表"是两个事务。
+# 新规则里只要有内核不支持的表达式（典型：5.9 之前的内核不支持在 prerouting
+# 用 reject，报 Operation not supported），删除已经提交、加载却整体失败，
+# 结果是透明代理规则全部消失——表现为代理静默失效而服务看起来正常。
+# 故加载失败时把删除前的表重新灌回去，把"规则消失"降级为"规则未更新 + 报错"。
 load_nft_table() {
-  local name="$1"
+  local name="$1" tmp backup
+  tmp="$(mktemp "${TMPDIR:-/tmp}/xtp-rs-nft.XXXXXX")" || return 1
+  backup="${tmp}.bak"
+  # 先把 stdin 落盘：后面要失败重试，且 nft 只接受一次 stdin
+  if ! cat > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
   if has_nft_table "$name"; then
+    # 备份失败不阻断（最坏情况是没有回滚能力），但要让调用方知道
+    nft_cmd list table inet "$name" > "$backup" 2>/dev/null || rm -f "$backup"
     nft_cmd delete table inet "$name" 2>/dev/null || true
   fi
-  nft_cmd -f -
+  if nft_cmd -f "$tmp"; then
+    rm -f "$tmp" "$backup"
+    return 0
+  fi
+  printf 'warning: failed to load nftables table %s, rolling back\n' "$name" >&2
+  if [ -s "$backup" ] && ! nft_cmd -f "$backup"; then
+    printf 'warning: rollback of table %s also failed, proxy rules are MISSING until setup re-runs successfully\n' "$name" >&2
+  fi
+  rm -f "$tmp" "$backup"
+  return 1
 }
 
 del_nft_table() {

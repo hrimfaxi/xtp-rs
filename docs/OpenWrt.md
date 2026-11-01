@@ -65,6 +65,8 @@ cargo build --release --target mipsel-unknown-linux-musl \
 | UCI 选项 | 默认 | 说明 |
 |----------|------|------|
 | `bypass_chnroute` | `0` | 中国大陆 IP 目的地址直连（需先跑 `update-chnroute.sh`） |
+| `ban_foreign_quic` | `0` | 拒绝发往境外地址的 QUIC（UDP/443），迫使回落到 TCP（需先跑 `update-chnroute.sh`） |
+| `ban_foreign_quic_action` | `auto` | 上面开关的处置动作：`auto` / `reject` / `drop` |
 | `tcp_ports` | `80 443` | 待代理 TCP 目的端口（空白 / 逗号 / 分号分隔，1-65535） |
 | `udp_ports` | `53 443` | 待代理 UDP 目的端口 |
 | `ext_reserved_ip` | 空 | 额外强制直连的目的地址（上游 VPN IP、内网服务器、指定公网 IP） |
@@ -110,7 +112,47 @@ uci commit xtp-rs
 #    追加到 /etc/crontabs/root 后执行：/etc/init.d/cron restart
 ```
 
-列表文件位于 `/etc/xtp-rs/chnroute.nft`（IPv4）与 `/etc/xtp-rs/chnroute6.nft`（IPv6）；两个地址族独立，任一缺失只跳过对应规则。
+列表文件位于 `/etc/xtp-rs/chnroute.nft`（IPv4）与 `/etc/xtp-rs/chnroute6.nft`（IPv6）；两个地址族独立，任一缺失只跳过对应规则。脚本只能识别“文件缺失 / 不是以 `set china_ips` 开头”这类问题；语法或类型损坏的文件要到 nft 加载阶段才会报错，此时 `setup-xtp-rs.sh` 会回滚到旧规则并报错（透明代理不会因此消失）。
+
+### 禁止境外 QUIC
+
+客户端（尤其浏览器）会优先用 QUIC（UDP/443）直连境外站点，这类流量要么绕过代理、要么在 UDP 不代理时直连出去。开启本选项后，目的地址不在中国大陆 IP 列表内的 UDP/443 被拦下，**支持快速回落的客户端**（Chrome / Firefox 等）会随即尝试 TCP/443，从而经代理访问：
+
+```sh
+# 1. 列表前置条件同 bypass_chnroute（已生成可跳过）
+/usr/libexec/xtp-rs/update-chnroute.sh
+
+# 2. 开启开关
+uci set xtp-rs.main.ban_foreign_quic='1'
+uci commit xtp-rs
+
+# 3. 应用规则
+/etc/init.d/xtp-rs restart
+```
+
+处置动作由 `ban_foreign_quic_action` 控制：
+
+| 取值 | 行为 | 适用 |
+|------|------|------|
+| `auto`（默认） | 先按 `reject` 生成；整表加载失败时自动改用 `drop` 重试一次 | 通用，兼顾回落速度与旧内核 |
+| `reject` | 强制回 ICMP / ICMPv6 `port-unreachable`，回落最快 | 内核 ≥ 5.9 |
+| `drop` | 强制丢包，不发 ICMP，客户端要等 QUIC 握手超时 | 内核 < 5.9（OpenWrt 19.07 / 21.02 的 4.14 / 5.4） |
+
+> [!IMPORTANT]
+> **内核要求**：`reject` 用在 `prerouting` hook 需要 Linux ≥ 5.9（内核 `nft_reject_validate` 从 5.9 起才允许 `PRE_ROUTING`）。更早的内核上整张表会加载失败，这也是 `auto` 存在的原因 —— 它失败一次后自动降级为 `drop` 并告警。显式写 `reject` 则不做降级，失败即报错（`setup-xtp-rs.sh` 会回滚到旧规则，透明代理不会因此消失，但新规则不生效）。
+
+其他行为要点：
+
+- 规则位于 `TPROXY` 规则**之前**，因此即使 `udp_ports` 含 `443`，境外 QUIC 也会被拦下而不会进入代理。
+- 匹配的是**所有** UDP/443，不只是 QUIC：其它跑在 443 上的 UDP 协议同样被拦；QUIC 跑在非 443 端口不覆盖。
+- 国内 QUIC 命中 `china_ips` / `china_ip6s` 故不受影响。**注意“国内”取决于列表新鲜度**：列表里没有的国内 IP 会被当成境外而拦下（结果是回落 TCP，不是断网），所以列表要按 [中国大陆 IP 直连](#中国大陆-ip-直连) 的建议定期刷新。
+- 对应地址族的列表缺失或损坏时只跳过该族规则并告警 —— 此时该族境外 QUIC 是**放行**而非拦截。
+- 保留地址不影响：xtp-rs 自身出站（`fwmark` 等于旁路标记）与 `local_ip` 在更前面的规则里已 `return`，上游隧道不受影响。
+- 排除项复用 `reserved_ip` / `reserved_ip6` 集合（保留网段 + `ext_reserved_ip`；`fc00::/7` 已覆盖 `fd00::/8`），并单独排除 `192.168.0.0/16`：内网 UDP 命中 `udp_ports`（默认含 443）时会从 `lan_udp_ports` 子链 `return` 回父链，而 `192.168/16` 刻意不在 `reserved_ip` 里（内网 UDP 命中代理端口时仍需可代理），不排除会把内网 QUIC 误拦。**内网服务若用公网地址访问**（split-horizon、服务直接绑在公网 IP 上），该地址要加进 `ext_reserved_ip`，否则会被当成境外。
+- 影响范围限于 `XTP_PROXY_INGRESS_IFACES` 列出的入口接口（+ `lo`）出去的流量；从 WAN 进入、要转发给内网服务器的入站流量不经本规则（DNAT 在更早的 `dstnat` 优先级完成，目的地址已变成内网地址）。
+- 已在 flowtable 快路径上的既有会话不再经过 netfilter，开启后可能要等旧流超时或被清掉才完全生效；排查时可 `conntrack -F` 或重启上游设备。
+- 与 `bypass_chnroute` 共用同一份列表：两者任一开启都会 include 集合文件，`bypass_chnroute` 关掉不影响本选项。
+- 只想让境外 QUIC 走 **TCP 代理**（不再代理 UDP/443）时，把 `443` 从 `udp_ports` 移除即可。
 
 ### 无 uci 时的回退
 
