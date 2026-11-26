@@ -698,6 +698,10 @@ impl AppState {
     /// 停止当前 generation 的 listener、UDP runtime 和辅助任务。
     ///
     /// reload 时不断已有 TCP 连接，只停 listener 和辅助 task。
+    ///
+    /// 注意：旧 generation 的 `AppState` 会被存量 TCP 连接持有的 `Arc` 拖住，
+    /// 不能指望它 drop 时靠 `TaskGuard::Drop` 收尾——不依赖 fd 的辅助任务必须在
+    /// 这里显式停掉，否则 reload 后新旧两份同时跑（例如分数表会打印两张）。
     pub async fn shutdown_for_reload(&self, timeout: Duration) -> bool {
         let mut ok = true;
         // 1. 先停 listener / port-forward：不再 accept 新连接、不再创建新 UDP session
@@ -713,6 +717,8 @@ impl AppState {
 
         // 4. 停 score task（不依赖 fd，随时可停）
         ok &= self.upstream_scores.shutdown(timeout).await;
+        ok &= self.relative_score.shutdown(timeout).await;
+        ok &= self.score_printer.shutdown(timeout).await;
 
         // 5. 最后停 health check
         ok &= self.health_check.shutdown(timeout).await;
@@ -2342,5 +2348,28 @@ mod tests {
             (true, Instant::now()),
         );
         assert!(!state.should_direct(ip, Some("a.proxy.example")));
+    }
+
+    /// 旧 generation 会被存量 TCP 连接拖住而无法 drop，所以分数打印/相对评分
+    /// 这类辅助任务必须由 shutdown_for_reload 显式停掉，否则 reload 后会多跑一份。
+    #[tokio::test]
+    async fn shutdown_for_reload_stops_score_aux_tasks() {
+        let state = minimal_app_state();
+        let stopped = Arc::new(AtomicU8::new(0));
+
+        for guard in [&state.score_printer, &state.relative_score] {
+            let stopped = Arc::clone(&stopped);
+            guard.spawn(|cancel| async move {
+                cancel.cancelled().await;
+                stopped.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+
+        assert!(state.shutdown_for_reload(Duration::from_secs(1)).await);
+        assert_eq!(
+            stopped.load(Ordering::Relaxed),
+            2,
+            "分数打印与相对评分任务都应在 reload 时被停掉"
+        );
     }
 }
