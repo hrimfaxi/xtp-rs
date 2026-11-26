@@ -105,6 +105,11 @@ impl Upstream {
         self.quic_stale_secs.store(secs.max(1), Ordering::Relaxed);
     }
 
+    /// QUIC 探针分数的过期阈值（秒）
+    pub fn quic_stale_secs(&self) -> u64 {
+        self.quic_stale_secs.load(Ordering::Relaxed)
+    }
+
     fn lock_registry(&self) -> std::sync::MutexGuard<'_, Vec<(Weak<()>, std::os::fd::RawFd)>> {
         self.registry.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1330,6 +1335,9 @@ pub async fn run_score_debug_printer(
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // 图例只在第一次输出分数表之前打印，避免每轮重复刷屏
+    let mut legend_printed = false;
+
     loop {
         tokio::select! {
             biased;
@@ -1366,31 +1374,105 @@ pub async fn run_score_debug_printer(
                     0
                 },
                 quic_down_init: quic_down_last > 0,
-                quic_eff: up.quic_score_effective_at(now),
                 eff_score: up.effective_score_at(now),
+                gain: up.gain,
+                stale_secs: up.quic_stale_secs(),
             });
         }
 
         // 按 effective_score 降序排列
         scores.sort_by_key(|s| std::cmp::Reverse(s.eff_score));
 
-        for s in &scores {
-            debug!(
-                id = %s.id,
-                tcp_raw = s.tcp_raw,
-                tcp_init = s.tcp_init,
-                quic_uplink_raw = s.quic_up_raw,
-                quic_uplink_age_secs = s.quic_up_age,
-                quic_uplink_initialized = s.quic_up_init,
-                quic_downlink_raw = s.quic_down_raw,
-                quic_downlink_age_secs = s.quic_down_age,
-                quic_downlink_initialized = s.quic_down_init,
-                quic_effective = s.quic_eff,
-                effective_score = s.eff_score,
-                "upstream scores detail"
-            );
+        // 整轮只产生一条日志事件：多行内容在 logread 里仍然是一张对齐的表
+        let mut msg = format!(
+            "upstream scores ({}), sorted by effective score",
+            scores.len()
+        );
+        if !legend_printed {
+            msg.push('\n');
+            msg.push_str(SCORE_TABLE_LEGEND);
+            legend_printed = true;
         }
+        msg.push('\n');
+        msg.push_str(&format_score_table(&scores));
+        debug!("{}", msg.trim_end());
     }
+}
+
+/// 分数表的 flags 图例，仅在首次打印分数表之前输出一次。
+const SCORE_TABLE_LEGEND: &str = concat!(
+    "  flags: T=tcp U=quic-uplink D=quic-downlink !=stale ?=no-probe\n",
+    "  age: seconds since last probe update as uplink/downlink, - = no sample",
+);
+
+/// 把一轮分数快照渲染成对齐的表格，风格参考 `transmission-remote -pl` 的 peer 列表。
+fn format_score_table(rows: &[UpstreamScoreSnapshot<'_>]) -> String {
+    // 表头行固定占两字符，再按最长 id 自适应列宽
+    let id_w = rows
+        .iter()
+        .map(|r| r.id.chars().count())
+        .max()
+        .unwrap_or(2)
+        .max(2);
+    let mut out = format!(
+        "  {id:<id_w$}  {flags:<5}  {score:>8}  {tcp:>4}  {qup:>4}  {qdn:>4}  {gain:>5}  {age:>7}\n",
+        id = "id",
+        flags = "flags",
+        score = "score",
+        tcp = "tcp",
+        qup = "qup",
+        qdn = "qdn",
+        gain = "gain",
+        age = "age",
+        id_w = id_w,
+    );
+
+    for r in rows {
+        let mut flags = String::with_capacity(5);
+        if r.tcp_init {
+            flags.push('T');
+        }
+        if r.quic_up_init {
+            flags.push('U');
+        }
+        if r.quic_down_init {
+            flags.push('D');
+        }
+        match (r.quic_up_init, r.quic_down_init) {
+            (false, false) => flags.push('?'),
+            _ => {
+                let up_stale = r.quic_up_init && r.quic_up_age >= r.stale_secs;
+                let down_stale = r.quic_down_init && r.quic_down_age >= r.stale_secs;
+                if up_stale || down_stale {
+                    flags.push('!');
+                }
+            }
+        }
+
+        let age = match (r.quic_up_init, r.quic_down_init) {
+            (false, false) => "-".to_string(),
+            // 固定 上行/下行 两段，避免 `-47` 被读成负数，也避免单向样本与双向同值混淆
+            (true, false) => format!("{}/-", r.quic_up_age),
+            (false, true) => format!("-/{}", r.quic_down_age),
+            (true, true) if r.quic_up_age == r.quic_down_age => r.quic_up_age.to_string(),
+            (true, true) => format!("{}/{}", r.quic_up_age, r.quic_down_age),
+        };
+
+        out.push_str(&format!(
+            "  {id:<id_w$}  {flags:<5}  {score:>8}  {tcp:>4}  {qup:>4}  {qdn:>4}  {gain:>5.2}  {age:>7}\n",
+            id = r.id,
+            flags = flags,
+            score = r.eff_score,
+            tcp = r.tcp_raw,
+            qup = r.quic_up_raw,
+            qdn = r.quic_down_raw,
+            gain = r.gain,
+            age = age,
+            id_w = id_w,
+        ));
+    }
+
+    out
 }
 
 /// 单个 upstream 的分数快照，用于调试打印
@@ -1404,8 +1486,9 @@ struct UpstreamScoreSnapshot<'a> {
     quic_down_raw: u32,
     quic_down_age: u64,
     quic_down_init: bool,
-    quic_eff: u32,
     eff_score: u64,
+    gain: f64,
+    stale_secs: u64,
 }
 
 #[cfg(test)]
@@ -2051,6 +2134,121 @@ mod tests {
             .await
             .expect("task should exit within timeout")
             .expect("task should not panic");
+    }
+
+    // ---------- format_score_table ----------
+
+    #[test]
+    fn score_table_renders_flags_columns_and_alignment() {
+        let rows = vec![
+            UpstreamScoreSnapshot {
+                id: "fast",
+                tcp_raw: 942,
+                tcp_init: true,
+                quic_up_raw: 40,
+                quic_up_age: 0,
+                quic_up_init: true,
+                quic_down_raw: 40,
+                quic_down_age: 0,
+                quic_down_init: true,
+                eff_score: 491,
+                gain: 0.85,
+                stale_secs: 180,
+            },
+            UpstreamScoreSnapshot {
+                id: "stale_link",
+                tcp_raw: 75,
+                tcp_init: true,
+                quic_up_raw: 498,
+                quic_up_age: 200,
+                quic_up_init: true,
+                quic_down_raw: 498,
+                quic_down_age: 200,
+                quic_down_init: true,
+                eff_score: 212,
+                gain: 1.1,
+                stale_secs: 180,
+            },
+            UpstreamScoreSnapshot {
+                id: "down_only",
+                tcp_raw: 75,
+                tcp_init: false,
+                quic_up_raw: 75,
+                quic_up_age: 0,
+                quic_up_init: false,
+                quic_down_raw: 108,
+                quic_down_age: 47,
+                quic_down_init: true,
+                eff_score: 54,
+                gain: 1.0,
+                stale_secs: 180,
+            },
+            UpstreamScoreSnapshot {
+                id: "up_only",
+                tcp_raw: 75,
+                tcp_init: true,
+                quic_up_raw: 301,
+                quic_up_age: 47,
+                quic_up_init: true,
+                quic_down_raw: 75,
+                quic_down_age: 0,
+                quic_down_init: false,
+                eff_score: 173,
+                gain: 1.0,
+                stale_secs: 180,
+            },
+            UpstreamScoreSnapshot {
+                id: "no_sample",
+                tcp_raw: DEFAULT_SCORE,
+                tcp_init: false,
+                quic_up_raw: DEFAULT_SCORE,
+                quic_up_age: 0,
+                quic_up_init: false,
+                quic_down_raw: DEFAULT_SCORE,
+                quic_down_age: 0,
+                quic_down_init: false,
+                eff_score: DEFAULT_SCORE as u64,
+                gain: 1.0,
+                stale_secs: 180,
+            },
+        ];
+
+        let table = format_score_table(&rows);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 6);
+
+        // 所有行等宽，保证表头与各数值列对齐
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.chars().count() == lines[0].chars().count()),
+            "rows must share the same width:\n{table}"
+        );
+        assert!(lines[0].contains("flags") && lines[0].contains("score"));
+
+        let fast: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(fast, ["fast", "TUD", "491", "942", "40", "40", "0.85", "0"]);
+
+        // 超过 stale 阈值追加 !
+        let stale: Vec<&str> = lines[2].split_whitespace().collect();
+        assert_eq!(stale[1], "TUD!");
+        assert_eq!(stale[5], "498");
+        assert_eq!(stale[7], "200");
+
+        // 只有下行样本：flags 无 T/U，age 固定 上行/下行 两段，`-` 占位
+        let down_only: Vec<&str> = lines[3].split_whitespace().collect();
+        assert_eq!(down_only[1], "D");
+        assert_eq!(down_only[7], "-/47");
+
+        // 只有上行样本：不能与"上下行同为 47 秒"混淆
+        let up_only: Vec<&str> = lines[4].split_whitespace().collect();
+        assert_eq!(up_only[1], "TU");
+        assert_eq!(up_only[7], "47/-");
+
+        // 无任何样本
+        let no_sample: Vec<&str> = lines[5].split_whitespace().collect();
+        assert_eq!(no_sample[1], "?");
+        assert_eq!(no_sample[7], "-");
     }
 
     // ---------- PickStats ----------

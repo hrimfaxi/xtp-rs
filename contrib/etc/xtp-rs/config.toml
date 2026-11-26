@@ -296,6 +296,14 @@ quic_weight = 40
 # 默认值：2。
 # relative_rescore_interval_secs = 2
 
+# 上游分数排障打印间隔（秒），仅在 log_level = "debug" 时生效。
+# 每轮输出一张按有效分降序的表格（flags 图例、列含义见
+# docs/工作原理.md 的「5.5 分数排障打印」）：
+#   id              flags     score   tcp   qup   qdn   gain      age
+#   combine_p20816  TUD         537    75  1000  1000   1.21        0
+# 默认值：0（禁用）。
+# upstream_score_debug_interval_secs = 10
+
 # ==================================================
 # 上游 SOCKS5 服务器（必须至少配置一个）
 # ==================================================
