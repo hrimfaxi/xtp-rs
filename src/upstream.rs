@@ -1321,8 +1321,8 @@ pub async fn run_relative_score_task(state: Arc<AppState>, cancel: CancellationT
     }
 }
 
-/// 定期打印所有 upstream 的详细分数信息（仅在 debug 级别启用时运行）
-pub async fn run_score_debug_printer(
+/// 定期打印所有 upstream 的详细分数信息（仅在 info 及以上日志级别启用时运行）
+pub async fn run_score_printer(
     upstreams: Vec<Arc<Upstream>>,
     interval_secs: u64,
     cancel: CancellationToken,
@@ -1345,7 +1345,7 @@ pub async fn run_score_debug_printer(
             _ = interval.tick() => {},
         }
 
-        if !tracing::enabled!(tracing::Level::DEBUG) {
+        if !tracing::enabled!(tracing::Level::INFO) {
             continue;
         }
 
@@ -1395,7 +1395,7 @@ pub async fn run_score_debug_printer(
         }
         msg.push('\n');
         msg.push_str(&format_score_table(&scores));
-        debug!("{}", msg.trim_end());
+        info!("{}", msg.trim_end());
     }
 }
 
@@ -2098,7 +2098,7 @@ mod tests {
     // ---------- interval_secs = 0 ----------
 
     #[tokio::test]
-    async fn score_debug_printer_exits_on_zero_interval() {
+    async fn score_printer_exits_on_zero_interval() {
         let up = make_upstream("test");
         let upstreams = vec![up];
         let cancel = CancellationToken::new();
@@ -2106,7 +2106,7 @@ mod tests {
         // interval_secs = 0 应该立即返回
         let result = tokio::time::timeout(
             Duration::from_millis(100),
-            run_score_debug_printer(upstreams, 0, cancel),
+            run_score_printer(upstreams, 0, cancel),
         )
         .await;
         assert!(
@@ -2116,14 +2116,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn score_debug_printer_exits_on_cancel() {
+    async fn score_printer_exits_on_cancel() {
         let up = make_upstream("test");
         let upstreams = vec![up];
         let cancel = CancellationToken::new();
 
         let cancel_clone = cancel.clone();
         let handle = tokio::spawn(async move {
-            run_score_debug_printer(upstreams, 5, cancel_clone).await;
+            run_score_printer(upstreams, 5, cancel_clone).await;
         });
 
         // 立即取消，任务进入 select! 后会发现取消状态

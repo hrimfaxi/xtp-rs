@@ -28,7 +28,7 @@ use crate::socket_factory::{
 use crate::tcp::{run_tcp_port_forward, tcp_accept_loop};
 use crate::udp::{UdpRuntime, run_udp_gc_loop, run_udp_loop, run_udp_port_forward};
 use crate::upstream::{
-    Upstream, UpstreamSet, run_health_check_task, run_relative_score_task, run_score_debug_printer,
+    Upstream, UpstreamSet, run_health_check_task, run_relative_score_task, run_score_printer,
 };
 use crate::util::{
     TaskGuard, build_ip_tries, canonical_domain, domain_matches_suffix, parse_ip_net_list,
@@ -297,7 +297,7 @@ pub struct AppState {
     pub tcp_handlers: TaskGuard,
     pub health_check: TaskGuard,
     pub udp_gc: TaskGuard,
-    pub score_debug_printer: TaskGuard,
+    pub score_printer: TaskGuard,
     pub relative_score: TaskGuard,
     pub runtime: Arc<AppRuntime>,
     direct_cache: DirectCache,
@@ -971,7 +971,7 @@ impl AppState {
             tcp_handlers: TaskGuard::new(),
             health_check: TaskGuard::new(),
             udp_gc: TaskGuard::new(),
-            score_debug_printer: TaskGuard::new(),
+            score_printer: TaskGuard::new(),
             relative_score: TaskGuard::new(),
             runtime: Arc::new(AppRuntime {
                 proxy_mode: AtomicU8::new(proxy_mode),
@@ -1017,11 +1017,11 @@ impl AppState {
                     .spawn(|cancel| run_relative_score_task(state, cancel));
             }
 
-            // 仅在 debug 级别启用且 interval > 0 时，启动分数调试打印任务
-            let interval_secs = self.config.upstream_score_debug_interval_secs;
-            if interval_secs > 0 && tracing::enabled!(tracing::Level::DEBUG) {
-                self.score_debug_printer
-                    .spawn(|cancel| run_score_debug_printer(all_upstreams, interval_secs, cancel));
+            // 仅在 info 及以上级别启用且 interval > 0 时，启动分数打印任务
+            let interval_secs = self.config.upstream_score_printer_interval_secs;
+            if interval_secs > 0 && tracing::enabled!(tracing::Level::INFO) {
+                self.score_printer
+                    .spawn(|cancel| run_score_printer(all_upstreams, interval_secs, cancel));
             }
         }
 
@@ -1336,7 +1336,7 @@ mod tests {
             tcp_handlers: TaskGuard::new(),
             health_check: TaskGuard::new(),
             udp_gc: TaskGuard::new(),
-            score_debug_printer: TaskGuard::new(),
+            score_printer: TaskGuard::new(),
             relative_score: TaskGuard::new(),
             runtime: Arc::new(AppRuntime {
                 proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
@@ -1409,7 +1409,7 @@ mod tests {
             quic_stale_secs: 180,
             enable_relative_scoring: false,
             relative_rescore_interval_secs: 2,
-            upstream_score_debug_interval_secs: 0,
+            upstream_score_printer_interval_secs: 0,
             pick_stats_window_secs: 0,
             proxy_mode: ProxyMode::default(),
             geosite_path: None,

@@ -524,12 +524,17 @@ pub struct Config {
     /// 相对归一化评分任务间隔，单位秒。默认 2。
     pub relative_rescore_interval_secs: u64,
 
-    /// 上游分数调试打印间隔，单位秒。
+    /// 上游分数打印间隔，单位秒。
     ///
-    /// 仅在 debug 日志级别启用时生效。
+    /// 仅在 info 及以上日志级别启用时生效。
     /// 默认 0（禁用）。
-    #[serde(default = "default_upstream_score_debug_interval_secs")]
-    pub upstream_score_debug_interval_secs: u64,
+    ///
+    /// 旧名 `upstream_score_debug_interval_secs` 作为 serde alias 继续可用。
+    #[serde(
+        default = "default_upstream_score_printer_interval_secs",
+        alias = "upstream_score_debug_interval_secs"
+    )]
+    pub upstream_score_printer_interval_secs: u64,
 
     /// 上游选中统计窗口，单位秒。
     ///
@@ -736,7 +741,7 @@ pub fn default_relative_rescore_interval_secs() -> u64 {
     2
 }
 
-pub fn default_upstream_score_debug_interval_secs() -> u64 {
+pub fn default_upstream_score_printer_interval_secs() -> u64 {
     0
 }
 
@@ -970,7 +975,10 @@ impl Config {
 
 /// 配置键的兼容别名：这些键能反序列化成功，但不会出现在序列化结果里，
 /// 因此必须在未知键检查中显式放行（与 `#[serde(alias = "...")]` 保持一致）。
-const CONFIG_KEY_ALIASES: &[&str] = &["udp_session_idle_timeout_secs"];
+const CONFIG_KEY_ALIASES: &[&str] = &[
+    "udp_session_idle_timeout_secs",
+    "upstream_score_debug_interval_secs",
+];
 
 /// 找出配置文件中会被 serde 静默忽略的未知键。
 ///
@@ -1113,7 +1121,7 @@ mod tests {
             quic_stale_secs: default_quic_stale_secs(),
             enable_relative_scoring: default_enable_relative_scoring(),
             relative_rescore_interval_secs: default_relative_rescore_interval_secs(),
-            upstream_score_debug_interval_secs: default_upstream_score_debug_interval_secs(),
+            upstream_score_printer_interval_secs: default_upstream_score_printer_interval_secs(),
             pick_stats_window_secs: default_pick_stats_window_secs(),
             proxy_mode: ProxyMode::Smart,
             geosite_path: None,
@@ -1422,8 +1430,21 @@ mod tests {
         }
 
         #[test]
-        fn default_upstream_score_debug_interval_is_disabled() {
-            assert_eq!(super::default_upstream_score_debug_interval_secs(), 0);
+        fn default_upstream_score_printer_interval_is_disabled() {
+            assert_eq!(super::default_upstream_score_printer_interval_secs(), 0);
+        }
+
+        #[test]
+        fn upstream_score_printer_interval_accepts_legacy_alias() {
+            let upstream_toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+            for key in [
+                "upstream_score_printer_interval_secs",
+                "upstream_score_debug_interval_secs",
+            ] {
+                let toml = format!("{key} = 10\n{upstream_toml}");
+                let cfg: super::Config = toml::from_str(&toml).expect("deserialize");
+                assert_eq!(cfg.upstream_score_printer_interval_secs, 10, "key: {key}");
+            }
         }
 
         #[test]
@@ -1477,6 +1498,7 @@ groops = ["youtube"]
         fn unknown_config_keys_accepts_alias_and_map_keys() {
             let raw = r#"
 udp_session_idle_timeout_secs = 30
+upstream_score_debug_interval_secs = 10
 quic_sniff_mode = "full"
 client_domain_routes = { "10.0.0.0/24" = { ".example.com" = "default" } }
 
