@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 export PATH=$PATH:~/.cargo/bin
 
 cross +nightly build \
@@ -8,8 +10,6 @@ cross +nightly build \
   --release
 
 BIN=target/mipsel-unknown-linux-musl/release/xtp-rs
-# Strip 符号表（减小体积）
-/home/hrimfaxi/temp/openwrt-sdk-25.12.2-ramips-mt7621_gcc-14.3.0_musl.Linux-x86_64/staging_dir/toolchain-mipsel_24kc_gcc-14.3.0_musl/bin/mipsel-openwrt-linux-musl-strip $BIN
 
 # upx 压缩（需要本地安装 upx）
 if command -v upx &>/dev/null; then
@@ -18,3 +18,7 @@ if command -v upx &>/dev/null; then
 else
   echo "upx not found, skipping compression"
 fi
+
+TARGET=${1:-zengl}
+rsync -avrPzz $BIN $TARGET:/usr/bin/
+ssh $TARGET service xtp-rs restart

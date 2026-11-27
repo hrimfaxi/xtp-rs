@@ -1,6 +1,8 @@
 #!/bin/bash
 
-TOOLCHAIN=~/temp/openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64/staging_dir/toolchain-aarch64_cortex-a53_gcc-14.3.0_musl/bin
+set -euo pipefail
+
+TOOLCHAIN=~/temp/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64/staging_dir/toolchain-aarch64_cortex-a53_gcc-14.3.0_musl/bin
 export PATH=$TOOLCHAIN:$PATH
 
 export CC_aarch64_unknown_linux_musl=$TOOLCHAIN/aarch64-openwrt-linux-musl-gcc
