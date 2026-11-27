@@ -175,7 +175,9 @@ jobs:
           command: test
           args: --all --release --target ${{ matrix.target }} ${{ matrix.extra-args }}
         env:
-          CROSS_CONTAINER_OPTS: "--network host"
+          # Docker 默认 seccomp 拦掉 32 位 compat 的 socketpair/socketcall 并返回 ENOSYS，
+          # tokio 建运行时 self-pipe 时直接 panic（i686-gnu 上必现，musl 不受影响）
+          CROSS_CONTAINER_OPTS: "--network host --security-opt seccomp=unconfined"
           RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Cargo build
