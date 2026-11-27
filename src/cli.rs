@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use tracing::warn;
 
-use crate::upstream::{Upstream, UpstreamSet};
+use crate::upstream::{DEFAULT_STRATEGY_KEY, Upstream, UpstreamSet, UpstreamStrategy};
 use crate::util::parse_ip_or_cidr;
 
 #[derive(Parser)]
@@ -161,6 +161,7 @@ pub struct Config {
     /// 直连 / SOCKS5 出站 socket 使用的 fwmark。
     ///
     /// 用于配合策略路由、TPROXY 回包等网络规则。
+    /// `0` 表示不设置 `SO_MARK`（需要 `CAP_NET_ADMIN`；容器或纯测试环境可置 0）。
     pub fwmark: u32,
 
     /// MaxMind GeoIP2 Country MMDB 文件路径。
@@ -466,7 +467,10 @@ pub struct Config {
     #[serde(default = "default_disable_upstream_score")]
     /// 禁用 upstream 动态评分。
     /// - `false`（默认）：启用 TCP_INFO 监控 + 吞吐量评分 + 加权随机
-    /// - `true`：完全随机选择 upstream，不做任何性能监控和分数更新
+    /// - `true`：不采集任何分数，也不做失败惩罚。所有链路停在基础分 75，
+    ///   `weighted` 的权重差异只剩 `gain`：`gain` 全为默认 1.0 时**加权抽签**是
+    ///   均匀的（粘性、5% 探索仍会介入，最终命中分布未必均匀）；
+    ///   `rr` / `lru` / `least_conn` 与分数无关，不受影响
     pub disable_upstream_score: bool,
 
     #[serde(default = "default_upstream_switch_tolerance")]
@@ -476,6 +480,29 @@ pub struct Config {
     /// - `>0`：仅当新 upstream 分数比当前高超过此值时才允许切换
     ///   例如 `100` 表示差距必须 >100 分才切，避免连接在 upstream 间乱跳
     pub upstream_switch_tolerance: u32,
+
+    #[serde(default)]
+    /// 组内选路策略表：键为分组名，值为该组使用的策略，可选值：
+    ///
+    /// - `weighted`（默认，即不写任何配置时的行为）：粘性容忍度 + 平方加权随机
+    /// - `best`：只取有效分最高的链路，同分随机打破（保留探索与粘性）
+    /// - `random`：组内均匀随机，忽略分数
+    /// - `rr`：组内严格轮询
+    /// - `lru`：选最久未被选中的链路
+    /// - `least_conn`：选当前活跃连接数最少的链路
+    ///
+    /// 保留键 `default` 兼作**全局默认策略**（同时也是 `default` 分组自身的策略），
+    /// 表中未列出的分组都回落到它；整张表不写则全部使用 `weighted`。
+    ///
+    /// ```toml
+    /// [upstream_group_strategy]
+    /// default = "least_conn"
+    /// office = "rr"
+    /// ```
+    ///
+    /// 任何策略都会在"还有别的候选"时跳过刚被 `penalize` 的链路：业务建连失败冷却
+    /// 60 秒；健康检查判死的链路没有 TTL，一直避让到探测成功。
+    pub upstream_group_strategy: HashMap<String, UpstreamStrategy>,
 
     #[serde(default = "default_health_check_interval_secs")]
     /// 主动健康检查间隔，单位秒。
@@ -826,6 +853,7 @@ impl Config {
             self.quic_stale_secs,
             self.pick_stats_window_secs,
         )
+        .map(|set| set.with_group_strategies(self.upstream_group_strategy.clone()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -889,6 +917,22 @@ impl Config {
                 } else {
                     bail!(
                         "no upstream in 'default' group and no client routes configured; the proxy would be unusable"
+                    );
+                }
+            }
+
+            // 分组策略表引用了不存在的分组：不影响可用性，但基本是拼写错误，
+            // 而拼错的覆盖会静默失效（该分组仍走 default 键的策略），所以必须告警。
+            // 保留键 `default` 是全局兜底策略，不对应具体分组，跳过。
+            for (group, strategy) in &self.upstream_group_strategy {
+                if group == DEFAULT_STRATEGY_KEY {
+                    continue;
+                }
+                if !group_count.contains_key(group.as_str()) {
+                    warn!(
+                        group = %group,
+                        strategy = %strategy,
+                        "upstream_group_strategy references a group with no upstream; override has no effect"
                     );
                 }
             }
@@ -1125,6 +1169,7 @@ mod tests {
             }],
             disable_upstream_score: false,
             upstream_switch_tolerance: 0,
+            upstream_group_strategy: HashMap::new(),
             health_check_interval_secs: 0,
             health_check_timeout_secs: 5,
             health_check_fail_threshold: 2,
@@ -1167,6 +1212,82 @@ mod tests {
         let toml = "tcp_nodelay = false\n[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(!cfg.tcp_nodelay);
+    }
+
+    #[test]
+    fn deserialize_upstream_strategy_table_defaults_empty() {
+        let toml = "[[upstream]]\nid = \"test\"\naddr = \"127.0.0.1:1080\"";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.upstream_group_strategy.is_empty());
+        assert_eq!(
+            cfg.build_upstream_set().unwrap().strategy_for("default"),
+            UpstreamStrategy::Weighted
+        );
+    }
+
+    #[test]
+    fn deserialize_upstream_strategy_table() {
+        let toml = r#"
+[upstream_group_strategy]
+default = "least_conn"
+office = "lru"
+
+[[upstream]]
+id = "test"
+addr = "127.0.0.1:1080"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.upstream_group_strategy.get("default"),
+            Some(&UpstreamStrategy::LeastConn)
+        );
+        assert_eq!(
+            cfg.upstream_group_strategy.get("office"),
+            Some(&UpstreamStrategy::Lru)
+        );
+    }
+
+    #[test]
+    fn deserialize_upstream_strategy_rejects_unknown_value() {
+        let toml = r#"
+[upstream_group_strategy]
+default = "bogus"
+
+[[upstream]]
+id = "test"
+addr = "127.0.0.1:1080"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
+    fn build_upstream_set_applies_strategy() {
+        let mut cfg = minimal_config();
+        cfg.upstream_group_strategy
+            .insert("default".to_string(), UpstreamStrategy::Random);
+        cfg.upstream_group_strategy
+            .insert("office".to_string(), UpstreamStrategy::Rr);
+        cfg.upstream = vec![UpstreamConfig {
+            id: "u1".into(),
+            addr: "127.0.0.1:1080".parse().unwrap(),
+            groups: Some(vec!["default".to_string(), "office".to_string()]),
+            gain: default_gain(),
+        }];
+
+        let set = cfg.build_upstream_set().unwrap();
+        assert_eq!(set.strategy_for("default"), UpstreamStrategy::Random);
+        assert_eq!(set.strategy_for("office"), UpstreamStrategy::Rr);
+        // 表里没列出的分组回落到 default 键
+        assert_eq!(set.strategy_for("cn"), UpstreamStrategy::Random);
+    }
+
+    #[test]
+    fn validate_warns_only_for_unknown_group_strategy() {
+        // 引用了不存在的分组只告警、不拒绝启动：分组可能只是暂时没有 upstream
+        let mut cfg = minimal_config();
+        cfg.upstream_group_strategy
+            .insert("ghost".to_string(), UpstreamStrategy::Rr);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -1545,6 +1666,9 @@ udp_session_idle_timeout_secs = 30
 upstream_score_debug_interval_secs = 10
 quic_sniff_mode = "full"
 client_domain_routes = { "10.0.0.0/24" = { ".example.com" = "default" } }
+
+[upstream_group_strategy]
+default = "rr"
 
 [[upstream]]
 id = "a"

@@ -1253,12 +1253,70 @@ fn is_must_direct_local_ipv6(ip: Ipv6Addr) -> bool {
 }
 
 #[cfg(test)]
+impl AppState {
+    /// 供跨模块集成测试构造最小状态：配置从 TOML 解析，upstream 集合与 IP / 域名
+    /// 强制规则按生产路径构建。MMDB、geosite、sniffer 与客户端路由表留空，
+    /// 需要它们的用例请自行填充字段。
+    pub(crate) fn for_test(config_toml: &str) -> Self {
+        let config: Config = toml::from_str(config_toml).expect("invalid test config");
+
+        let direct_nets = parse_ip_net_list(&config.force_direct_ips).expect("force_direct_ips");
+        let socks5_nets = parse_ip_net_list(&config.force_socks5_ips).expect("force_socks5_ips");
+        let (force_direct_v4, force_direct_v6) = build_ip_tries(&direct_nets).unwrap();
+        let (force_socks5_v4, force_socks5_v6) = build_ip_tries(&socks5_nets).unwrap();
+
+        let upstreams = config.build_upstream_set().expect("test upstreams");
+        let route_cache_ttl = Duration::from_secs(config.route_cache_ttl_secs);
+        let udp = Arc::new(UdpRuntime::new(Duration::from_secs(
+            config.udp_session_timeout_secs,
+        )));
+        let proxy_mode = config.proxy_mode.as_u8();
+        let force_direct_domains = DomainSet::compile(&config.force_direct_domains);
+        let force_socks5_domains = DomainSet::compile(&config.force_socks5_domains);
+
+        Self {
+            mmdb: None,
+            config,
+            config_path: String::new(),
+            force_direct_v4,
+            force_direct_v6,
+            force_socks5_v4,
+            force_socks5_v6,
+            force_direct_domains,
+            force_socks5_domains,
+            sniffers: Vec::new(),
+            udp_sniffers: Vec::new(),
+            upstreams,
+            tcp_listeners: TaskGuard::new(),
+            udp_listeners: TaskGuard::new(),
+            port_forwards: TaskGuard::new(),
+            upstream_scores: TaskGuard::new(),
+            tcp_handlers: TaskGuard::new(),
+            health_check: TaskGuard::new(),
+            udp_gc: TaskGuard::new(),
+            score_printer: TaskGuard::new(),
+            relative_score: TaskGuard::new(),
+            runtime: Arc::new(AppRuntime {
+                proxy_mode: AtomicU8::new(proxy_mode),
+                udp,
+                client_routes: ClientIpRoutes::new(),
+                client_domain_routes: ClientDomainRoutes::new(),
+                client_dst_ip_routes: ClientDstIpRoutes::new(),
+            }),
+            direct_cache: DashMap::new(),
+            route_cache_ttl,
+            upstream_cache: DashMap::new(),
+            #[cfg(feature = "geosite")]
+            geosite: None,
+            #[cfg(feature = "geosite")]
+            compiled_geosite: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{
-        QuicSniffMode, UpstreamConfig, default_half_close_timeout, default_tcp_nodelay,
-    };
-    use crate::upstream::Upstream;
     use std::net::IpAddr;
 
     #[test]
@@ -1311,123 +1369,16 @@ mod tests {
 
     // Helper to create a minimal AppState for should_direct tests
     fn minimal_app_state() -> AppState {
-        let upstream = Upstream::new(
-            "test",
-            "127.0.0.1:1080".parse().unwrap(),
-            vec!["default".to_string()],
-            1.0,
-        );
-        let upstreams = UpstreamSet::new(vec![upstream], 0, 70, 180, 0).unwrap();
-        let udp_runtime = Arc::new(UdpRuntime::new(Duration::from_secs(60)));
-        AppState {
-            mmdb: None,
-            config: Config {
-                direct_local_ip: true,
-                ..create_test_config()
-            },
-            config_path: String::new(),
-            force_direct_v4: Ipv4RTrieSet::new(),
-            force_direct_v6: Ipv6RTrieSet::new(),
-            force_socks5_v4: Ipv4RTrieSet::new(),
-            force_socks5_v6: Ipv6RTrieSet::new(),
-            force_direct_domains: DomainSet::default(),
-            force_socks5_domains: DomainSet::default(),
-            sniffers: vec![],
-            udp_sniffers: vec![],
-            upstreams,
-            tcp_listeners: TaskGuard::new(),
-            udp_listeners: TaskGuard::new(),
-            port_forwards: TaskGuard::new(),
-            upstream_scores: TaskGuard::new(),
-            tcp_handlers: TaskGuard::new(),
-            health_check: TaskGuard::new(),
-            udp_gc: TaskGuard::new(),
-            score_printer: TaskGuard::new(),
-            relative_score: TaskGuard::new(),
-            runtime: Arc::new(AppRuntime {
-                proxy_mode: AtomicU8::new(ProxyMode::Smart.as_u8()),
-                udp: udp_runtime,
-                client_routes: ClientIpRoutes::new(),
-                client_domain_routes: ClientDomainRoutes::new(),
-                client_dst_ip_routes: ClientDstIpRoutes::new(),
-            }),
-            direct_cache: DashMap::new(),
-            route_cache_ttl: Duration::from_secs(5),
-            upstream_cache: DashMap::new(),
-            #[cfg(feature = "geosite")]
-            geosite: None,
-            #[cfg(feature = "geosite")]
-            compiled_geosite: None,
-        }
-    }
+        AppState::for_test(
+            r#"
+listen = "127.0.0.1:10810"
+direct_local_ip = true
 
-    fn create_test_config() -> Config {
-        Config {
-            listen: "[::]:10810".into(),
-            udp: true,
-            socks5_user: None,
-            socks5_password: None,
-            fwmark: 2,
-            mmdb_path: None,
-            udp_session_timeout_secs: 120,
-            splice: false,
-            tcp_nodelay: default_tcp_nodelay(),
-            half_close_timeout: default_half_close_timeout(),
-            sniff_tls_sni: false,
-            sniff_http_host: false,
-            quic_sniff_mode: QuicSniffMode::None,
-            quic_sniff_pending_timeout_ms: 200,
-            socks5_udp_reply_watchdog_secs: 31,
-            tcp_peek_buffer_size: 32 * 1024,
-            tls_sniff_peek_len: 2048,
-            tls_sniff_max_len: 32 * 1024,
-            tls_sniff_max_retries: 5,
-            tls_sniff_wait_more_ms: 100,
-            tls_sniff_timeout_ms: 1000,
-            http_sniff_peek_len: 512,
-            http_sniff_max_len: 16 * 1024,
-            http_sniff_max_retries: 5,
-            http_sniff_wait_more_ms: 100,
-            http_sniff_timeout_ms: 1000,
-            log_level: None,
-            direct_countries: vec![],
-            force_direct_domains: vec![],
-            force_socks5_domains: vec![],
-            force_direct_ips: vec![],
-            force_socks5_ips: vec![],
-            force_direct_ips_file: None,
-            force_socks5_ips_file: None,
-            port_forward: vec![],
-            direct_local_ip: true,
-            upstream: vec![UpstreamConfig {
-                id: "test".into(),
-                addr: "127.0.0.1:1080".parse().unwrap(),
-                groups: None,
-                gain: 1.0,
-            }],
-            disable_upstream_score: false,
-            upstream_switch_tolerance: 0,
-            health_check_interval_secs: 0,
-            health_check_timeout_secs: 5,
-            health_check_fail_threshold: 2,
-            health_check_url: "cp.cloudflare.com".into(),
-            quic_weight: 40,
-            quic_stale_secs: 180,
-            enable_relative_scoring: false,
-            relative_rescore_interval_secs: 2,
-            upstream_score_printer_interval_secs: 0,
-            pick_stats_window_secs: 0,
-            proxy_mode: ProxyMode::default(),
-            geosite_path: None,
-            direct_geosite_tags: vec![],
-            proxy_geosite_tags: vec![],
-            client_routes: HashMap::new(),
-            client_domain_routes: HashMap::new(),
-            client_dst_ip_routes: HashMap::new(),
-            connect_timeout_secs: 20,
-            route_cache_ttl_secs: 5,
-            route_cache_max: 4096,
-        }
+[[upstream]]
+id = "test"
+addr = "127.0.0.1:1080"
+"#,
+        )
     }
 
     #[test]

@@ -690,6 +690,128 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // ===== 连接登记：走真实 handler 的集成测试 =====
+    //
+    // least_conn 依赖 track() 的登记与 ConnToken 的存活期。直接调 track() 的单测
+    // 证明不了生产路径仍会登记连接——尤其是在 disable_upstream_score = true 时，
+    // 采样与惩罚任务都不跑。这里用一个假 SOCKS5 上游跑一遍 handle_tcp_connection。
+    //
+    // 配置里 fwmark = 0：SO_MARK 需要 CAP_NET_ADMIN，测试进程通常没有。
+
+    /// 极简 SOCKS5 服务端：no-auth 握手 → CONNECT 成功 → 之后原样回显。
+    async fn spawn_fake_socks5() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = serve_fake_socks5(&mut sock).await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn serve_fake_socks5(sock: &mut TcpStream) -> std::io::Result<()> {
+        // 握手：VER NMETHODS METHODS...
+        let mut head = [0u8; 2];
+        sock.read_exact(&mut head).await?;
+        let mut methods = vec![0u8; head[1] as usize];
+        sock.read_exact(&mut methods).await?;
+        sock.write_all(&[0x05, 0x00]).await?; // no-auth
+
+        // 请求：VER CMD RSV ATYP ADDR PORT
+        let mut req = [0u8; 4];
+        sock.read_exact(&mut req).await?;
+        match req[3] {
+            0x01 => {
+                let mut rest = [0u8; 6]; // IPv4 + port
+                sock.read_exact(&mut rest).await?;
+            }
+            0x04 => {
+                let mut rest = [0u8; 18]; // IPv6 + port
+                sock.read_exact(&mut rest).await?;
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                sock.read_exact(&mut len).await?;
+                let mut rest = vec![0u8; len[0] as usize + 2];
+                sock.read_exact(&mut rest).await?;
+            }
+            _ => return Ok(()),
+        }
+        sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
+
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            sock.write_all(&buf[..n]).await?;
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_scoring_still_registers_connections() {
+        let socks_addr = spawn_fake_socks5().await;
+        let config = format!(
+            r#"
+listen = "127.0.0.1:10810"
+fwmark = 0
+disable_upstream_score = true
+force_socks5_ips = ["1.2.3.4"]
+
+[upstream_group_strategy]
+default = "least_conn"
+
+[[upstream]]
+id = "u1"
+addr = "{socks_addr}"
+"#
+        );
+        let state = Arc::new(AppState::for_test(&config));
+        let up = state.upstreams.find_by_id("u1").expect("upstream u1");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = listener.local_addr().unwrap();
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                let (client, peer) = listener.accept().await.unwrap();
+                handle_tcp_connection(client, peer, "1.2.3.4:80".parse().unwrap(), state).await
+            }
+        });
+
+        let mut client = TcpStream::connect(front).await.unwrap();
+        // 握手与回显阶段也要有超时：否则假上游若卡在握手，测试会一直挂在
+        // read_exact 上，永远走不到下面的 5 秒等待。
+        let echoed = tokio::time::timeout(Duration::from_secs(5), async {
+            client.write_all(b"ping").await.unwrap();
+            let mut got = [0u8; 4];
+            client.read_exact(&mut got).await.unwrap();
+            got
+        })
+        .await
+        .expect("SOCKS5 握手或回显超时");
+        assert_eq!(&echoed, b"ping", "relay 应把数据经假 SOCKS5 上游回显");
+
+        assert_eq!(
+            up.active_conns(),
+            1,
+            "关闭评分时生产连接路径仍应登记连接，least_conn 才有负载可依据"
+        );
+
+        drop(client);
+        let handled = tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("handler 未在超时内结束")
+            .expect("handler panic");
+        assert!(handled.is_ok(), "handler 返回错误: {handled:?}");
+        assert_eq!(up.active_conns(), 0, "连接结束后应归还计数");
+    }
+
     const REQUEST: &[u8] = b"GET / HTTP/1.0\r\n\r\n";
     const RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\n\r\nhello";
 

@@ -68,7 +68,9 @@ impl SocketFactory {
             set_socket_reuse(socket)?;
         }
 
-        if let Some(fwmark) = mark {
+        // fwmark = 0 视为"不打标记"：SO_MARK 需要 CAP_NET_ADMIN，而 0 与不设置等价，
+        // 跳过它能让无策略路由的环境（容器、单测）正常建连。
+        if let Some(fwmark) = mark.filter(|m| *m != 0) {
             socket.set_mark(fwmark)?;
         }
 

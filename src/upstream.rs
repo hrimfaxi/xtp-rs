@@ -1,12 +1,13 @@
 use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use portable_atomic::AtomicU64;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixDatagram;
@@ -59,12 +60,92 @@ const UNINIT_RECV: u64 = u64::MAX;
 /// 保证新链路能分到流量产生吞吐/探针样本，打破"无样本→无分数→无流量"的饥饿循环。
 const PICK_EXPLORE_RATIO: f32 = 0.05;
 
+/// penalize() 之后把链路从候选池里压下去的时间（秒）。
+///
+/// 依赖分数的策略本来就会因为分数被打回 DEFAULT_SCORE 而少选它，但 random / rr /
+/// lru / least_conn 完全不看分数，必须有一个独立的"刚失败过"标记才能体现 penalize。
+/// 只要有别的候选存在就不选它；冷却结束自动回池，避免一次瞬时失败把好链路永久踢掉。
+const PENALIZE_COOLDOWN_SECS: u64 = 60;
+
+/// 每累计这么多次连接断开，就回收一次 registry 里失效的条目。
+///
+/// 采样任务每 2 秒清理一次，但 `disable_upstream_score = true` 时它不跑，
+/// 那时只能靠连接断开路径兜底。按"断开次数"而不是"registry 长度"触发，
+/// 是为了让清理成本摊薄——按长度触发的话，活跃长连接数一旦超过阈值，
+/// 每次建连都要做一次 O(N) 扫描却一条都回收不掉。
+const REGISTRY_PRUNE_EVERY: u32 = 256;
+
+/// 组内选路策略。
+///
+/// 所有策略都跑同一套前置过滤：候选池先剔除"刚被 penalize"的链路（除非池里只剩它们），
+/// 差别只在剩下的候选里怎么挑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamStrategy {
+    /// 粘性容忍度 + 平方加权随机 + 未测量链路探索（默认，即历史行为）。
+    #[default]
+    Weighted,
+    /// 组内均匀随机，完全忽略分数。
+    Random,
+    /// 选最久未被选中过的链路（按 pick 序号，不是时间戳，不受时钟分辨率影响）。
+    Lru,
+    /// 选当前活跃连接数最少的链路。
+    LeastConn,
+    /// 组内严格轮询。
+    Rr,
+    /// 只取有效分最高的链路；同分时随机打破（否则同分链路里只有一条能拿流量）。
+    Best,
+}
+
+/// 策略表里的保留键：既是内置兜底分组的名字，也是未覆盖分组的默认策略。
+pub const DEFAULT_STRATEGY_KEY: &str = "default";
+
+impl UpstreamStrategy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Weighted => "weighted",
+            Self::Random => "random",
+            Self::Lru => "lru",
+            Self::LeastConn => "least_conn",
+            Self::Rr => "rr",
+            Self::Best => "best",
+        }
+    }
+}
+
+impl fmt::Display for UpstreamStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 单个被追踪连接的采样基线：记录上次读到的累计下行字节。
 /// 放在 registry 里以 Arc 共享，采样快照可以在锁外无锁回写，不必再抢 registry 的锁。
 #[derive(Debug)]
 struct FdSample {
     fd: std::os::fd::RawFd,
     last_recv: AtomicU64,
+}
+
+/// 一条被追踪连接的凭据。持有期间该 upstream 的活跃连接数计入这一条，
+/// drop 时自动减一，并按累计断开次数顺带清理 registry。
+pub struct ConnToken {
+    up: Arc<Upstream>,
+    /// 保住 registry 中对应 `Weak` 的存活期，采样任务据此判断连接是否还在。
+    _alive: Arc<()>,
+}
+
+impl Drop for ConnToken {
+    fn drop(&mut self) {
+        self.up.active_conns.fetch_sub(1, Ordering::Relaxed);
+        let dead = self.up.dead_since_prune.fetch_add(1, Ordering::Relaxed) + 1;
+        if dead >= REGISTRY_PRUNE_EVERY {
+            self.up.dead_since_prune.store(0, Ordering::Relaxed);
+            self.up
+                .lock_registry()
+                .retain(|(weak, _)| weak.strong_count() > 0);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -81,6 +162,20 @@ pub struct Upstream {
 
     last_check_secs: AtomicU64,
     health_failures: AtomicU32, // 连续失败次数
+
+    /// 最近一次被选中的序号（由 UpstreamSet 单调递增分配），0 表示从未被选中。LRU 策略使用。
+    last_picked_seq: AtomicU64,
+    /// 冷却截止时间（秒）：业务建连失败来源。
+    penalized_until_secs: AtomicU64,
+    /// 健康检查是否判定这条链路死亡。与业务冷却分开记账，且没有 TTL：
+    /// 只有健康检查自己探测成功才会清除。用截止时间的话，探测延迟（串行检查
+    /// 多条链路时，同一条链路的实际检查周期远大于配置间隔）会在冷却到期与下一次
+    /// 检查结果之间留出空窗，把流量重新引到已知不可用的链路上。
+    health_dead: AtomicBool,
+    /// 当前活跃连接数：track() 时加一，ConnToken drop 时减一。
+    active_conns: AtomicUsize,
+    /// 自上次 registry 清理以来断开的连接数，见 [`REGISTRY_PRUNE_EVERY`]。
+    dead_since_prune: AtomicU32,
 
     quic_uplink_score: AtomicU32,
     quic_downlink_score: AtomicU32,
@@ -119,6 +214,11 @@ impl Upstream {
             quic_downlink_last_update_secs: AtomicU64::new(0),
             last_check_secs: AtomicU64::new(0),
             health_failures: AtomicU32::new(0),
+            last_picked_seq: AtomicU64::new(0),
+            penalized_until_secs: AtomicU64::new(0),
+            health_dead: AtomicBool::new(false),
+            active_conns: AtomicUsize::new(0),
+            dead_since_prune: AtomicU32::new(0),
             quic_weight: AtomicU32::new(40),
             quic_stale_secs: AtomicU64::new(DEFAULT_QUIC_STALE_SECS),
             unmeasured_cap: AtomicU32::new(UNMEASURED_SCORE_CAP),
@@ -146,9 +246,12 @@ impl Upstream {
         self.registry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn track(&self, fd: std::os::fd::RawFd) -> Arc<()> {
-        let token = Arc::new(());
-        let weak = Arc::downgrade(&token);
+    /// 登记一条连接：active_conns 加一，并把 fd 交给采样任务。
+    /// 返回的 token 必须持有到连接结束，drop 时自动减一。
+    #[must_use = "丢弃 token 会立刻把连接记为已结束，least_conn 会低估负载"]
+    pub fn track(self: &Arc<Self>, fd: std::os::fd::RawFd) -> ConnToken {
+        let alive = Arc::new(());
+        let weak = Arc::downgrade(&alive);
         self.lock_registry().push((
             weak,
             Arc::new(FdSample {
@@ -156,7 +259,11 @@ impl Upstream {
                 last_recv: AtomicU64::new(UNINIT_RECV),
             }),
         ));
-        token
+        self.active_conns.fetch_add(1, Ordering::Relaxed);
+        ConnToken {
+            up: Arc::clone(self),
+            _alive: alive,
+        }
     }
 
     pub async fn run_score_task(self: Arc<Self>, relative_mode: bool, cancel: CancellationToken) {
@@ -447,7 +554,24 @@ impl Upstream {
             .store(now, Ordering::Relaxed);
     }
 
+    /// 业务建连失败后的惩罚：分数打回基础分，并进入冷却期。
     pub fn penalize(&self) {
+        self.reset_scores();
+        let now = now_secs();
+        self.penalized_until_secs
+            .store(now + PENALIZE_COOLDOWN_SECS, Ordering::Relaxed);
+    }
+
+    /// 健康检查判定死亡：分数打回基础分，并置上"判死"标记。
+    ///
+    /// 这个标记没有 TTL，只由 [`Self::clear_health_penalty`]（健康检查探测成功）
+    /// 清除。组内只剩被判死的链路时，选路会回退到完整候选池，不会整组不可用。
+    pub fn penalize_by_health(&self) {
+        self.reset_scores();
+        self.health_dead.store(true, Ordering::Relaxed);
+    }
+
+    fn reset_scores(&self) {
         self.tcp_score.store(DEFAULT_SCORE, Ordering::Relaxed);
         self.tcp_score_initialized.store(true, Ordering::Relaxed);
         self.quic_uplink_score
@@ -459,6 +583,34 @@ impl Upstream {
             .store(now, Ordering::Relaxed);
         self.quic_downlink_last_update_secs
             .store(now, Ordering::Relaxed);
+    }
+
+    /// 链路是否应当避让（忽略分数的策略靠它实现"优先剔除失败链路"）：
+    /// 业务建连失败的冷却期内，或健康检查判定死亡。
+    pub fn is_penalized_at(&self, now: u64) -> bool {
+        self.penalized_until_secs.load(Ordering::Relaxed) > now
+            || self.health_dead.load(Ordering::Relaxed)
+    }
+
+    /// 健康检查探测成功：解除判死状态。业务建连失败的冷却不受影响。
+    pub fn clear_health_penalty(&self) {
+        self.health_dead.store(false, Ordering::Relaxed);
+    }
+
+    pub fn last_picked_seq(&self) -> u64 {
+        self.last_picked_seq.load(Ordering::Relaxed)
+    }
+
+    fn mark_picked(&self, seq: u64) {
+        // 并发下"分配序号"和"提交序号"不是原子的：先领到较小序号的任务可能后提交，
+        // 用 store 会把刚写进去的更大序号改小，让这条链路显得比实际更久没用。
+        // fetch_max 只增不减，保证记录值与真实最近使用顺序一致。
+        self.last_picked_seq.fetch_max(seq, Ordering::Relaxed);
+    }
+
+    /// 当前活跃连接数。读写都是原子操作，不抢 registry 的锁。
+    pub fn active_conns(&self) -> usize {
+        self.active_conns.load(Ordering::Relaxed)
     }
 }
 
@@ -628,6 +780,12 @@ pub struct UpstreamSet {
     current: Mutex<HashMap<String, Option<String>>>,
     tolerance: u32,
     pick_stats: Option<PickStats>,
+    /// 分组 → 策略覆盖。保留键 `default` 兼作全局默认策略。
+    group_strategies: HashMap<String, UpstreamStrategy>,
+    /// 每个分组的轮询游标（rr 策略）。
+    rr_cursor: Mutex<HashMap<String, usize>>,
+    /// 全局单调递增的选中序号，lru 策略据此判断"最久未使用"。
+    pick_seq: AtomicU64,
 }
 
 impl UpstreamSet {
@@ -668,7 +826,35 @@ impl UpstreamSet {
             current: Mutex::new(HashMap::new()),
             tolerance,
             pick_stats,
+            group_strategies: HashMap::new(),
+            rr_cursor: Mutex::new(HashMap::new()),
+            pick_seq: AtomicU64::new(0),
         })
+    }
+
+    /// 配置选路策略表。保留键 `default` 兼作全局默认策略，其余键按分组覆盖。
+    pub fn with_group_strategies(
+        mut self,
+        group_strategies: HashMap<String, UpstreamStrategy>,
+    ) -> Self {
+        self.group_strategies = group_strategies;
+        if !self.group_strategies.is_empty() {
+            info!(
+                default_strategy = %self.strategy_for(DEFAULT_STRATEGY_KEY),
+                group_strategies = ?self.group_strategies,
+                "upstream selection strategy configured"
+            );
+        }
+        self
+    }
+
+    /// 某个分组实际生效的策略：本组覆盖 → `default` 键 → 内置 `weighted`。
+    pub fn strategy_for(&self, group: &str) -> UpstreamStrategy {
+        self.group_strategies
+            .get(group)
+            .or_else(|| self.group_strategies.get(DEFAULT_STRATEGY_KEY))
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn pick(&self) -> Option<Arc<Upstream>> {
@@ -677,7 +863,7 @@ impl UpstreamSet {
 
     pub fn pick_from_group(&self, group: &str) -> Option<Arc<Upstream>> {
         let items = self.groups.get(group)?;
-        self.pick_weighted(items, group, None)
+        self.pick_in_group(items, group, None)
     }
 
     pub fn pick_excluding_many_from_group(
@@ -694,47 +880,106 @@ impl UpstreamSet {
         if candidates.is_empty() {
             return None;
         }
-        self.pick_weighted(&candidates, group, None)
+        self.pick_in_group(&candidates, group, None)
     }
 
-    /// 公共的平方加权随机选择逻辑，带 tolerance 切换门槛。
+    /// 组内选路入口：先按 penalize 冷却过滤候选，再按该分组的策略分派。
+    ///
+    /// 过滤只做一次、对全部策略生效：依赖分数的策略本来就会因为分数被打回
+    /// DEFAULT_SCORE 而少选失败链路，但忽略分数的策略同样需要"刚失败过就先别用"。
+    /// 组内只剩被 penalize 的链路时不做过滤，避免整组不可用。
     /// `exclude_ctx` 仅用于 debug 日志区分调用来源。
-    fn pick_weighted(
+    fn pick_in_group(
         &self,
         items: &[Arc<Upstream>],
         group: &str,
         exclude_ctx: Option<&str>,
     ) -> Option<Arc<Upstream>> {
-        match items.len() {
-            0 => {
-                debug!(
-                    group = %group,
-                    exclude_ctx = ?exclude_ctx,
-                    "pick: no upstream available"
-                );
-                return None;
-            }
-            1 => {
-                let up = &items[0];
-                debug!(
-                    group = %group,
-                    exclude_ctx = ?exclude_ctx,
-                    upstream_id = %up.id,
-                    score = up.score(),
-                    "pick: single upstream"
-                );
-                let chosen = Arc::clone(up);
-                self.current
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(group.to_string(), Some(chosen.id.clone()));
-                self.record_pick_stats(&chosen);
-                return Some(chosen);
-            }
-            _ => {}
+        if items.is_empty() {
+            debug!(
+                group = %group,
+                exclude_ctx = ?exclude_ctx,
+                "pick: no upstream available"
+            );
+            return None;
         }
 
+        let strategy = self.strategy_for(group);
+        let now = now_secs();
+
+        // 每个候选只读一次冷却状态：先数一遍再过滤一遍会让两次读取之间被别的任务
+        // 改掉的链路漏进第二次过滤，得到一个空候选池（随后随机取 0 下标会 panic）。
+        let mut penalized = 0usize;
+        let mut healthy: Vec<Arc<Upstream>> = Vec::with_capacity(items.len());
+        for up in items {
+            if up.is_penalized_at(now) {
+                penalized += 1;
+            } else {
+                healthy.push(Arc::clone(up));
+            }
+        }
+
+        let chosen = if penalized > 0 && !healthy.is_empty() {
+            debug!(
+                group = %group,
+                exclude_ctx = ?exclude_ctx,
+                penalty_skipped = penalized,
+                "pick: skip penalized upstreams"
+            );
+            self.pick_by_strategy(&healthy, group, exclude_ctx, strategy)
+        } else {
+            // 没有冷却链路，或全组都在冷却：用完整候选池，避免整组不可用
+            self.pick_by_strategy(items, group, exclude_ctx, strategy)
+        };
+
+        self.commit_pick(group, &chosen);
+        Some(chosen)
+    }
+
+    fn pick_by_strategy(
+        &self,
+        items: &[Arc<Upstream>],
+        group: &str,
+        exclude_ctx: Option<&str>,
+        strategy: UpstreamStrategy,
+    ) -> Arc<Upstream> {
+        debug_assert!(!items.is_empty());
+
+        if items.len() == 1 {
+            let up = &items[0];
+            debug!(
+                group = %group,
+                exclude_ctx = ?exclude_ctx,
+                upstream_id = %up.id,
+                score = up.score(),
+                strategy = %strategy,
+                "pick: single upstream"
+            );
+            return Arc::clone(up);
+        }
+
+        match strategy {
+            UpstreamStrategy::Weighted => self.pick_score_based(items, group, exclude_ctx, true),
+            UpstreamStrategy::Best => self.pick_score_based(items, group, exclude_ctx, false),
+            UpstreamStrategy::Random => self.pick_uniform(items, group, exclude_ctx),
+            UpstreamStrategy::Lru => self.pick_lru(items, group, exclude_ctx),
+            UpstreamStrategy::LeastConn => self.pick_least_conn(items, group, exclude_ctx),
+            UpstreamStrategy::Rr => self.pick_round_robin(items, group, exclude_ctx),
+        }
+    }
+
+    /// 基于有效分数的选择：`weighted_draw = false` 时退化成"只取最高分"。
+    /// 两种模式都保留未测量链路探索与 tolerance 粘性。
+    fn pick_score_based(
+        &self,
+        items: &[Arc<Upstream>],
+        group: &str,
+        exclude_ctx: Option<&str>,
+        weighted_draw: bool,
+    ) -> Arc<Upstream> {
         // 0. 探索：存在尚无任何测量样本（未初始化）的 upstream 时，以固定概率从中均匀选取。
+        //    这一步刻意排在粘性检查之前：粘性会把流量固定在当前链路上，新链路若排在
+        //    粘性之后，就永远等不到产生样本的机会。
         //    探针报告与吞吐样本都依赖流量产生，若不探索，新链路会陷入
         //    "无样本→无分数→无流量"的死锁；penalize() 会把失败链路标记为已初始化，
         //    因此探索不会持续浪费流量在坏链路上。
@@ -751,16 +996,13 @@ impl UpstreamSet {
                 upstream_id = %chosen.id,
                 "pick: explore uninitialized upstream"
             );
-            self.current
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(group.to_string(), Some(chosen.id.clone()));
-            self.record_pick_stats(&chosen);
-            return Some(chosen);
+            return chosen;
         }
 
         // 1. 候选里的最高有效分数
-        let best = items.iter().max_by_key(|u| u.effective_score())?;
+        let Some(best) = items.iter().max_by_key(|u| u.effective_score()) else {
+            return Arc::clone(&items[0]);
+        };
         let best_eff = best.effective_score();
 
         // 2. 检查 sticky：仅当 tolerance > 0 时启用
@@ -798,28 +1040,47 @@ impl UpstreamSet {
                         tolerance = self.tolerance,
                         "pick: keep sticky upstream"
                     );
-                    let chosen = Arc::clone(cur);
-                    self.record_pick_stats(&chosen);
-                    return Some(chosen);
+                    return Arc::clone(cur);
                 }
             }
         }
 
-        // 3. 重新选：平方加权随机
-        let weights: Vec<u64> = items
-            .iter()
-            .map(|u| {
-                let s = u.effective_score();
-                s * s // 平方加权：高分优势放大
-            })
-            .collect();
+        if !weighted_draw {
+            // 同分时随机打破。max_by_key 在并列时恒定返回同一个元素，直接用它会在
+            // 同分链路之间制造"永远只有它拿流量"；全部分数相同（例如关闭评分）时，
+            // 随机打破等价于组内均匀随机。
+            let top: Vec<&Arc<Upstream>> = items
+                .iter()
+                .filter(|u| u.effective_score() == best_eff)
+                .collect();
+            // effective_score() 读的是原子变量：算出 best_eff 之后、过滤之前，
+            // 这条链路可能刚被 score_task 或 penalize 改了分数，此时 top 会为空，
+            // 直接对 0 取随机下标会 panic。空集回退到快照里的 best。
+            let chosen = match top.len() {
+                0 => Arc::clone(best),
+                1 => Arc::clone(top[0]),
+                n => Arc::clone(top[fastrand::usize(..n)]),
+            };
+            debug!(
+                group = %group,
+                exclude_ctx = ?exclude_ctx,
+                upstream_id = %chosen.id,
+                score = best_eff,
+                tied = top.len(),
+                "pick: best-score pick upstream"
+            );
+            return chosen;
+        }
 
-        let total_weight: u64 = weights.iter().sum();
+        // 3. 重新选：平方加权随机。分数只读一次组成快照，抽签与日志都用它。
+        let scores: Vec<u64> = items.iter().map(|u| u.effective_score()).collect();
+        let total_weight = squared_weight_total(&scores);
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             let candidate_scores: Vec<(&str, u64)> = items
                 .iter()
-                .map(|u| (u.id.as_str(), u.effective_score()))
+                .zip(scores.iter())
+                .map(|(u, s)| (u.id.as_str(), *s))
                 .collect();
             debug!(
                 group = %group,
@@ -833,64 +1094,153 @@ impl UpstreamSet {
             );
         }
 
-        let chosen = if total_weight == 0 {
+        if total_weight == 0 {
             let idx = fastrand::usize(..items.len());
             let chosen = Arc::clone(&items[idx]);
             debug!(
                 group = %group,
                 exclude_ctx = ?exclude_ctx,
                 upstream_id = %chosen.id,
-                score = chosen.effective_score(),
+                score = scores[idx],
                 index = idx,
                 "pick: random pick upstream"
             );
-            chosen
-        } else {
-            let mut r = fastrand::u64(..total_weight);
-            let pick_r = r;
-            let mut picked = None;
+            return chosen;
+        }
 
-            for (i, w) in weights.iter().enumerate() {
-                if r < *w {
-                    let chosen = Arc::clone(&items[i]);
-                    debug!(
-                        group = %group,
-                        exclude_ctx = ?exclude_ctx,
-                        upstream_id = %chosen.id,
-                        score = chosen.effective_score(),
-                        weight = *w,
-                        rand = pick_r,
-                        total_weight = total_weight,
-                        "pick: weighted pick upstream"
-                    );
-                    picked = Some(chosen);
-                    break;
-                }
-                r -= *w;
-            }
-
-            picked.unwrap_or_else(|| {
-                let chosen = Arc::clone(&items[0]);
-                debug!(
-                    group = %group,
-                    exclude_ctx = ?exclude_ctx,
-                    upstream_id = %chosen.id,
-                    score = chosen.effective_score(),
-                    "pick: fallback to first upstream"
-                );
-                chosen
-            })
+        let pick_r = fastrand::u64(..total_weight);
+        let Some(idx) = draw_index_by_squared_score(&scores, pick_r) else {
+            let chosen = Arc::clone(&items[0]);
+            debug!(
+                group = %group,
+                exclude_ctx = ?exclude_ctx,
+                upstream_id = %chosen.id,
+                score = scores[0],
+                "pick: fallback to first upstream"
+            );
+            return chosen;
         };
 
-        // 4. 更新 current
+        let chosen = Arc::clone(&items[idx]);
+        debug!(
+            group = %group,
+            exclude_ctx = ?exclude_ctx,
+            upstream_id = %chosen.id,
+            score = scores[idx],
+            weight = squared_weight(scores[idx]),
+            rand = pick_r,
+            total_weight = total_weight,
+            "pick: weighted pick upstream"
+        );
+        chosen
+    }
+
+    /// 组内均匀随机，不看分数。
+    fn pick_uniform(
+        &self,
+        items: &[Arc<Upstream>],
+        group: &str,
+        exclude_ctx: Option<&str>,
+    ) -> Arc<Upstream> {
+        let idx = fastrand::usize(..items.len());
+        let chosen = Arc::clone(&items[idx]);
+        debug!(
+            group = %group,
+            exclude_ctx = ?exclude_ctx,
+            upstream_id = %chosen.id,
+            index = idx,
+            "pick: uniform random pick upstream"
+        );
+        chosen
+    }
+
+    /// 组内严格轮询：游标按分组独立推进。
+    fn pick_round_robin(
+        &self,
+        items: &[Arc<Upstream>],
+        group: &str,
+        exclude_ctx: Option<&str>,
+    ) -> Arc<Upstream> {
+        let mut cursor = self.rr_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = cursor.get(group).copied().unwrap_or(0);
+        let idx = pos % items.len();
+        let chosen = Arc::clone(&items[idx]);
+        // 候选集长度会随 penalize 过滤变化，游标只保证"每次前进一格"
+        cursor.insert(group.to_string(), pos.wrapping_add(1));
+        debug!(
+            group = %group,
+            exclude_ctx = ?exclude_ctx,
+            upstream_id = %chosen.id,
+            index = idx,
+            "pick: round-robin pick upstream"
+        );
+        chosen
+    }
+
+    /// 选最久没有被选中过的链路（pick 序号最小），并列时随机打破。
+    /// 从未被选过的链路序号为 0，因此天然优先——新链路能立刻拿到流量。
+    fn pick_lru(
+        &self,
+        items: &[Arc<Upstream>],
+        group: &str,
+        exclude_ctx: Option<&str>,
+    ) -> Arc<Upstream> {
+        let seqs: Vec<u64> = items.iter().map(|u| u.last_picked_seq()).collect();
+        let min_seq = seqs.iter().copied().min().unwrap_or(0);
+        let ties: Vec<usize> = (0..items.len()).filter(|i| seqs[*i] == min_seq).collect();
+        let idx = if ties.len() == 1 {
+            ties[0]
+        } else {
+            ties[fastrand::usize(..ties.len())]
+        };
+        let chosen = Arc::clone(&items[idx]);
+        debug!(
+            group = %group,
+            exclude_ctx = ?exclude_ctx,
+            upstream_id = %chosen.id,
+            last_picked_seq = min_seq,
+            "pick: lru pick upstream"
+        );
+        chosen
+    }
+
+    /// 选当前活跃连接数最少的链路，并列时随机打破。
+    fn pick_least_conn(
+        &self,
+        items: &[Arc<Upstream>],
+        group: &str,
+        exclude_ctx: Option<&str>,
+    ) -> Arc<Upstream> {
+        let conns: Vec<usize> = items.iter().map(|u| u.active_conns()).collect();
+        let min_conns = conns.iter().copied().min().unwrap_or(0);
+        let ties: Vec<usize> = (0..items.len())
+            .filter(|i| conns[*i] == min_conns)
+            .collect();
+        let idx = if ties.len() == 1 {
+            ties[0]
+        } else {
+            ties[fastrand::usize(..ties.len())]
+        };
+        let chosen = Arc::clone(&items[idx]);
+        debug!(
+            group = %group,
+            exclude_ctx = ?exclude_ctx,
+            upstream_id = %chosen.id,
+            active_conns = min_conns,
+            "pick: least-conn pick upstream"
+        );
+        chosen
+    }
+
+    /// 选路成功后统一更新粘性状态、LRU 序号与选中统计。
+    fn commit_pick(&self, group: &str, chosen: &Arc<Upstream>) {
         self.current
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(group.to_string(), Some(chosen.id.clone()));
-
-        // 5. 记录选中统计
-        self.record_pick_stats(&chosen);
-        Some(chosen)
+        let seq = self.pick_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        chosen.mark_picked(seq);
+        self.record_pick_stats(chosen);
     }
 
     fn record_pick_stats(&self, chosen: &Arc<Upstream>) {
@@ -908,6 +1258,36 @@ impl UpstreamSet {
     pub fn iter(&self) -> impl Iterator<Item = &Arc<Upstream>> + '_ {
         self.all_items.iter()
     }
+}
+
+/// 单个候选的抽签权重：有效分的平方（高分优势放大）。
+fn squared_weight(score: u64) -> u64 {
+    score.saturating_mul(score)
+}
+
+fn squared_weight_total(scores: &[u64]) -> u64 {
+    scores.iter().map(|s| squared_weight(*s)).sum()
+}
+
+/// 平方加权抽签：给定各候选的有效分与一个随机数，返回命中的下标。
+///
+/// 抽签单独成纯函数是为了能确定性地钉住"权重是平方、不是线性"这个口径：
+/// 统计测试只能验证大致比例，而线性权重（gain 3:1 时 75%）与平方权重（90%）
+/// 在宽区间里都会通过。
+fn draw_index_by_squared_score(scores: &[u64], rand: u64) -> Option<usize> {
+    let total = squared_weight_total(scores);
+    if total == 0 {
+        return None;
+    }
+    let mut r = rand % total;
+    for (i, score) in scores.iter().enumerate() {
+        let w = squared_weight(*score);
+        if r < w {
+            return Some(i);
+        }
+        r -= w;
+    }
+    None
 }
 
 /// 基于吞吐量的质量分（连接结束时用）。
@@ -1293,6 +1673,9 @@ pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationTok
 
             if alive {
                 let failures = up.health_failures.swap(0, Ordering::Relaxed);
+                // 只解除健康检查自己设置的冷却：业务建连失败设置的冷却由它自己的
+                // TTL 过期。端口能握手不代表那条链路已经可用，别替它解除。
+                up.clear_health_penalty();
                 if failures > 0 {
                     debug!(
                         id = %up.id,
@@ -1309,21 +1692,25 @@ pub async fn run_health_check_task(state: Arc<AppState>, cancel: CancellationTok
                 }
             } else {
                 let f = up.health_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                if f == fail_threshold {
-                    up.penalize();
-                    warn!(
-                        id = %up.id,
-                        failures = f,
-                        threshold = fail_threshold,
-                        "upstream health check dead, penalized"
-                    );
-                } else if f > fail_threshold {
-                    debug!(
-                        id = %up.id,
-                        failures = f,
-                        threshold = fail_threshold,
-                        "upstream health check still dead"
-                    );
+                if f >= fail_threshold {
+                    // 判死状态是粘住的，只会被成功探测清除，所以每轮重置分数即可。
+                    // 首次跨阈值告警，之后只记 debug。
+                    up.penalize_by_health();
+                    if f == fail_threshold {
+                        warn!(
+                            id = %up.id,
+                            failures = f,
+                            threshold = fail_threshold,
+                            "upstream health check dead, penalized"
+                        );
+                    } else {
+                        debug!(
+                            id = %up.id,
+                            failures = f,
+                            threshold = fail_threshold,
+                            "upstream health check still dead"
+                        );
+                    }
                 } else {
                     debug!(
                         id = %up.id,
@@ -1429,7 +1816,7 @@ pub async fn run_relative_score_task(state: Arc<AppState>, cancel: CancellationT
                 up.tcp_score_initialized.store(true, Ordering::Relaxed);
             }
             // 本轮无样本时保留上一次实测值：不再写"乐观先验"，也不向 0 衰减。
-            // 没有证据的链路保持未初始化，由 pick_weighted 的探索逻辑取样。
+            // 没有证据的链路保持未初始化，由 pick_score_based 的探索逻辑取样。
         }
 
         // 4. 按组给"零吞吐证据"的链路定上限
@@ -1979,7 +2366,7 @@ mod tests {
         ];
         let set = UpstreamSet::new(items.clone(), 50, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
 
-        // 全部标记已初始化，否则 pick_weighted 的探索分支会以小概率
+        // 全部标记已初始化，否则 pick_score_based 的探索分支会以小概率
         // 无视 sticky 均匀随机选中 b/d，导致本测试偶发失败
         for u in &items {
             set_tcp_score(u, 500);
@@ -1997,6 +2384,384 @@ mod tests {
 
         let picked_office = set.pick_from_group("office").unwrap();
         assert_eq!(picked_office.id, "c");
+    }
+
+    // ---------- 选路策略 ----------
+
+    fn strategies(pairs: &[(&str, UpstreamStrategy)]) -> HashMap<String, UpstreamStrategy> {
+        pairs.iter().map(|(g, s)| ((*g).to_string(), *s)).collect()
+    }
+
+    fn strategy_pick_seq(set: &UpstreamSet, group: &str, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|_| set.pick_from_group(group).unwrap().id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn strategy_for_falls_back_to_default_key() {
+        let set = upstream_set(&["a", "b"], 0);
+        assert_eq!(set.strategy_for("default"), UpstreamStrategy::Weighted);
+        assert_eq!(set.strategy_for("missing"), UpstreamStrategy::Weighted);
+
+        // `default` 键既给 default 分组，也给所有未列出的分组兜底
+        let set = set.with_group_strategies(strategies(&[
+            ("default", UpstreamStrategy::Lru),
+            ("office", UpstreamStrategy::Rr),
+        ]));
+        assert_eq!(set.strategy_for("default"), UpstreamStrategy::Lru);
+        assert_eq!(set.strategy_for("cn"), UpstreamStrategy::Lru);
+        assert_eq!(set.strategy_for("office"), UpstreamStrategy::Rr);
+    }
+
+    #[test]
+    fn rr_strategy_cycles_in_order() {
+        let set = upstream_set(&["a", "b", "c"], 0)
+            .with_group_strategies(strategies(&[("default", UpstreamStrategy::Rr)]));
+        assert_eq!(
+            strategy_pick_seq(&set, "default", 7),
+            vec!["a", "b", "c", "a", "b", "c", "a"]
+        );
+    }
+
+    #[test]
+    fn random_strategy_ignores_scores() {
+        let set = upstream_set(&["a", "b"], 0)
+            .with_group_strategies(strategies(&[("default", UpstreamStrategy::Random)]));
+        for u in set.iter() {
+            set_tcp_score(u, if u.id == "a" { 900 } else { 100 });
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..400 {
+            *counts.entry(set.pick().unwrap().id.clone()).or_insert(0) += 1;
+        }
+        // 均匀随机：低分链路应拿到接近一半的选中次数，而不是被高分链路挤掉
+        assert!(
+            counts.get("b").copied().unwrap_or(0) > 100,
+            "低分链路几乎没被选中: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn best_strategy_always_picks_top_score() {
+        let set = upstream_set(&["a", "b"], 0)
+            .with_group_strategies(strategies(&[("default", UpstreamStrategy::Best)]));
+        for u in set.iter() {
+            set_tcp_score(u, if u.id == "a" { 200 } else { 900 });
+        }
+        for _ in 0..50 {
+            assert_eq!(set.pick().unwrap().id, "b");
+        }
+    }
+
+    #[test]
+    fn draw_weights_are_squared_not_linear() {
+        // 75 vs 225（gain 3）：平方权重 5625 : 50625 = 1:9。
+        //
+        // 抓线性权重回归靠两条断言，缺一不可：
+        // 1. 总权重：平方 56250，线性只有 300；
+        // 2. 边界：rand = 5624 必须落在下标 0。线性权重下（总 300）5624 % 300 = 224，
+        //    已经跨过 75 的分界落到下标 1，断言失败。
+        // 单看 rand = 5625 不够——取模后线性权重也可能恰好落到下标 1。
+        let scores = [75, 225];
+        let total = squared_weight_total(&scores);
+        assert_eq!(total, 56_250, "平方权重的总权重");
+        assert_eq!(draw_index_by_squared_score(&scores, 0), Some(0));
+        assert_eq!(
+            draw_index_by_squared_score(&scores, 5_624),
+            Some(0),
+            "5624 < 5625：平方权重下仍在下标 0 的区间里"
+        );
+        assert_eq!(draw_index_by_squared_score(&scores, 5_625), Some(1));
+        assert_eq!(draw_index_by_squared_score(&scores, total - 1), Some(1));
+
+        // 分数全零：没有可加权项，交由调用方退化处理
+        assert_eq!(draw_index_by_squared_score(&[0, 0], 0), None);
+    }
+
+    #[test]
+    fn weighted_without_scores_is_uniform_when_gains_are_equal() {
+        // 关闭评分时所有链路停在基础分：gain 相同 → 平方权重相同 → 组内均匀随机
+        let set = upstream_set(&["a", "b"], 0);
+        for u in set.iter() {
+            set_tcp_score(u, DEFAULT_SCORE);
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..400 {
+            *counts.entry(set.pick().unwrap().id.clone()).or_insert(0) += 1;
+        }
+        assert!(
+            counts.get("a").copied().unwrap_or(0) > 100
+                && counts.get("b").copied().unwrap_or(0) > 100,
+            "gain 相同时应均摊: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn weighted_without_scores_still_follows_gain() {
+        // 同为基础分，但 gain 不同 → 平方加权仍然生效，不是"均匀随机"。
+        // 注意 set_tcp_score 会把链路标记为已测量，因此这里没有 5% 探索干扰，
+        // 期望命中率就是平方权重的 90%；线性权重只有 75%，用 82% 作分界。
+        let items = vec![
+            Upstream::new(
+                "plain",
+                "127.0.0.1:1080".parse().unwrap(),
+                vec!["default".to_string()],
+                1.0,
+            ),
+            Upstream::new(
+                "boosted",
+                "127.0.0.1:1081".parse().unwrap(),
+                vec!["default".to_string()],
+                3.0,
+            ),
+        ];
+        let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS, 0).unwrap();
+        for u in set.iter() {
+            set_tcp_score(u, DEFAULT_SCORE);
+        }
+
+        let mut boosted = 0usize;
+        let rounds = 1000;
+        for _ in 0..rounds {
+            if set.pick().unwrap().id == "boosted" {
+                boosted += 1;
+            }
+        }
+        // 权重 75² : (75×3)² = 1:9，期望 900/1000；线性权重只会到 750
+        assert!(
+            boosted > 820,
+            "gain 3 的命中率应接近平方权重的 90%，实际 {boosted}/{rounds}"
+        );
+    }
+
+    #[test]
+    fn exploration_precedes_sticky_on_unmeasured_links() {
+        // 两条都未测量、分数全等、tolerance > 0：探索分支排在粘性之前，
+        // 因此两个 id 都会出现。若哪天把探索挪到粘性之后，新链路会被粘性饿死，
+        // 这条断言就会失败——这正是顺序契约。
+        let set = upstream_set(&["a", "b"], 50);
+        let mut seen = HashSet::new();
+        for _ in 0..800 {
+            seen.insert(set.pick().unwrap().id.clone());
+        }
+        assert_eq!(seen.len(), 2, "探索应能绕过粘性给新链路引流: {seen:?}");
+    }
+
+    #[test]
+    fn tolerance_keeps_sticky_even_without_scores() {
+        // 关闭评分 + 非零容忍度：分数全等也仍然粘住当前链路
+        let set = upstream_set(&["a", "b"], 50);
+        for u in set.iter() {
+            set_tcp_score(u, DEFAULT_SCORE);
+        }
+        let first = set.pick().unwrap().id.clone();
+        for _ in 0..20 {
+            assert_eq!(
+                set.pick().unwrap().id,
+                first,
+                "tolerance > 0 时分数全等也应粘住"
+            );
+        }
+    }
+
+    #[test]
+    fn best_strategy_breaks_ties_randomly() {
+        let set = upstream_set(&["a", "b"], 0)
+            .with_group_strategies(strategies(&[("default", UpstreamStrategy::Best)]));
+        for u in set.iter() {
+            set_tcp_score(u, 500);
+        }
+        let mut seen = HashSet::new();
+        for _ in 0..200 {
+            seen.insert(set.pick().unwrap().id.clone());
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "同分时应随机打破，而不是固定选同一条: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn lru_strategy_cycles_least_recently_used() {
+        let set = upstream_set(&["a", "b", "c"], 0)
+            .with_group_strategies(strategies(&[("default", UpstreamStrategy::Lru)]));
+        let ids = strategy_pick_seq(&set, "default", 4);
+        let mut first_round = ids[..3].to_vec();
+        first_round.sort();
+        assert_eq!(first_round, vec!["a", "b", "c"], "首轮应覆盖全部链路");
+        assert_eq!(ids[3], ids[0], "第 4 次应回到最久未使用的链路");
+    }
+
+    #[test]
+    fn least_conn_prefers_idle_upstream() {
+        let set = upstream_set(&["a", "b"], 0)
+            .with_group_strategies(strategies(&[("default", UpstreamStrategy::LeastConn)]));
+        let a = set.find_by_id("a").unwrap();
+        let t1 = a.track(1);
+        let t2 = a.track(2);
+        assert_eq!(a.active_conns(), 2);
+        for _ in 0..10 {
+            assert_eq!(set.pick().unwrap().id, "b");
+        }
+
+        drop(t1);
+        drop(t2);
+        assert_eq!(a.active_conns(), 0);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..200 {
+            *counts.entry(set.pick().unwrap().id.clone()).or_insert(0) += 1;
+        }
+        assert!(
+            counts.get("a").copied().unwrap_or(0) > 40,
+            "负载相同时两条链路都应被选中: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn group_strategy_override_applies() {
+        let items = vec![
+            upstream_with_groups("a", vec!["default".to_string(), "office".to_string()]),
+            upstream_with_groups("b", vec!["default".to_string(), "office".to_string()]),
+            upstream_with_groups("c", vec!["office".to_string()]),
+        ];
+        let set = UpstreamSet::new(items, 0, 40, DEFAULT_QUIC_STALE_SECS, 0)
+            .unwrap()
+            .with_group_strategies(strategies(&[
+                ("default", UpstreamStrategy::Random),
+                ("office", UpstreamStrategy::Rr),
+            ]));
+
+        assert_eq!(set.strategy_for("default"), UpstreamStrategy::Random);
+        assert_eq!(set.strategy_for("office"), UpstreamStrategy::Rr);
+        assert_eq!(
+            strategy_pick_seq(&set, "office", 3),
+            vec!["a", "b", "c"],
+            "office 组应走轮询"
+        );
+    }
+
+    #[test]
+    fn penalized_upstream_skipped_when_alternative_exists() {
+        let set = upstream_set(&["a", "b"], 0)
+            .with_group_strategies(strategies(&[("default", UpstreamStrategy::Rr)]));
+        set.find_by_id("a").unwrap().penalize();
+        for _ in 0..4 {
+            assert_eq!(set.pick().unwrap().id, "b");
+        }
+
+        // 全组都在冷却期时不做过滤，否则整组直接不可用
+        set.find_by_id("b").unwrap().penalize();
+        assert!(set.pick().is_some());
+    }
+
+    #[test]
+    fn penalize_cooldown_expires() {
+        let up = upstream("a");
+        let now = now_secs();
+        assert!(!up.is_penalized_at(now));
+
+        up.penalize();
+        assert!(up.is_penalized_at(now));
+        assert!(
+            !up.is_penalized_at(now + PENALIZE_COOLDOWN_SECS + 1),
+            "冷却期过后应自动回池"
+        );
+    }
+
+    #[test]
+    fn health_recovery_only_clears_its_own_cooldown() {
+        let up = upstream("a");
+        let now = now_secs();
+
+        // 健康检查判死 → 恢复：解除
+        up.penalize_by_health();
+        assert!(up.is_penalized_at(now));
+        up.clear_health_penalty();
+        assert!(!up.is_penalized_at(now));
+
+        // 业务失败 → 健康检查恢复：不得解除业务设置的冷却
+        up.penalize();
+        up.clear_health_penalty();
+        assert!(
+            up.is_penalized_at(now),
+            "健康检查恢复不应替业务连接失败解除冷却"
+        );
+    }
+
+    #[test]
+    fn health_dead_state_is_sticky_until_a_successful_check() {
+        let up = upstream("a");
+        let far_future = now_secs() + PENALIZE_COOLDOWN_SECS * 1000;
+
+        up.penalize_by_health();
+        assert!(
+            up.is_penalized_at(far_future),
+            "健康判死没有 TTL，不能因为时间流逝自动回池"
+        );
+
+        up.clear_health_penalty();
+        assert!(!up.is_penalized_at(far_future), "成功探测后才回池");
+    }
+
+    #[test]
+    fn health_dead_link_is_avoided_until_cleared() {
+        // 组内还有健康候选时一律避让判死链路；全组判死时回退到完整候选池
+        let set = upstream_set(&["a", "b"], 0)
+            .with_group_strategies(strategies(&[("default", UpstreamStrategy::Rr)]));
+        let a = set.find_by_id("a").unwrap();
+        let b = set.find_by_id("b").unwrap();
+
+        a.penalize_by_health();
+        for _ in 0..6 {
+            assert_eq!(set.pick().unwrap().id, "b", "判死链路应被避开");
+        }
+
+        b.penalize_by_health();
+        assert!(set.pick().is_some(), "全组判死时应回退到完整候选池");
+
+        // a 解除判死后应是唯一未被避让的候选（b 仍判死），轮到它接流量
+        a.clear_health_penalty();
+        assert_eq!(set.pick().unwrap().id, "a", "恢复后的链路应重新参与选路");
+    }
+
+    #[test]
+    fn health_recovery_keeps_business_cooldown_interleaved() {
+        // 交错场景：健康检查只失败一次（未达阈值、没设置冷却），随后业务连接失败
+        // 设置冷却，下一轮健康检查成功。不能把业务设置的冷却一起清掉。
+        let up = upstream("a");
+        let now = now_secs();
+
+        up.health_failures.store(1, Ordering::Relaxed); // 未达阈值的失败
+        up.penalize(); // 业务连接失败
+        up.clear_health_penalty(); // 健康检查本轮成功
+        assert!(
+            up.is_penalized_at(now),
+            "未达阈值的健康检查失败不应成为解除业务冷却的依据"
+        );
+
+        // 反过来：健康检查确实判死过，之后业务也失败，恢复只清健康检查那份
+        up.penalize_by_health();
+        up.penalize();
+        up.clear_health_penalty();
+        assert!(up.is_penalized_at(now), "业务失败设置的冷却仍在");
+    }
+
+    #[test]
+    fn track_prunes_dead_entries_without_score_task() {
+        // disable_upstream_score 模式下没有采样任务定期清理，track() 必须自己回收，
+        // 否则 least_conn 的扫描成本会随历史连接数无界增长。
+        let up = upstream("a");
+        for _ in 0..1000 {
+            drop(up.track(1));
+        }
+        assert_eq!(up.active_conns(), 0);
+        assert!(
+            up.lock_registry().len() < REGISTRY_PRUNE_EVERY as usize * 2,
+            "死条目未被回收: {}",
+            up.lock_registry().len()
+        );
     }
 
     // ---------- effective_score ----------

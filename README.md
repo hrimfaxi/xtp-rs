@@ -37,6 +37,7 @@
 | 🧭 **智能路由** | 按 GeoIP2 国家归属（MaxMind MMDB）、geosite 域名分类、自定义 CIDR、本地地址类型自动判定直连 / 代理；支持域名强制规则（`force_direct_domains` / `force_socks5_domains`）覆盖 geosite 与 IP 规则 |
 | 📡 **多 SOCKS5 上游** | 配置多个上游服务器，支持用户名 / 密码认证、分组路由与增益系数 |
 | 📈 **动态上游评分** | 基于 `TCP_INFO` 实时吞吐监控与 QUIC 探针（RTT / 丢包率 / MTU）报告综合评分，平方加权随机选择最优上游；支持跨链路相对归一化评分与冷启动加速；粘性切换容忍度避免频繁抖动 |
+| 🎯 **可选选路策略** | `[upstream_group_strategy]` 按分组配置 `weighted`（默认）/ `best` / `random` / `rr` / `lru` / `least_conn`；保留键 `default` 兼作全局默认策略 |
 | 👃 **域名嗅探** | TLS SNI（HTTPS）、HTTP Host（明文 HTTP）、QUIC SNI（QUIC Initial）三种协议嗅探；默认关闭，按需开启 |
 | ⚙️ **端口转发** | 将本地 TCP / UDP 端口强制经 SOCKS5 转发到指定目标（可用于 DNS over SOCKS5 等） |
 | 🔄 **热重载** | `SIGHUP` 重载配置无需重启；`SIGUSR1` 在 smart → global → bypass 间循环切换代理模式 |
