@@ -248,12 +248,13 @@ jobs:
         env:
           GITHUB_REPO: ${{ github.repository }}
 
-      - name: Github stable release
+      - name: Github tag release
         uses: softprops/action-gh-release@v3
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          prerelease: false
+          # 形如 v0.1.2-alpha.1 的标签按预发布处理，避免顶掉正式版
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: false
           body: ${{ steps.git-cliff.outputs.content }}
           files: |
