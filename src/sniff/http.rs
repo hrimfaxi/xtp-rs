@@ -164,11 +164,7 @@ fn definitely_not_http_1x_prefix(buf: &[u8]) -> bool {
         Err(_) => return true,
     };
 
-    if !looks_like_http_1x_request_line(line) {
-        return true;
-    }
-
-    false
+    !looks_like_http_1x_request_line(line)
 }
 
 pub fn sniff_http_host_from_prefix(
