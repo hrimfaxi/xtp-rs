@@ -11,6 +11,7 @@ use crate::util::parse_ip_or_cidr;
 #[derive(Parser)]
 #[command(
     name = "xtp-rs",
+    version,
     about = "tproxy / port forward -> SOCKS5, with IP country-based direct switch"
 )]
 pub struct Cli {

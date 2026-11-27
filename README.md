@@ -52,13 +52,23 @@
 ### 环境要求
 
 - **运行环境**：Linux 内核（需启用 `TPROXY`、`IP_TRANSPARENT`、`NF_SOCKET` 等选项）
-- **构建环境**：Rust 1.85+（edition 2024）
+- **构建环境**：Rust 1.87+（edition 2024）
 
 ### 方式一：下载预编译二进制
 
 [GitHub Releases](https://github.com/hrimfaxi/xtp-rs/releases) 提供 x86_64 / i686 / aarch64 / armv7 / mips(el) / mips64 等多平台预编译二进制（glibc 与 musl 两种版本，musl 静态版本适合 OpenWrt 等嵌入式环境）。
 
-### 方式二：从源码构建
+### 方式二：cargo install
+
+已发布到 crates.io，可直接安装：
+
+```bash
+cargo install xtp-rs
+```
+
+默认启用全部 sniff 功能与 geosite 支持；需要裁剪体积时用 `--no-default-features --features "..."`。注意从源码编译要求目标机器有 Rust 1.87+ 工具链，OpenWrt 等嵌入式环境请改用交叉编译或预编译二进制。
+
+### 方式三：从源码构建
 
 ```bash
 git clone https://github.com/hrimfaxi/xtp-rs.git
@@ -71,7 +81,7 @@ cargo build --release
 cargo build --release --no-default-features --features "sniff-tls,sniff-http,geosite"
 ```
 
-### 方式三：OpenWrt
+### 方式四：OpenWrt
 
 软件包仓库：[openwrt-xtp-rs](https://github.com/hrimfaxi/openwrt-xtp-rs)；交叉编译与安装细节见 [OpenWrt 部署](./docs/OpenWrt.md)。
 

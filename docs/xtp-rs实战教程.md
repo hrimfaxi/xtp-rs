@@ -60,7 +60,7 @@ xray、sing-box 也能做透明代理和分流，但 xtp-rs 补上了它们不�
 ### 2.1 安装
 
 - **预编译二进制**：GitHub Releases 提供 x86_64 / aarch64 / armv7 / mips(el) 等多平台构建（含 musl 静态版，适合 OpenWrt）。
-- **源码编译**：Rust 1.85+，`cargo build --release` 即可。
+- **源码编译**：Rust 1.87+，`cargo build --release` 即可。
 
 ### 2.2 部署透明代理环境
 

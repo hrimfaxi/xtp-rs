@@ -1,12 +1,15 @@
 [package]
 name = "xtp-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-license = "GPL-3.0"
+rust-version = "1.87"
+license = "GPL-3.0-only"
 repository = "https://github.com/hrimfaxi/xtp-rs"
 keywords = ["tproxy", "socks5", "proxy", "geoip", "transparent"]
 categories = ["network-programming"]
 description = "基于 TPROXY 的高性能透明代理，支持 GeoIP/geosite 智能分流和 SOCKS5 转发"
+# 发布到 crates.io 的只有源码；contrib/ 的 geosite.dat、mmdb 等数据文件走仓库与 GitHub Releases
+include = ["/src/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [features]
 default = [ "geosite", "sniff-quic", "sniff-http", "sniff-tls", "mimalloc" ]
