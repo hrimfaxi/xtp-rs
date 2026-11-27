@@ -773,6 +773,25 @@ pub fn parse_listen_addr(listen: &str) -> Result<(IpAddr, u16)> {
     Ok((addr.ip(), addr.port()))
 }
 
+/// upstream 实际生效的分组。
+///
+/// 未配置、空数组、以及只含空白项时都回落到 `["default"]`。
+/// 构造和校验必须共用这一处：否则 `groups = []` 会出现"validate 认为它属于
+/// default、运行时却没有任何 group 引用它"的静默失效——链路永远选不中，
+/// 分数表里却只表现为一排空组。
+fn effective_groups(groups: Option<&[String]>) -> Vec<String> {
+    let mut out: Vec<String> = groups
+        .unwrap_or_default()
+        .iter()
+        .filter(|g| !g.trim().is_empty())
+        .cloned()
+        .collect();
+    if out.is_empty() {
+        out.push("default".to_string());
+    }
+    out
+}
+
 impl Config {
     pub fn build_upstream_set(&self) -> anyhow::Result<UpstreamSet> {
         if self.upstream.is_empty() {
@@ -795,10 +814,7 @@ impl Config {
             .upstream
             .iter()
             .map(|u| {
-                let groups = u
-                    .groups
-                    .clone()
-                    .unwrap_or_else(|| vec!["default".to_string()]);
+                let groups = effective_groups(u.groups.as_deref());
                 Upstream::new(u.id.trim().to_string(), u.addr, groups, u.gain)
             })
             .collect();
@@ -855,17 +871,12 @@ impl Config {
 
         // 校验 upstream groups 及路由引用
         {
-            let mut group_count: HashMap<&str, usize> = HashMap::new();
+            let mut group_count: HashMap<String, usize> = HashMap::new();
             for up in &self.upstream {
-                let groups: Vec<&str> = match up.groups.as_deref() {
-                    Some(g) if !g.is_empty() => g.iter().map(|s| s.as_str()).collect(),
-                    _ => vec!["default"],
-                };
-                for g in groups {
+                for g in effective_groups(up.groups.as_deref()) {
                     *group_count.entry(g).or_default() += 1;
                 }
             }
-            // 未显式配置 groups 的 upstream 视为属于 default 组
             let has_default = group_count.contains_key("default");
             let has_client_routes = !self.client_routes.is_empty()
                 || !self.client_domain_routes.is_empty()
@@ -1208,6 +1219,38 @@ mod tests {
             ..minimal_config()
         };
         assert!(cfg.build_upstream_set().is_err());
+    }
+
+    #[test]
+    fn effective_groups_falls_back_to_default() {
+        assert_eq!(effective_groups(None), vec!["default".to_string()]);
+        assert_eq!(effective_groups(Some(&[])), vec!["default".to_string()]);
+        // 只含空白项与空数组等价：否则会造出一个谁也引用不到的分组
+        let blank = vec!["".to_string(), "   ".to_string()];
+        assert_eq!(effective_groups(Some(&blank)), vec!["default".to_string()]);
+        // 显式命名的分组原样保留
+        let named = vec!["poe".to_string(), "youtube".to_string()];
+        assert_eq!(effective_groups(Some(&named)), named);
+    }
+
+    #[test]
+    fn empty_groups_still_belong_to_default() {
+        let cfg = Config {
+            upstream: vec![UpstreamConfig {
+                id: "u1".into(),
+                addr: "127.0.0.1:1080".parse().unwrap(),
+                groups: Some(vec![]),
+                gain: default_gain(),
+            }],
+            ..minimal_config()
+        };
+        // 校验侧把它算进 default，构造侧也必须一致，否则链路永远选不中
+        cfg.validate().unwrap();
+        let set = cfg.build_upstream_set().unwrap();
+        let picked = set
+            .pick_from_group("default")
+            .expect("空 groups 应回落到 default 并可选");
+        assert_eq!(picked.groups, vec!["default".to_string()]);
     }
 
     #[test]

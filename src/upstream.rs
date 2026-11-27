@@ -28,9 +28,44 @@ const DEFAULT_QUIC_STALE_SECS: u64 = 180;
 /// 最低分数，避免分数归零导致 upstream 被"饿死"无法被选中更新。
 const MINIMAL_SCORE: u32 = 10;
 
+/// 只有探针分、没有吞吐样本时的分数上限（组内没有任何实测样本时的默认值）。
+/// 探针只测 RTT/丢包/MTU，与吞吐相关性弱；不设上限会让一条从未跑过数据的
+/// 链路凭探针分拿到最高权重，把新连接全部吸走，而它自己永远拿不到吞吐样本。
+const UNMEASURED_SCORE_CAP: u32 = 500;
+
+/// 无吞吐证据链路的上限下限。组内唯一的实测链路本身很差时（比如只有 18 分），
+/// 按 1/3 算出来的上限会把其他链路压得没有流量、也就永远测不出来，
+/// 因此不低于这个值，保证探索空间。
+const MIN_UNMEASURED_SCORE_CAP: u32 = 100;
+
+// 不变式：(false, false) 分支返回 DEFAULT_SCORE，而 (false, true) 至少是
+// MIN_UNMEASURED_SCORE_CAP。若前者反超后者，"既没吞吐又没探针"的链路会排在
+// "只有探针、但被 cap 限幅"的链路前面，语义就倒挂了。
+const _: () = assert!(DEFAULT_SCORE < MIN_UNMEASURED_SCORE_CAP);
+
+/// 计入"活跃连接"的最小本窗口下行增量。空闲 keep-alive 和偶发心跳不计入速率
+/// 分母 —— 否则挂着一堆长连接的链路会被稀释得看不出真实带宽。
+const ACTIVE_CONN_MIN_BYTES: u64 = 1024 * 4;
+
+/// MiB/s → Mbps 的换算系数（1 MiB/s = 8.388608 Mbps，十进制 Mbps）。
+const MIB_TO_MBPS: f64 = 8.0 * 1024.0 * 1024.0 / 1_000_000.0;
+
+/// FdSample.last_recv 的"尚未建立基线"哨兵值。
+/// 不能用 0：新连接第一次采样时可能还没收到任何字节（握手/TTFB 阶段），
+/// 若把 0 既当"未初始化"又当合法基线，下个窗口收到的突发会被永久跳过。
+const UNINIT_RECV: u64 = u64::MAX;
+
 /// pick 时对未初始化（无任何测量样本）upstream 的探索概率。
 /// 保证新链路能分到流量产生吞吐/探针样本，打破"无样本→无分数→无流量"的饥饿循环。
 const PICK_EXPLORE_RATIO: f32 = 0.05;
+
+/// 单个被追踪连接的采样基线：记录上次读到的累计下行字节。
+/// 放在 registry 里以 Arc 共享，采样快照可以在锁外无锁回写，不必再抢 registry 的锁。
+#[derive(Debug)]
+struct FdSample {
+    fd: std::os::fd::RawFd,
+    last_recv: AtomicU64,
+}
 
 #[derive(Debug)]
 pub struct Upstream {
@@ -39,15 +74,12 @@ pub struct Upstream {
     pub groups: Vec<String>,
     pub gain: f64,
 
-    registry: std::sync::Mutex<Vec<(Weak<()>, std::os::fd::RawFd)>>,
+    registry: std::sync::Mutex<Vec<(Weak<()>, Arc<FdSample>)>>,
 
     tcp_score: AtomicU32,
     tcp_score_initialized: AtomicBool,
 
-    last_total_recv: AtomicU64,
-    last_total_sent: AtomicU64,
     last_check_secs: AtomicU64,
-    tcp_info_initialized: AtomicBool,
     health_failures: AtomicU32, // 连续失败次数
 
     quic_uplink_score: AtomicU32,
@@ -56,6 +88,8 @@ pub struct Upstream {
     quic_downlink_last_update_secs: AtomicU64,
     quic_weight: AtomicU32,     // 0-100，默认 40
     quic_stale_secs: AtomicU64, // 过期阈值（秒），由 UpstreamSet 统一设置
+    /// 仅有探针分时的分数上限，由 run_relative_score_task 按组动态写入
+    unmeasured_cap: AtomicU32,
 
     // 相对归一化评分（enable_relative_scoring 开启时使用）
     throughput_rate_mibs: AtomicU64, // 最近实测吞吐速率（MiB/s，存 f64 bits，EMA）
@@ -83,13 +117,11 @@ impl Upstream {
             quic_downlink_score: AtomicU32::new(DEFAULT_SCORE),
             quic_uplink_last_update_secs: AtomicU64::new(0),
             quic_downlink_last_update_secs: AtomicU64::new(0),
-            last_total_recv: AtomicU64::new(0),
-            last_total_sent: AtomicU64::new(0),
             last_check_secs: AtomicU64::new(0),
-            tcp_info_initialized: AtomicBool::new(false),
             health_failures: AtomicU32::new(0),
             quic_weight: AtomicU32::new(40),
             quic_stale_secs: AtomicU64::new(DEFAULT_QUIC_STALE_SECS),
+            unmeasured_cap: AtomicU32::new(UNMEASURED_SCORE_CAP),
             throughput_rate_mibs: AtomicU64::new(0),
             throughput_updated_secs: AtomicU64::new(0),
             probe_quality: AtomicU64::new(0),
@@ -110,14 +142,20 @@ impl Upstream {
         self.quic_stale_secs.load(Ordering::Relaxed)
     }
 
-    fn lock_registry(&self) -> std::sync::MutexGuard<'_, Vec<(Weak<()>, std::os::fd::RawFd)>> {
+    fn lock_registry(&self) -> std::sync::MutexGuard<'_, Vec<(Weak<()>, Arc<FdSample>)>> {
         self.registry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn track(&self, fd: std::os::fd::RawFd) -> Arc<()> {
         let token = Arc::new(());
         let weak = Arc::downgrade(&token);
-        self.lock_registry().push((weak, fd));
+        self.lock_registry().push((
+            weak,
+            Arc::new(FdSample {
+                fd,
+                last_recv: AtomicU64::new(UNINIT_RECV),
+            }),
+        ));
         token
     }
 
@@ -134,9 +172,9 @@ impl Upstream {
             let entries: Vec<_> = {
                 let mut reg = self.lock_registry();
                 let mut entries = Vec::with_capacity(reg.len());
-                reg.retain(|(weak, fd)| {
+                reg.retain(|(weak, sample)| {
                     if let Some(token) = weak.upgrade() {
-                        entries.push((token, *fd));
+                        entries.push((token, Arc::clone(sample)));
                         true
                     } else {
                         false
@@ -145,19 +183,37 @@ impl Upstream {
                 entries
             };
 
-            // 2. 锁外：对快照中的 fd 做 getsockopt（best-effort，fd 可能已被复用）
-            let (recv, sent, alive) = {
-                let mut r = 0u64;
-                let mut s = 0u64;
-                let mut n = 0usize;
-                for (_token, fd) in &entries {
-                    if let Some(info) = get_tcp_info_ext_raw(*fd) {
-                        r += info.tcpi_bytes_received;
-                        s += info.tcpi_bytes_acked;
-                        n += 1;
+            // 2. 锁外：对快照中的 fd 做 getsockopt（best-effort，fd 可能已被复用）。
+            //    按 fd 自己算本窗口增量：只有真在传数据的连接才进速率分母。
+            //    这样既能排除大量空闲 keep-alive 的稀释，也不会像聚合总量那样
+            //    "被选得越多分越高"。
+            // 只统计下行字节。上行方向在这个 socket 上是 loopback：tcpi_bytes_acked
+            // 反映的是本机 SOCKS5 进程多快把数据抽进自己的发送缓冲（受 shadowquic
+            // 的 send-window 支配），与远端上行带宽无关。
+            let (sum_d, sum_sq, active, alive) = {
+                let mut sum_d = 0u128;
+                let mut sum_sq = 0u128;
+                let mut active = 0usize;
+                let mut alive = 0usize;
+                for (_token, sample) in &entries {
+                    let Some(info) = get_tcp_info_ext_raw(sample.fd) else {
+                        continue;
+                    };
+                    alive += 1;
+                    let cur = info.tcpi_bytes_received;
+                    let prev = sample.last_recv.swap(cur, Ordering::Relaxed);
+                    // 首次采样只建立基线，本轮不产生增量
+                    if prev == UNINIT_RECV {
+                        continue;
+                    }
+                    let delta = cur.saturating_sub(prev);
+                    if delta >= ACTIVE_CONN_MIN_BYTES {
+                        active += 1;
+                        sum_d += delta as u128;
+                        sum_sq += (delta as u128) * (delta as u128);
                     }
                 }
-                (r, s, n)
+                (sum_d, sum_sq, active, alive)
             };
 
             if alive == 0 {
@@ -165,62 +221,58 @@ impl Upstream {
             }
 
             let now = now_secs();
-            let prev_recv = self.last_total_recv.swap(recv, Ordering::Relaxed);
-            let prev_sent = self.last_total_sent.swap(sent, Ordering::Relaxed);
             let prev_secs = self.last_check_secs.swap(now, Ordering::Relaxed);
+            let delta_secs = now.saturating_sub(prev_secs).max(1);
 
-            if !self.tcp_info_initialized.swap(true, Ordering::Relaxed) {
+            // 没有连接在本窗口真正传数据：本轮无样本，保留上一次实测值。
+            if active == 0 || sum_d < 1024 * 16 {
                 continue;
             }
 
-            let delta_recv = recv.saturating_sub(prev_recv);
-            let delta_sent = sent.saturating_sub(prev_sent);
-            let delta_bytes = delta_recv + delta_sent;
-            let delta_secs = now.saturating_sub(prev_secs).max(1);
+            // 字节加权的下行速率：等价于"每条连接的速率，按它搬了多少字节加权"。
+            // 结果接近高流量流的速率，既不被大量小请求拉低，也不随并发数放大。
+            let mib_per_sec = byte_weighted_mib_per_sec(sum_d, sum_sq, delta_secs);
+            // 绝对模式用的"代表性连接本窗口字节数"，单连接时等于该连接自身总量
+            let weighted_bytes = (sum_sq / sum_d).min(u64::MAX as u128) as u64;
+            let speed_mbps = mib_per_sec * MIB_TO_MBPS;
+            let delta_mib = format!("{:.2}", sum_d as f64 / 1024.0 / 1024.0);
 
-            if delta_bytes >= 1024 * 16 {
-                let speed_mbps = 8.0 * delta_bytes as f64 / 1_000_000.0 / delta_secs as f64;
-                let speed_str = format!("{:.2}", speed_mbps);
-                let delta_mb = format!("{:.2}", delta_bytes as f64 / 1024.0 / 1024.0);
+            if relative_mode {
+                // 相对模式：只记录实测速率（MiB/s 的 EMA），不直接写 tcp_score。
+                // tcp_score 由 run_relative_score_task 统一做组内归一化后写入。
+                let old_rate = load_f64(&self.throughput_rate_mibs);
+                let last = self.throughput_updated_secs.load(Ordering::Relaxed);
+                let new_rate =
+                    blend_rate_mibs(old_rate, last, now, self.quic_stale_secs(), mib_per_sec);
+                store_f64(&self.throughput_rate_mibs, new_rate);
+                self.throughput_updated_secs.store(now, Ordering::Relaxed);
+                debug!(
+                    id = %self.id,
+                    alive = alive,
+                    active = active,
+                    delta_mib = %delta_mib,
+                    speed_mbps = speed_mbps,
+                    rate_mbps = new_rate * MIB_TO_MBPS,
+                    "upstream per-active-conn rate (relative mode)"
+                );
+            } else if let Some(raw) =
+                calc_throughput_score(weighted_bytes, Duration::from_secs(delta_secs))
+            {
+                let old = self.tcp_score.load(Ordering::Relaxed);
+                // 50/50，历史与新数据同等权重
+                let blended = (old * 5 + raw * 5) / 10;
 
-                if relative_mode {
-                    // 相对模式：只记录实测速率（MiB/s 的 EMA），不直接写 tcp_score。
-                    // tcp_score 由 run_relative_score_task 统一做跨链路归一化后写入。
-                    let mib_per_sec = delta_bytes as f64 / 1024.0 / 1024.0 / delta_secs as f64;
-                    let old_rate = load_f64(&self.throughput_rate_mibs);
-                    let new_rate = if old_rate == 0.0 {
-                        mib_per_sec
-                    } else {
-                        old_rate * 0.5 + mib_per_sec * 0.5
-                    };
-                    store_f64(&self.throughput_rate_mibs, new_rate);
-                    self.throughput_updated_secs.store(now, Ordering::Relaxed);
-                    debug!(
-                        id = %self.id,
-                        alive = alive,
-                        delta_mb = %delta_mb,
-                        speed_mbps = %speed_str,
-                        rate_mibs = new_rate,
-                        "upstream throughput rate (relative mode)"
-                    );
-                } else if let Some(raw) =
-                    calc_throughput_score(delta_bytes, Duration::from_secs(delta_secs))
-                {
-                    let old = self.tcp_score.load(Ordering::Relaxed);
-                    // 50/50，历史与新数据同等权重
-                    let blended = (old * 5 + raw * 5) / 10;
-
-                    self.tcp_score.store(blended, Ordering::Relaxed);
-                    self.tcp_score_initialized.store(true, Ordering::Relaxed);
-                    debug!(
-                        id = %self.id,
-                        alive = alive,
-                        delta_mb = %delta_mb,
-                        speed_mbps = %speed_str,
-                        score = blended,
-                        "upstream aggregate score"
-                    );
-                }
+                self.tcp_score.store(blended, Ordering::Relaxed);
+                self.tcp_score_initialized.store(true, Ordering::Relaxed);
+                debug!(
+                    id = %self.id,
+                    alive = alive,
+                    active = active,
+                    delta_mib = %delta_mib,
+                    speed_mbps = speed_mbps,
+                    score = blended,
+                    "upstream per-active-conn score"
+                );
             }
         }
     }
@@ -267,7 +319,9 @@ impl Upstream {
 
         match (tcp_valid, quic_valid) {
             (true, true) => (tcp * tw + quic * qw) / 100,
-            (false, true) => quic,
+            // 只有探针分：限幅，避免零吞吐证据的链路凭探针分垄断选路。
+            // 上限按组动态计算，见 unmeasured_cap_for()。
+            (false, true) => quic.min(self.unmeasured_cap.load(Ordering::Relaxed)),
             (true, false) => tcp,
             (false, false) => DEFAULT_SCORE,
         }
@@ -1064,6 +1118,87 @@ fn relative_score(value: f64, max: f64) -> u32 {
     (value / max * 1000.0).clamp(0.0, 1000.0) as u32
 }
 
+/// 字节加权的平均下行速率（MiB/s）：`Σd² / (dt · Σd)`。
+///
+/// 等价于"每连接速率按它搬的字节数加权"，所以结果由高流量流主导：
+/// 一条大流不会因为旁边挂着一堆小请求而被拉低；空闲连接（d=0）权重为零，
+/// 也不像聚合总量那样随并发连接数放大。单连接时退化为它自己的速率。
+fn byte_weighted_mib_per_sec(sum_d: u128, sum_sq: u128, secs: u64) -> f64 {
+    if sum_d == 0 {
+        return 0.0;
+    }
+    let bytes_per_sec = sum_sq as f64 / sum_d as f64 / secs.max(1) as f64;
+    bytes_per_sec / 1024.0 / 1024.0
+}
+
+/// 有实测样本时向相对分缓慢跟随（1/8 步长），避免单轮抖动把分数打飞。
+/// 加 4 做四舍五入：截断会让 rel 比 old 高不到 8 时永远卡住不动。
+fn blend_rate_sample(old: u32, rel: u32) -> u32 {
+    (old * 7 + rel + 4) / 8
+}
+
+/// 速率 EMA：样本新鲜时 50/50 混合；首次或已过期时直接覆盖。
+/// 过期后仍按 50/50 混合会让几小时前的旧速率把重启后的第一个样本拉偏一半。
+fn blend_rate_mibs(old: f64, last_update: u64, now: u64, stale_secs: u64, cur: f64) -> f64 {
+    let stale = last_update == 0 || now.saturating_sub(last_update) >= stale_secs;
+    if stale || old <= 0.0 {
+        cur
+    } else {
+        old * 0.5 + cur * 0.5
+    }
+}
+
+/// 根据本轮是否有吞吐样本决定新的 tcp 分。
+/// 返回 None 表示"本轮没有新证据"，调用方应保留旧值 —— 绝不能当成 0 分，
+/// 否则空闲链路会在几十秒内被折半衰减到地板，再也回不来。
+fn next_tcp_score(old: u32, initialized: bool, rel: Option<u32>) -> Option<u32> {
+    let rel = rel?;
+    Some(if initialized {
+        blend_rate_sample(old, rel)
+    } else {
+        rel
+    })
+}
+
+/// 无吞吐证据链路的分数上限：不超过同组最佳实测分的 1/3。
+///
+/// 平方加权下 `c = best/3` 意味着实测最佳链路大约能拿到 2/3 的权重，
+/// 其余分给无证据链路作为探索空间。组内完全没有实测样本时退回默认上限，
+/// 让尚未测量的链路彼此公平竞争。
+fn unmeasured_cap_for(best_measured: Option<u32>) -> u32 {
+    match best_measured {
+        Some(best) => (best / 3).clamp(MIN_UNMEASURED_SCORE_CAP, UNMEASURED_SCORE_CAP),
+        None => UNMEASURED_SCORE_CAP,
+    }
+}
+
+/// 组内 max 的 EMA，跨轮次持久，避免瞬时抖动。
+fn update_group_max_ema(map: &mut HashMap<String, f64>, group: &str, cur: f64) {
+    if cur <= 0.0 {
+        return;
+    }
+    let e = map.entry(group.to_string()).or_insert(0.0);
+    *e = if *e == 0.0 { cur } else { *e * 0.9 + cur * 0.1 };
+}
+
+/// upstream 所属各组相对分的平均。
+/// pick 是按 group 取候选池的，所以归一化必须按组做：全局 max 会把弱组整组压扁。
+/// 多组链路在各自的池子里面对不同 max，取平均以在强组不被高估、弱组不被低估。
+fn avg_relative_over_groups<F>(groups: &[String], mut score_of: F) -> Option<u32>
+where
+    F: FnMut(&str) -> Option<u32>,
+{
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    for g in groups {
+        if let Some(v) = score_of(g) {
+            sum += v as u64;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| (sum / n) as u32)
+}
+
 /// 将 f64 以 bits 形式存入 AtomicU64。
 fn store_f64(a: &AtomicU64, v: f64) {
     a.store(v.to_bits(), Ordering::Relaxed);
@@ -1211,9 +1346,10 @@ pub async fn run_relative_score_task(state: Arc<AppState>, cancel: CancellationT
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // max 的 EMA，跨周期持久，避免瞬时抖动
-    let mut max_rate_ema: f64 = 0.0;
-    let mut max_q_ema: f64 = 0.0;
+    // 每组 max 的 EMA，跨周期持久，避免瞬时抖动。
+    // 归一化必须按组做：pick 是按 group 取候选池的，全局 max 会把弱组整组压扁。
+    let mut max_rate_ema: HashMap<String, f64> = HashMap::new();
+    let mut max_q_ema: HashMap<String, f64> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -1228,95 +1364,104 @@ pub async fn run_relative_score_task(state: Arc<AppState>, cancel: CancellationT
         let now = now_secs();
         let ups: Vec<Arc<Upstream>> = state.upstreams.iter().cloned().collect();
 
-        // 1. 收集快照并统计本轮 max
+        // 1. 收集快照。None 表示本轮没有新鲜样本，与"样本值恰好为 0"是两回事。
         struct Snap {
             up: Arc<Upstream>,
-            rate: f64,
-            has_rate: bool,
-            q: f64,
-            has_q: bool,
+            rate: Option<f64>,
+            q: Option<f64>,
         }
         let mut snaps: Vec<Snap> = Vec::with_capacity(ups.len());
-        let mut max_rate = 0.0f64;
-        let mut max_q = 0.0f64;
         for up in &ups {
             let rate_last = up.throughput_updated_secs.load(Ordering::Relaxed);
-            let has_rate = rate_last > 0 && now.saturating_sub(rate_last) < stale_secs;
-            let rate = if has_rate {
-                load_f64(&up.throughput_rate_mibs)
-            } else {
-                0.0
-            };
+            let rate = (rate_last > 0 && now.saturating_sub(rate_last) < stale_secs)
+                .then(|| load_f64(&up.throughput_rate_mibs));
             let q_last = up.probe_quality_updated_secs.load(Ordering::Relaxed);
-            let has_q = q_last > 0 && now.saturating_sub(q_last) < stale_secs;
-            let q = if has_q {
-                load_f64(&up.probe_quality)
-            } else {
-                0.0
-            };
-            if has_rate {
-                max_rate = max_rate.max(rate);
-            }
-            if has_q {
-                max_q = max_q.max(q);
-            }
+            let q = (q_last > 0 && now.saturating_sub(q_last) < stale_secs)
+                .then(|| load_f64(&up.probe_quality));
             snaps.push(Snap {
                 up: Arc::clone(up),
                 rate,
-                has_rate,
                 q,
-                has_q,
             });
         }
 
-        // 2. 更新 max 的 EMA
-        if max_rate > 0.0 {
-            max_rate_ema = if max_rate_ema == 0.0 {
-                max_rate
-            } else {
-                max_rate_ema * 0.9 + max_rate * 0.1
-            };
+        // 2. 统计本轮各组 max，再对每组的 max 做 EMA
+        let mut cur_max: HashMap<&str, (f64, f64)> = HashMap::new();
+        for s in &snaps {
+            for g in &s.up.groups {
+                let e = cur_max.entry(g.as_str()).or_insert((0.0, 0.0));
+                if let Some(rate) = s.rate {
+                    e.0 = e.0.max(rate);
+                }
+                if let Some(q) = s.q {
+                    e.1 = e.1.max(q);
+                }
+            }
         }
-        if max_q > 0.0 {
-            max_q_ema = if max_q_ema == 0.0 {
-                max_q
-            } else {
-                max_q_ema * 0.9 + max_q * 0.1
-            };
+        for (g, (rate, q)) in &cur_max {
+            update_group_max_ema(&mut max_rate_ema, g, *rate);
+            update_group_max_ema(&mut max_q_ema, g, *q);
         }
 
         // 3. 写入相对分
         for snap in &snaps {
             let up = &snap.up;
-            if max_q_ema > 0.0 && snap.has_q {
-                let rel_quic = relative_score(snap.q, max_q_ema);
-                up.quic_uplink_score.store(rel_quic, Ordering::Relaxed);
-                up.quic_downlink_score.store(rel_quic, Ordering::Relaxed);
+
+            let rel_quic = snap.q.and_then(|q| {
+                avg_relative_over_groups(&up.groups, |g| {
+                    max_q_ema.get(g).map(|max| relative_score(q, *max))
+                })
+            });
+            if let Some(rel) = rel_quic {
+                up.quic_uplink_score.store(rel, Ordering::Relaxed);
+                up.quic_downlink_score.store(rel, Ordering::Relaxed);
             }
-            if snap.has_rate && max_rate_ema > 0.0 {
-                let rel_tcp = relative_score(snap.rate, max_rate_ema);
-                let old = up.tcp_score_raw();
-                let blended = (old + rel_tcp) / 2;
-                up.tcp_score.store(blended, Ordering::Relaxed);
+
+            let rel_tcp = snap.rate.and_then(|rate| {
+                avg_relative_over_groups(&up.groups, |g| {
+                    max_rate_ema.get(g).map(|max| relative_score(rate, *max))
+                })
+            });
+            if let Some(new) =
+                next_tcp_score(up.tcp_score_raw(), up.tcp_score_initialized(), rel_tcp)
+            {
+                up.tcp_score.store(new, Ordering::Relaxed);
                 up.tcp_score_initialized.store(true, Ordering::Relaxed);
-            } else if !up.tcp_score_initialized() && max_q_ema > 0.0 {
-                // 冷启动：尚无吞吐样本时用探针相对分做种子（若有）；探针也拿不到
-                // （新链路尚无流量回报）时，用组内最优的一半做乐观先验，使新链路在
-                // 拿到真实样本前就具备竞争力，避免被高分链路长期饿死。
-                let seed = if snap.has_q {
-                    relative_score(snap.q, max_q_ema)
-                } else {
-                    relative_score(max_q_ema * 0.5, max_q_ema)
-                };
-                up.tcp_score.store(seed, Ordering::Relaxed);
-                up.tcp_score_initialized.store(true, Ordering::Relaxed);
-                debug!(
-                    id = %up.id,
-                    seed,
-                    has_q = snap.has_q,
-                    "relative score cold-start seed"
-                );
             }
+            // 本轮无样本时保留上一次实测值：不再写"乐观先验"，也不向 0 衰减。
+            // 没有证据的链路保持未初始化，由 pick_weighted 的探索逻辑取样。
+        }
+
+        // 4. 按组给"零吞吐证据"的链路定上限
+        let mut best_measured: HashMap<&str, u32> = HashMap::new();
+        for s in &snaps {
+            if !s.up.tcp_score_initialized() {
+                continue;
+            }
+            let sc = s.up.score_at(now);
+            for g in &s.up.groups {
+                let e = best_measured.entry(g.as_str()).or_insert(0);
+                *e = (*e).max(sc);
+            }
+        }
+        for s in &snaps {
+            if s.up.tcp_score_initialized() {
+                continue;
+            }
+            // 多组链路取最保守的那个上限：只要它在任一有实测样本的组里，
+            // 都不该压过该组的实测链路。已知取舍：它在"全未测组"里也会被这个
+            // 较小的上限压住，权重低于该组内纯属本组的零样本链路；反之若取较大
+            // 值，则会在这条链路的实测组里超配。单标量存不下两组不同的cap，
+            // 需要按组存就得上 Map，代价是把 effective_score 变成依赖 group 的
+            // 调用，pick 热路径与分数表都得跟着改。
+            let cap =
+                s.up.groups
+                    .iter()
+                    .filter_map(|g| best_measured.get(g.as_str()).copied())
+                    .map(|best| unmeasured_cap_for(Some(best)))
+                    .min()
+                    .unwrap_or(UNMEASURED_SCORE_CAP);
+            s.up.unmeasured_cap.store(cap, Ordering::Relaxed);
         }
     }
 }
@@ -1356,6 +1501,8 @@ pub async fn run_score_printer(
         for up in &upstreams {
             let quic_up_last = up.quic_uplink_last_update_secs();
             let quic_down_last = up.quic_downlink_last_update_secs();
+            let rate_last = up.throughput_updated_secs.load(Ordering::Relaxed);
+            let stale_secs = up.quic_stale_secs();
             scores.push(UpstreamScoreSnapshot {
                 id: up.id.as_str(),
                 tcp_raw: up.tcp_score_raw(),
@@ -1374,9 +1521,13 @@ pub async fn run_score_printer(
                     0
                 },
                 quic_down_init: quic_down_last > 0,
+                // 原始实测速率（存 MiB/s，打印换算成 Mbps）：没有它，归一化后的 tcp 分无法自证
+                rate_mibs: (rate_last > 0 && now.saturating_sub(rate_last) < stale_secs)
+                    .then(|| load_f64(&up.throughput_rate_mibs)),
                 eff_score: up.effective_score_at(now),
                 gain: up.gain,
-                stale_secs: up.quic_stale_secs(),
+                groups: &up.groups,
+                stale_secs,
             });
         }
 
@@ -1402,8 +1553,18 @@ pub async fn run_score_printer(
 /// 分数表的 flags 图例，仅在首次打印分数表之前输出一次。
 const SCORE_TABLE_LEGEND: &str = concat!(
     "  flags: T=tcp U=quic-uplink D=quic-downlink !=stale ?=no-probe\n",
-    "  age: seconds since last probe update as uplink/downlink, - = no sample",
+    "  age: seconds since last probe update as uplink/downlink, - = no sample\n",
+    "  rate: measured per-connection downlink Mbps, - = no sample",
 );
+
+/// 所属组的展示文本；不属于任何组时与 rate/age 一致用 `-` 占位。
+fn groups_label(groups: &[String]) -> String {
+    if groups.is_empty() {
+        "-".to_string()
+    } else {
+        groups.join(",")
+    }
+}
 
 /// 把一轮分数快照渲染成对齐的表格，风格参考 `transmission-remote -pl` 的 peer 列表。
 fn format_score_table(rows: &[UpstreamScoreSnapshot<'_>]) -> String {
@@ -1414,17 +1575,26 @@ fn format_score_table(rows: &[UpstreamScoreSnapshot<'_>]) -> String {
         .max()
         .unwrap_or(2)
         .max(2);
+    let grp_w = rows
+        .iter()
+        .map(|r| groups_label(r.groups).chars().count())
+        .max()
+        .unwrap_or(3)
+        .max(3);
     let mut out = format!(
-        "  {id:<id_w$}  {flags:<5}  {score:>8}  {tcp:>4}  {qup:>4}  {qdn:>4}  {gain:>5}  {age:>7}\n",
+        "  {id:<id_w$}  {flags:<5}  {score:>8}  {tcp:>4}  {qup:>4}  {qdn:>4}  {rate:>9}  {gain:>5}  {age:>7}  {grp:<grp_w$}\n",
         id = "id",
         flags = "flags",
         score = "score",
         tcp = "tcp",
         qup = "qup",
         qdn = "qdn",
+        rate = "rate_mbps",
         gain = "gain",
         age = "age",
+        grp = "grp",
         id_w = id_w,
+        grp_w = grp_w,
     );
 
     for r in rows {
@@ -1458,17 +1628,25 @@ fn format_score_table(rows: &[UpstreamScoreSnapshot<'_>]) -> String {
             (true, true) => format!("{}/{}", r.quic_up_age, r.quic_down_age),
         };
 
+        let rate = match r.rate_mibs {
+            Some(v) => format!("{:.2}", v * MIB_TO_MBPS),
+            None => "-".to_string(),
+        };
+
         out.push_str(&format!(
-            "  {id:<id_w$}  {flags:<5}  {score:>8}  {tcp:>4}  {qup:>4}  {qdn:>4}  {gain:>5.2}  {age:>7}\n",
+            "  {id:<id_w$}  {flags:<5}  {score:>8}  {tcp:>4}  {qup:>4}  {qdn:>4}  {rate:>9}  {gain:>5.2}  {age:>7}  {grp:<grp_w$}\n",
             id = r.id,
             flags = flags,
             score = r.eff_score,
             tcp = r.tcp_raw,
             qup = r.quic_up_raw,
             qdn = r.quic_down_raw,
+            rate = rate,
             gain = r.gain,
             age = age,
+            grp = groups_label(r.groups),
             id_w = id_w,
+            grp_w = grp_w,
         ));
     }
 
@@ -1486,8 +1664,10 @@ struct UpstreamScoreSnapshot<'a> {
     quic_down_raw: u32,
     quic_down_age: u64,
     quic_down_init: bool,
+    rate_mibs: Option<f64>,
     eff_score: u64,
     gain: f64,
+    groups: &'a [String],
     stale_secs: u64,
 }
 
@@ -2140,6 +2320,10 @@ mod tests {
 
     #[test]
     fn score_table_renders_flags_columns_and_alignment() {
+        let poe_default = vec!["poe".to_string(), "default".to_string()];
+        let youtube = vec!["youtube".to_string()];
+        let gemini = vec!["gemini".to_string()];
+        let no_group: Vec<String> = Vec::new();
         let rows = vec![
             UpstreamScoreSnapshot {
                 id: "fast",
@@ -2151,8 +2335,10 @@ mod tests {
                 quic_down_raw: 40,
                 quic_down_age: 0,
                 quic_down_init: true,
+                rate_mibs: Some(12.345),
                 eff_score: 491,
                 gain: 0.85,
+                groups: &poe_default,
                 stale_secs: 180,
             },
             UpstreamScoreSnapshot {
@@ -2165,8 +2351,10 @@ mod tests {
                 quic_down_raw: 498,
                 quic_down_age: 200,
                 quic_down_init: true,
+                rate_mibs: Some(0.5),
                 eff_score: 212,
                 gain: 1.1,
+                groups: &youtube,
                 stale_secs: 180,
             },
             UpstreamScoreSnapshot {
@@ -2179,8 +2367,10 @@ mod tests {
                 quic_down_raw: 108,
                 quic_down_age: 47,
                 quic_down_init: true,
+                rate_mibs: None,
                 eff_score: 54,
                 gain: 1.0,
+                groups: &no_group,
                 stale_secs: 180,
             },
             UpstreamScoreSnapshot {
@@ -2193,8 +2383,10 @@ mod tests {
                 quic_down_raw: 75,
                 quic_down_age: 0,
                 quic_down_init: false,
+                rate_mibs: Some(3.0),
                 eff_score: 173,
                 gain: 1.0,
+                groups: &gemini,
                 stale_secs: 180,
             },
             UpstreamScoreSnapshot {
@@ -2207,8 +2399,10 @@ mod tests {
                 quic_down_raw: DEFAULT_SCORE,
                 quic_down_age: 0,
                 quic_down_init: false,
+                rate_mibs: None,
                 eff_score: DEFAULT_SCORE as u64,
                 gain: 1.0,
+                groups: &poe_default,
                 stale_secs: 180,
             },
         ];
@@ -2225,30 +2419,194 @@ mod tests {
             "rows must share the same width:\n{table}"
         );
         assert!(lines[0].contains("flags") && lines[0].contains("score"));
+        assert!(lines[0].contains("rate") && lines[0].contains("grp"));
 
         let fast: Vec<&str> = lines[1].split_whitespace().collect();
-        assert_eq!(fast, ["fast", "TUD", "491", "942", "40", "40", "0.85", "0"]);
+        assert_eq!(
+            fast,
+            [
+                "fast",
+                "TUD",
+                "491",
+                "942",
+                "40",
+                "40",
+                "103.56",
+                "0.85",
+                "0",
+                "poe,default"
+            ]
+        );
 
         // 超过 stale 阈值追加 !
         let stale: Vec<&str> = lines[2].split_whitespace().collect();
         assert_eq!(stale[1], "TUD!");
         assert_eq!(stale[5], "498");
-        assert_eq!(stale[7], "200");
+        assert_eq!(stale[8], "200");
 
         // 只有下行样本：flags 无 T/U，age 固定 上行/下行 两段，`-` 占位
         let down_only: Vec<&str> = lines[3].split_whitespace().collect();
         assert_eq!(down_only[1], "D");
-        assert_eq!(down_only[7], "-/47");
+        assert_eq!(down_only[6], "-");
+        assert_eq!(down_only[8], "-/47");
 
         // 只有上行样本：不能与"上下行同为 47 秒"混淆
         let up_only: Vec<&str> = lines[4].split_whitespace().collect();
         assert_eq!(up_only[1], "TU");
-        assert_eq!(up_only[7], "47/-");
+        assert_eq!(up_only[8], "47/-");
 
         // 无任何样本
         let no_sample: Vec<&str> = lines[5].split_whitespace().collect();
         assert_eq!(no_sample[1], "?");
-        assert_eq!(no_sample[7], "-");
+        assert_eq!(no_sample[6], "-");
+        assert_eq!(no_sample[8], "-");
+
+        // 不属于任何组时与 rate/age 一致，用 `-` 占位
+        assert_eq!(down_only[9], "-");
+        assert_eq!(fast[9], "poe,default");
+    }
+
+    // ---------- per-connection rate / relative scoring ----------
+
+    #[test]
+    fn byte_weighted_rate_tracks_the_fattest_connection() {
+        let mib = 1024 * 1024u128;
+        let kib = 1024u128;
+
+        // 单连接：退化为它自己的速率
+        assert!((byte_weighted_mib_per_sec(2 * mib, (2 * mib) * (2 * mib), 1) - 2.0).abs() < 1e-9);
+
+        // 10 条各 1MiB/s：仍是 1MiB/s，不随并发数放大
+        let d = mib;
+        let (sum_d, sum_sq) = (10 * d, 10 * d * d);
+        assert!((byte_weighted_mib_per_sec(sum_d, sum_sq, 1) - 1.0).abs() < 1e-9);
+
+        // 1 条 2MiB/s + 9 条 5KiB/s：接近那条大流，而不是被拉低到 0.2
+        let big = 2 * mib;
+        let small = 5 * kib;
+        let (sum_d, sum_sq) = (big + 9 * small, big * big + 9 * small * small);
+        let r = byte_weighted_mib_per_sec(sum_d, sum_sq, 1);
+        assert!(
+            r > 1.9 && r < 2.0,
+            "fat connection should dominate, got {r}"
+        );
+
+        // 无数据时不除零
+        assert_eq!(byte_weighted_mib_per_sec(0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn unmeasured_cap_follows_group_best() {
+        // 组内没有实测样本：用默认上限，让未测量链路彼此公平竞争
+        assert_eq!(unmeasured_cap_for(None), UNMEASURED_SCORE_CAP);
+        // 组内最佳实测 979 → 上限 326，平方加权下实测链路约拿 2/3 权重
+        assert_eq!(unmeasured_cap_for(Some(979)), 979 / 3);
+        // 组内唯一实测链路很差（18 分）：落到下限，否则探索空间被彻底掐死
+        assert_eq!(unmeasured_cap_for(Some(18)), MIN_UNMEASURED_SCORE_CAP);
+        // 不超过默认上限
+        assert_eq!(unmeasured_cap_for(Some(10_000)), UNMEASURED_SCORE_CAP);
+    }
+
+    #[test]
+    fn probe_only_score_is_capped_until_throughput_is_measured() {
+        let up = Upstream::new(
+            "probe_only",
+            "127.0.0.1:20808".parse().unwrap(),
+            vec!["poe".to_string()],
+            1.0,
+        );
+        up.set_quic_weight(100); // 让综合分完全由 quic 决定
+        up.quic_downlink_score.store(1000, Ordering::Relaxed);
+        up.quic_downlink_last_update_secs
+            .store(now_secs(), Ordering::Relaxed);
+
+        // 只有探针分：被限幅，不能拿到满权重
+        assert_eq!(up.score(), UNMEASURED_SCORE_CAP);
+        assert!(!up.tcp_score_initialized());
+
+        // 有了真实吞吐样本后不再受限
+        up.tcp_score.store(900, Ordering::Relaxed);
+        up.tcp_score_initialized.store(true, Ordering::Relaxed);
+        assert_eq!(up.score(), 1000);
+    }
+
+    #[test]
+    fn tcp_score_without_sample_keeps_old_value() {
+        // 本轮无样本 = 无新证据，必须保留旧值（返回 None），不能当成 0 分
+        assert_eq!(next_tcp_score(977, true, None), None);
+        assert_eq!(next_tcp_score(0, false, None), None);
+        // 首次拿到样本直接采用，不被默认分稀释
+        assert_eq!(next_tcp_score(DEFAULT_SCORE, false, Some(800)), Some(800));
+        // 已有样本时缓慢跟随，1/8 步长
+        assert_eq!(next_tcp_score(800, true, Some(0)), Some(700));
+        assert_eq!(next_tcp_score(0, true, Some(800)), Some(100));
+        // 四舍五入：差值小于 8 时也要动，不能因整除截断卡死
+        assert_eq!(next_tcp_score(993, true, Some(1000)), Some(994));
+        assert_eq!(next_tcp_score(994, true, Some(1000)), Some(995));
+    }
+
+    #[test]
+    fn rate_ema_overrides_stale_sample_instead_of_blending() {
+        // 新鲜样本：50/50 混合
+        assert!((blend_rate_mibs(2.0, 100, 110, 480, 4.0) - 3.0).abs() < 1e-9);
+        // 首次采样（从未更新过）：直接覆盖
+        assert!((blend_rate_mibs(0.0, 0, 110, 480, 4.0) - 4.0).abs() < 1e-9);
+        // 旧值已过期：直接覆盖，不被几小时前的速率拉偏一半
+        assert!((blend_rate_mibs(2.0, 100, 100 + 480, 480, 4.0) - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fd_sample_first_read_only_establishes_baseline() {
+        // 新连接第一次采样时可能一个字节都没收到，0 必须是合法基线，
+        // 不能被当成"未初始化"而把后续突发永久跳过。
+        let sample = FdSample {
+            fd: -1,
+            last_recv: AtomicU64::new(UNINIT_RECV),
+        };
+        assert_eq!(sample.last_recv.swap(0, Ordering::Relaxed), UNINIT_RECV);
+        assert_eq!(sample.last_recv.swap(2 * 1024 * 1024, Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn relative_score_is_normalized_per_group() {
+        let groups = vec!["poe".to_string(), "youtube".to_string()];
+        let max_rate: HashMap<String, f64> = [
+            // poe 组最强 10MiB/s，youtube 组最强 2MiB/s
+            ("poe".to_string(), 10.0),
+            ("youtube".to_string(), 2.0),
+        ]
+        .into_iter()
+        .collect();
+        // 同一速率在两组里的相对分不同：2MiB/s 在 poe 是 200，在 youtube 是 1000
+        assert_eq!(
+            avg_relative_over_groups(&groups, |g| max_rate
+                .get(g)
+                .map(|max| relative_score(2.0, *max))),
+            Some((200 + 1000) / 2)
+        );
+        // 不在任何组里时没有相对分
+        assert_eq!(avg_relative_over_groups(&[], |_| Some(500)), None);
+        // 组内无 max（无样本）时返回 None，而不是 0
+        let empty: HashMap<String, f64> = HashMap::new();
+        assert_eq!(
+            avg_relative_over_groups(&groups, |g| empty
+                .get(g)
+                .map(|max| relative_score(1.0, *max))),
+            None
+        );
+    }
+
+    #[test]
+    fn group_max_ema_ignores_empty_rounds() {
+        let mut map: HashMap<String, f64> = HashMap::new();
+        update_group_max_ema(&mut map, "poe", 10.0);
+        assert_eq!(map.get("poe"), Some(&10.0));
+        // 本轮无样本不得把 max 拉向 0
+        update_group_max_ema(&mut map, "poe", 0.0);
+        assert_eq!(map.get("poe"), Some(&10.0));
+        // 有样本时按 9:1 向新值靠拢
+        update_group_max_ema(&mut map, "poe", 20.0);
+        assert!((map["poe"] - 11.0).abs() < 1e-9);
     }
 
     // ---------- PickStats ----------

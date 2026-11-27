@@ -289,7 +289,8 @@ quic_weight = 40
 
 # 启用跨链路相对归一化评分（默认 false：使用绝对分段评分）。
 # - true：保留 TCP_INFO 实测吞吐为主信号，把评分口径改为"跨链路相对归一化"，
-#   并支持冷启动探针种子（新链路立即具备竞争力），自动适配光纤/4G/卫星等网络。
+#   自动适配光纤/4G/卫星等网络。没有吞吐样本的链路不再写乐观先验，只有探针分
+#   时按组限幅（组内最佳实测分 / 3），避免零证据链路靠探针分垄断选路。
 # enable_relative_scoring = false
 
 # 相对归一化评分任务间隔（秒），仅当 enable_relative_scoring = true 时生效。
@@ -299,8 +300,9 @@ quic_weight = 40
 # 上游分数打印间隔（秒），仅在日志级别为 info（默认）及以上时生效。
 # 每轮输出一张按有效分降序的表格（flags 图例、列含义见
 # docs/工作原理.md 的「5.5 分数打印」）：
-#   id              flags     score   tcp   qup   qdn   gain      age
-#   combine_p20816  TUD         537    75  1000  1000   1.21        0
+#   id              flags     score   tcp   qup   qdn  rate_mbps   gain      age  grp
+#   combine_p20819  TUD         516   973    62    62      16.63   1.00       15  youtube
+#   combine_p20822  UD          189    75   999   999          -   1.00       15  default
 # 默认值：0（禁用）。旧名 upstream_score_debug_interval_secs 仍可作为别名使用。
 # upstream_score_printer_interval_secs = 10
 
